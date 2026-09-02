@@ -206,13 +206,28 @@ impl Repository {
         // Files visible on the old view but NOT on the new view are
         // removed from disk.
         let mut removed_paths: Vec<String> = Vec::new();
-        for path in old_files.difference(&new_files) {
-            let abs_path = self.root.join(path);
+        let mut paths_to_remove: Vec<String> = old_files.difference(&new_files).cloned().collect();
+        paths_to_remove.sort();
+        for path in paths_to_remove {
+            let abs_path = self.root.join(&path);
             if abs_path.exists()
                 && !abs_path.is_dir()
-                && working_copy.remove_path(path, false).is_ok()
+                && working_copy.remove_path(&path, false).is_ok()
             {
-                removed_paths.push(path.clone());
+                removed_paths.push(path);
+
+                // Deterministic expected-red failpoint for the bridge recovery
+                // contract. Release builds contain no environment-variable
+                // branch; the operation journal will eventually recover this
+                // deliberately partial transition.
+                #[cfg(debug_assertions)]
+                if removed_paths.len() == 1
+                    && std::env::var_os("ATOMIC_FAIL_SWITCH_AFTER_FIRST_TRACKED_REMOVAL").is_some()
+                {
+                    return Err(RepositoryError::Io(std::io::Error::other(
+                        "debug failpoint: switch failed after first tracked-path removal",
+                    )));
+                }
             }
         }
 

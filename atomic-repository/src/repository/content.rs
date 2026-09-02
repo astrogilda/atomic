@@ -105,11 +105,9 @@ impl Repository {
         )
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        if content.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(content))
-        }
+        // Presence was established by TREE + INODES above. Empty content is a
+        // tracked zero-byte file, not an absent path.
+        Ok(Some(content))
     }
 
     /// Get file content using the CRDT-driven walker (task #24).
@@ -232,11 +230,8 @@ impl Repository {
         )
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        if content.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(content))
-        }
+        // The path and inode were resolved above; preserve zero-byte presence.
+        Ok(Some(content))
     }
 
     /// Diff two views: returns (changes only in A, changes only in B, common changes).
@@ -797,11 +792,8 @@ impl Repository {
                     RepositoryError::Database(e.to_string())
                 })?;
 
-        if content.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(content))
-        }
+        // Tracking/inode checks distinguish absence from a present empty file.
+        Ok(Some(content))
     }
 
     // Archive Operations

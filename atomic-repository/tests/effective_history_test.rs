@@ -104,3 +104,70 @@ fn effective_history_matches_log_for_shared_view() {
     assert_eq!(log_hashes, vec![a, b]);
     assert_eq!(effective, log_hashes);
 }
+
+/// A nested draft inherits both history and content through every parent,
+/// without duplicating changes copied into a draft's own log.
+#[test]
+fn nested_draft_effective_history_and_content_include_all_parents() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().to_path_buf();
+    let mut repo = Repository::init(&repo_path).expect("init");
+
+    add_file(&repo, &repo_path, "base.txt", "base\n");
+    let base = record(&repo, "base");
+
+    let shared_view = repo.current_view().to_string();
+    repo.create_view_from("parent", &shared_view)
+        .expect("create parent draft");
+    repo.switch_view("parent").expect("switch to parent draft");
+    add_file(&repo, &repo_path, "parent.txt", "parent\n");
+    let parent = record(&repo, "parent");
+
+    repo.create_view_from("child", "parent")
+        .expect("create nested child draft");
+    repo.switch_view("child").expect("switch to child draft");
+    add_file(&repo, &repo_path, "child.txt", "child\n");
+    let child = record(&repo, "child");
+
+    let effective: Vec<Hash> = repo
+        .effective_history(Some("child"))
+        .expect("nested effective history")
+        .into_iter()
+        .map(|entry| entry.hash)
+        .collect();
+    assert_eq!(effective, vec![base, parent, child]);
+
+    assert_eq!(
+        repo.get_file_content_on_view("base.txt", "child")
+            .expect("read inherited base content"),
+        Some(b"base\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("parent.txt", "child")
+            .expect("read inherited parent content"),
+        Some(b"parent\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("child.txt", "child")
+            .expect("read child content"),
+        Some(b"child\n".to_vec())
+    );
+}
+
+/// A tracked empty file is distinct from an untracked path: its recorded
+/// content is present and has zero bytes.
+#[test]
+fn tracked_empty_file_content_is_some_empty_vec() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().to_path_buf();
+    let repo = Repository::init(&repo_path).expect("init");
+
+    add_file(&repo, &repo_path, "empty.txt", "");
+    record(&repo, "add empty file");
+
+    assert_eq!(
+        repo.get_file_content("empty.txt")
+            .expect("read tracked empty file"),
+        Some(Vec::new())
+    );
+}
