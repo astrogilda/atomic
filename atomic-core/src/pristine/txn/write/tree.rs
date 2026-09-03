@@ -1,4 +1,5 @@
 use super::*;
+use crate::pristine::txn::helpers::collect_until_error;
 
 // TreeTxnT Implementation
 
@@ -56,17 +57,11 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
         let table = self.txn.open_table(TREE)?;
-        let mut results = Vec::new();
-        for result in table.iter()? {
-            match result {
-                Ok((k, v)) => {
-                    results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
-                }
-            }
-        }
+        let results = collect_until_error(table.iter()?.map(|result| {
+            result
+                .map(|(key, value)| (key.value().to_string(), Inode::new(value.value())))
+                .map_err(|error| PristineError::Storage(Box::new(error)))
+        }));
         Ok(Box::new(results.into_iter()))
     }
 
@@ -86,23 +81,31 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
         let mut results = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            match result {
-                Ok((key, values)) => {
-                    let (_, change_id, start, end) = decode_inode_vertex(key.value());
-                    let node = GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(start),
-                        end: ChangePosition::new(end),
-                    };
+        'entries: for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, values) = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    results.push(Err(PristineError::Storage(Box::new(error))));
+                    break;
+                }
+            };
+            let (_, change_id, start, end) = decode_inode_vertex(key.value());
+            let node = GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(start),
+                end: ChangePosition::new(end),
+            };
 
-                    for v in values.filter_map(|r| r.ok()) {
-                        let edge = deserialize_edge(v.value());
+            for value in values {
+                match value {
+                    Ok(value) => {
+                        let edge = deserialize_edge(value.value());
                         results.push(Ok((node, edge)));
                     }
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
+                    Err(error) => {
+                        results.push(Err(PristineError::Storage(Box::new(error))));
+                        break 'entries;
+                    }
                 }
             }
         }
@@ -137,5 +140,58 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
             entries.push((path, secs, nanos, size, hash));
         }
         Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pristine::{MutTxnT, Pristine};
+    use tempfile::tempdir;
+
+    #[test]
+    fn healthy_write_tree_and_inode_iterators_return_all_values() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let inode = Inode::new(11);
+        txn.put_tree("src/lib.rs", inode).unwrap();
+
+        let change_id = txn
+            .register_change(&Hash::of(b"write inode graph"))
+            .unwrap();
+        let node = GraphNode::new(change_id, ChangePosition::new(0), ChangePosition::new(4));
+        for position in [2, 1] {
+            txn.put_inode_graph(
+                inode,
+                node,
+                SerializedGraphEdge::new(
+                    EdgeFlags::BLOCK,
+                    Position::new(change_id, ChangePosition::new(position)),
+                    change_id,
+                ),
+            )
+            .unwrap();
+        }
+
+        let tree = txn
+            .iter_tree()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tree, vec![("src/lib.rs".to_string(), inode)]);
+
+        let inode_entries = txn
+            .iter_inode_vertices(inode)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            inode_entries
+                .iter()
+                .map(|(_, edge)| edge.dest().pos.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

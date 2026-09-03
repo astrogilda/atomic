@@ -25,7 +25,8 @@ use crate::pristine::traits::{
 };
 
 use super::helpers::{
-    deserialize_conflicts, deserialize_edge, deserialize_view_state, AdjIterator,
+    collect_preload_edges, collect_until_error, deserialize_conflicts, deserialize_edge,
+    deserialize_view_state, graph_presence, try_collect, try_is_present, AdjIterator,
 };
 
 /// Read-only transaction
@@ -125,7 +126,7 @@ impl GraphTxnT for ReadTxn {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -216,7 +217,7 @@ impl GraphTxnT for ReadTxn {
         // Without this direct lookup, iteration would return V[0:9] first since
         // it has a lower start position.
         let empty_key = encode_vertex(change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if try_is_present(table.get(&empty_key)?)? {
             return Ok(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -265,7 +266,7 @@ impl GraphTxnT for ReadTxn {
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        let has = table.get(&key)?.next().is_some();
+        let has = graph_presence(table.get(&key)?)?;
         Ok(has)
     }
 
@@ -318,10 +319,7 @@ impl GraphTxnT for ReadTxn {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        let has = table
-            .range::<&[u8; 24]>(&start_key..=&end_key)?
-            .next()
-            .is_some();
+        let has = graph_presence(table.range::<&[u8; 24]>(&start_key..=&end_key)?)?;
         Ok(has)
     }
 }
@@ -503,18 +501,12 @@ impl TreeTxnT for ReadTxn {
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
         let table = self.txn.open_table(TREE)?;
-        // Collect to avoid lifetime issues
-        let mut results = Vec::new();
-        for result in table.iter()? {
-            match result {
-                Ok((k, v)) => {
-                    results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
-                }
-            }
-        }
+        // Collect to avoid lifetime issues while preserving lazy iterator errors.
+        let results = collect_until_error(table.iter()?.map(|result| {
+            result
+                .map(|(key, value)| (key.value().to_string(), Inode::new(value.value())))
+                .map_err(|error| PristineError::Storage(Box::new(error)))
+        }));
         Ok(Box::new(results.into_iter()))
     }
 
@@ -533,25 +525,33 @@ impl TreeTxnT for ReadTxn {
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
         let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
-        // Collect to avoid lifetime issues
+        // Collect to avoid lifetime issues while preserving lazy iterator errors.
         let mut results = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            match result {
-                Ok((key, values)) => {
-                    let (_, change_id, start, end) = decode_inode_vertex(key.value());
-                    let node = GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(start),
-                        end: ChangePosition::new(end),
-                    };
+        'entries: for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, values) = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    results.push(Err(PristineError::Storage(Box::new(error))));
+                    break;
+                }
+            };
+            let (_, change_id, start, end) = decode_inode_vertex(key.value());
+            let node = GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(start),
+                end: ChangePosition::new(end),
+            };
 
-                    for v in values.filter_map(|r| r.ok()) {
-                        let edge = deserialize_edge(v.value());
+            for value in values {
+                match value {
+                    Ok(value) => {
+                        let edge = deserialize_edge(value.value());
                         results.push(Ok((node, edge)));
                     }
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
+                    Err(error) => {
+                        results.push(Err(PristineError::Storage(Box::new(error))));
+                        break 'entries;
+                    }
                 }
             }
         }
@@ -1552,7 +1552,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -1623,7 +1623,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let table = &self.graph_table;
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        let has = table.get(&key)?.next().is_some();
+        let has = graph_presence(table.get(&key)?)?;
         Ok(has)
     }
 
@@ -1651,10 +1651,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         let table = &self.graph_table;
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        let has = table
-            .range::<&[u8; 24]>(&start_key..=&end_key)?
-            .next()
-            .is_some();
+        let has = graph_presence(table.range::<&[u8; 24]>(&start_key..=&end_key)?)?;
         Ok(has)
     }
 }
@@ -1731,7 +1728,7 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
             node.end.get(),
         );
         let mut edges = Vec::new();
-        for v in self.inode_graph_table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(self.inode_graph_table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -1834,7 +1831,7 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
 
         // Check for empty vertex at exact position
         let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if try_is_present(table.get(&empty_key)?)? {
             return Ok(Some(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -1898,10 +1895,8 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
         let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
-        Ok(table
-            .range::<&[u8; 32]>(&start_key..=&end_key)?
-            .next()
-            .is_some())
+        let populated = try_is_present(table.range::<&[u8; 32]>(&start_key..=&end_key)?)?;
+        Ok(populated)
     }
 
     fn inode_graph_needs_view_filter(&self) -> bool {
@@ -1965,12 +1960,11 @@ impl<'txn> InodePreloadTxn<'txn> {
             };
             vertex_set.insert(vertex);
 
-            let edge_list = edges.entry(vertex).or_default();
-            for v in values.filter_map(|r| r.ok()) {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                edge_list.push(edge);
-            }
+            let edge_list = collect_preload_edges(values, |value| {
+                let bytes: &[u8; 24] = value.value();
+                deserialize_edge(bytes)
+            })?;
+            edges.entry(vertex).or_default().extend(edge_list);
         }
 
         let mut vertices: Vec<GraphNode<NodeId>> = vertex_set.into_iter().collect();
@@ -2142,8 +2136,7 @@ impl<'txn> GraphTxnT for InodePreloadTxn<'txn> {
     }
 
     fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
-        // Check the preloaded vertices
-        Ok(self.vertices.iter().any(|v| v.change == change_id))
+        self.txn.has_change_in_graph(change_id)
     }
 }
 
@@ -2377,7 +2370,7 @@ impl GitShaIndexTxnT for ReadTxn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::Pristine;
+    use crate::pristine::{InodeGraphOps, MutTxnT, Pristine};
     use tempfile::tempdir;
 
     #[test]
@@ -2393,5 +2386,136 @@ mod tests {
         assert!(txn.get_view("main").unwrap().is_none());
         assert!(txn.get_inode("test.txt").unwrap().is_none());
         assert!(txn.list_views().unwrap().is_empty());
+    }
+
+    #[test]
+    fn healthy_graph_and_inode_multimap_reads_remain_ordered_and_filtered() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let inode = Inode::new(7);
+
+        let (change_id, node, global_only_change) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let change_id = txn.register_change(&Hash::of(b"inode change")).unwrap();
+            let node = GraphNode::new(change_id, ChangePosition::new(7), ChangePosition::new(7));
+            let block_10 = SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(10)),
+                change_id,
+            );
+            let folder_15 = SerializedGraphEdge::new(
+                EdgeFlags::FOLDER,
+                Position::new(change_id, ChangePosition::new(15)),
+                change_id,
+            );
+            let block_20 = SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(20)),
+                change_id,
+            );
+
+            for edge in [block_20, folder_15, block_10] {
+                txn.put_graph(node, edge).unwrap();
+                txn.put_inode_graph(inode, node, edge).unwrap();
+            }
+
+            let global_only_change = txn
+                .register_change(&Hash::of(b"global-only change"))
+                .unwrap();
+            let global_node = GraphNode::new(
+                global_only_change,
+                ChangePosition::new(0),
+                ChangePosition::new(1),
+            );
+            txn.put_graph(
+                global_node,
+                SerializedGraphEdge::new(
+                    EdgeFlags::BLOCK,
+                    Position::new(global_only_change, ChangePosition::new(0)),
+                    global_only_change,
+                ),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            (change_id, node, global_only_change)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        let cached = CachedGraphTxn::new(&txn).unwrap();
+        let expected_positions = vec![10, 20];
+
+        let edges = txn
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| edge.dest().pos.get())
+                .collect::<Vec<_>>(),
+            expected_positions
+        );
+        let cached_edges = cached
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(cached_edges, edges);
+
+        assert!(txn.has_vertex(node).unwrap());
+        assert!(cached.has_vertex(node).unwrap());
+        assert!(txn.has_change_in_graph(change_id).unwrap());
+        assert!(cached.has_change_in_graph(change_id).unwrap());
+        assert_eq!(
+            txn.find_block_end(Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            node
+        );
+        assert_eq!(
+            cached
+                .find_block_end(Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            node
+        );
+
+        let inode_edges = txn
+            .iter_inode_vertices(inode)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(inode_edges.len(), 3);
+        assert!(txn.inode_graph_is_populated(inode).unwrap());
+        assert!(cached.inode_graph_is_populated(inode).unwrap());
+        assert_eq!(
+            txn.find_block_end_in_inode(inode, Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            Some(node)
+        );
+        assert_eq!(
+            cached
+                .find_block_end_in_inode(inode, Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            Some(node)
+        );
+
+        let mut cached_adj = cached
+            .init_inode_adj(inode, node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap();
+        let mut cached_inode_edges = Vec::new();
+        while let Some(edge) = cached.next_inode_adj(&mut cached_adj) {
+            cached_inode_edges.push(edge.unwrap());
+        }
+        assert_eq!(cached_inode_edges, edges);
+
+        let preload = InodePreloadTxn::new(&txn, inode).unwrap();
+        let preload_edges = preload
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(preload_edges, edges);
+        assert!(preload.has_change_in_graph(global_only_change).unwrap());
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::pristine::txn::helpers::{try_collect, try_is_present};
 
 // GraphTxnT Implementation
 
@@ -54,7 +55,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -164,7 +165,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         // Without this direct lookup, iteration would return V[0:9] first since
         // it has a lower start position.
         let empty_key = encode_vertex(change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if try_is_present(table.get(&empty_key)?)? {
             return Ok(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -215,7 +216,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        let has = table.get(&key)?.next().is_some();
+        let has = try_is_present(table.get(&key)?)?;
         Ok(has)
     }
 
@@ -268,10 +269,59 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        let has = table
-            .range::<&[u8; 24]>(&start_key..=&end_key)?
-            .next()
-            .is_some();
+        let has = try_is_present(table.range::<&[u8; 24]>(&start_key..=&end_key)?)?;
         Ok(has)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pristine::{MutTxnT, Pristine};
+    use tempfile::tempdir;
+
+    #[test]
+    fn healthy_write_graph_reads_remain_ordered_and_filtered() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let change_id = txn.register_change(&Hash::of(b"write graph")).unwrap();
+        let node = GraphNode::new(change_id, ChangePosition::new(7), ChangePosition::new(7));
+
+        for (flag, position) in [
+            (EdgeFlags::BLOCK, 20),
+            (EdgeFlags::FOLDER, 15),
+            (EdgeFlags::BLOCK, 10),
+        ] {
+            txn.put_graph(
+                node,
+                SerializedGraphEdge::new(
+                    flag,
+                    Position::new(change_id, ChangePosition::new(position)),
+                    change_id,
+                ),
+            )
+            .unwrap();
+        }
+
+        let edges = txn
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| edge.dest().pos.get())
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert!(txn.has_vertex(node).unwrap());
+        assert!(txn.has_change_in_graph(change_id).unwrap());
+        assert_eq!(
+            txn.find_block_end(Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            node
+        );
     }
 }

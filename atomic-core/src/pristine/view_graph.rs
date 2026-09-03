@@ -91,6 +91,10 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
         &self,
         adj: &mut InodeAdjState,
     ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+        if adj.is_exhausted() {
+            return None;
+        }
+
         // Filter inode edges by the view's visible change set,
         // same as iter_adjacent does for the global GRAPH.
         loop {
@@ -103,7 +107,11 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
                     // Edge from a non-visible change — skip it
                     continue;
                 }
-                other => return other,
+                Some(Err(error)) => {
+                    adj.mark_exhausted();
+                    return Some(Err(error));
+                }
+                None => return None,
             }
         }
     }
@@ -143,6 +151,7 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
 pub struct FilteredAdj<I> {
     inner: I,
     visibility: GraphVisibilityClosure,
+    exhausted: bool,
 }
 
 impl<I> Iterator for FilteredAdj<I>
@@ -152,6 +161,10 @@ where
     type Item = Result<SerializedGraphEdge, PristineError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+
         loop {
             match self.inner.next() {
                 Some(Ok(edge)) => {
@@ -162,8 +175,14 @@ where
                     // Skip edges not visible in this view
                     continue;
                 }
-                Some(Err(e)) => return Some(Err(e)),
-                None => return None,
+                Some(Err(error)) => {
+                    self.exhausted = true;
+                    return Some(Err(error));
+                }
+                None => {
+                    self.exhausted = true;
+                    return None;
+                }
             }
         }
     }
@@ -186,6 +205,7 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         Ok(FilteredAdj {
             inner: inner_iter,
             visibility: self.visibility.clone(),
+            exhausted: false,
         })
     }
 
@@ -303,6 +323,104 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChangePosition;
+    use std::cell::Cell;
+
+    fn visible_edge() -> SerializedGraphEdge {
+        SerializedGraphEdge::new(
+            EdgeFlags::BLOCK,
+            Position::new(NodeId::ROOT, ChangePosition::new(0)),
+            NodeId::ROOT,
+        )
+    }
+
+    #[test]
+    fn filtered_adj_is_terminal_after_underlying_error() {
+        let error = PristineError::BlockNotFound { change: 1, pos: 0 };
+        let mut adj = FilteredAdj {
+            inner: vec![Err(error), Ok(visible_edge())].into_iter(),
+            visibility: GraphVisibilityClosure::empty(),
+            exhausted: false,
+        };
+
+        assert!(matches!(adj.next(), Some(Err(_))));
+        assert!(adj.next().is_none());
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ScriptedInodeError;
+
+    impl std::fmt::Display for ScriptedInodeError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("scripted inode error")
+        }
+    }
+
+    impl std::error::Error for ScriptedInodeError {}
+
+    struct ScriptedInodeTxn {
+        calls: Cell<usize>,
+    }
+
+    impl InodeGraphOps for ScriptedInodeTxn {
+        type InodeError = ScriptedInodeError;
+
+        fn init_inode_adj(
+            &self,
+            inode: Inode,
+            node: GraphNode<NodeId>,
+            min_flag: EdgeFlags,
+            max_flag: EdgeFlags,
+        ) -> Result<InodeAdjState, Self::InodeError> {
+            Ok(InodeAdjState::new(inode, node, min_flag, max_flag))
+        }
+
+        fn next_inode_adj(
+            &self,
+            _adj: &mut InodeAdjState,
+        ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call == 0 {
+                Some(Err(ScriptedInodeError))
+            } else {
+                Some(Ok(visible_edge()))
+            }
+        }
+
+        fn find_block_in_inode(
+            &self,
+            _inode: Inode,
+            _pos: Position<NodeId>,
+        ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+            Ok(None)
+        }
+
+        fn count_inode_vertices(&self, _inode: Inode) -> Result<usize, Self::InodeError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn filtered_inode_adj_marks_state_terminal_after_underlying_error() {
+        let inner = ScriptedInodeTxn {
+            calls: Cell::new(0),
+        };
+        let graph = ViewGraph::new(&inner, GraphVisibilityClosure::empty());
+        let mut adj = graph
+            .init_inode_adj(
+                Inode::new(1),
+                GraphNode::ROOT,
+                EdgeFlags::empty(),
+                EdgeFlags::all(),
+            )
+            .unwrap();
+
+        assert!(matches!(graph.next_inode_adj(&mut adj), Some(Err(_))));
+        assert!(adj.is_exhausted());
+        assert!(graph.next_inode_adj(&mut adj).is_none());
+        assert_eq!(inner.calls.get(), 1);
+    }
 
     #[test]
     fn test_is_visible_root_always_visible() {

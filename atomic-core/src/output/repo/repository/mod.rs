@@ -19,7 +19,7 @@ use crate::pristine::{GraphTxnT, TreeTxnT};
 use crate::types::Inode;
 
 use super::conflict::{FileConflict, FileConflictType};
-use super::file::{output_file_with_filter, FileOutputResult};
+use super::file::{apply_rendered_file, render_file_with_filter, FileOutputResult};
 use super::outcome::OutputOutcome;
 use super::tree::{collect_tree, TreeCollectOptions};
 
@@ -222,21 +222,22 @@ where
     // Collect items to output starting from root
     let items = collect_children(txn, Inode::ROOT, "", &options)?;
 
-    // Process each item
     let file_options = options.to_file_options();
 
     // ── View-aware pre-filter ──────────────────────────────────────
     let (passing_file_paths, passing_ancestors) =
         filter::compute_filters(&items, options.graph_visibility.as_ref());
 
+    // Select every directory and file before rendering. This preserves all
+    // filtering behavior while keeping the working copy untouched.
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
     for item in items {
         if item.is_directory {
-            // Only create directories that will contain files on this view
             if !filter::dir_has_passing_children(&item.path, &passing_ancestors) {
                 result.record_skipped();
                 continue;
             }
-            // Selective materialize: skip directories with no target files.
             if let Some(ref paths) = options.only_paths {
                 let has_target = paths.iter().any(|p| p.starts_with(&item.path));
                 if !has_target {
@@ -244,52 +245,63 @@ where
                     continue;
                 }
             }
-            // Create directory
-            working_copy
-                .create_dir_all(&item.path)
-                .map_err(MaterializeError::WorkingCopy)?;
-            result.record_directory();
-        } else {
-            // Check prefix filter
-            if !options.matches_prefix(&item.path) {
+            directories.push(item);
+            continue;
+        }
+
+        if !options.matches_prefix(&item.path) {
+            result.record_skipped();
+            continue;
+        }
+        if let Some(ref paths) = options.only_paths {
+            if !paths.contains(&item.path) {
                 result.record_skipped();
                 continue;
             }
-
-            // Selective materialize: skip files not in the explicit path set.
-            if let Some(ref paths) = options.only_paths {
-                if !paths.contains(&item.path) {
-                    result.record_skipped();
-                    continue;
-                }
-            }
-
-            // View-aware skip: if the file's introducing change is not in the
-            // filter, skip it entirely.
-            if let Some(ref paths) = passing_file_paths {
-                if !paths.contains(&item.path) {
-                    result.record_skipped();
-                    continue;
-                }
-            }
-
-            // Output file
-            let file_result = output_file_with_filter(
-                txn,
-                changes,
-                working_copy,
-                item.inode,
-                item.position,
-                &item.path,
-                file_options,
-                options.graph_visibility.clone(),
-            )
-            .map_err(|source| MaterializeError::FileOutput {
-                path: item.path.clone(),
-                source,
-            })?;
-            result.merge_file_result(file_result, false);
         }
+        if let Some(ref paths) = passing_file_paths {
+            if !paths.contains(&item.path) {
+                result.record_skipped();
+                continue;
+            }
+        }
+        files.push(item);
+    }
+
+    // Render the entire selected batch before the first working-copy mutation.
+    let mut rendered_files = Vec::with_capacity(files.len());
+    for item in files {
+        let rendered = render_file_with_filter::<T, C, W::Error>(
+            txn,
+            changes,
+            item.inode,
+            item.position,
+            &item.path,
+            file_options,
+            options.graph_visibility.clone(),
+        )
+        .map_err(|source| MaterializeError::FileOutput {
+            path: item.path,
+            source,
+        })?;
+        rendered_files.push(rendered);
+    }
+
+    // All graph traversal, resolution, and content loading succeeded. External
+    // write/flush failures may still leave partial effects by design.
+    for directory in directories {
+        working_copy
+            .create_dir_all(&directory.path)
+            .map_err(MaterializeError::WorkingCopy)?;
+        result.record_directory();
+    }
+
+    for rendered in rendered_files {
+        let path = rendered.result.path.clone();
+        let file_result =
+            apply_rendered_file(working_copy, rendered, file_options.flush_after_write)
+                .map_err(|source| MaterializeError::FileOutput { path, source })?;
+        result.merge_file_result(file_result, false);
     }
 
     Ok(result)

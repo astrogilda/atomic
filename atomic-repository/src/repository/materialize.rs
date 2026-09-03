@@ -110,6 +110,7 @@ fn render_name_conflict<C: atomic_core::change::ChangeStore>(
     store: &C,
     inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
     visibility: &GraphVisibilityClosure,
+    external_hashes: &std::collections::HashMap<NodeId, Hash>,
     path: &str,
     sides: &[(Inode, Position<NodeId>)],
 ) -> Result<Vec<u8>, String> {
@@ -134,15 +135,19 @@ fn render_name_conflict<C: atomic_core::change::ChangeStore>(
             .map_err(|e| format!("{}: name-conflict retrieve: {:?}", path, e))?;
         let mut graph = retrieve_result.graph;
         let order = compute_order(&mut graph);
-        let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order);
+        let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order)
+            .map_err(|error| format!("{}: name-conflict semantic resolution: {}", path, error))?;
         let buffer = Vec::with_capacity(graph.total_bytes());
         let mut writer = Writer::new(buffer);
-        let hash_fn = |node_id: NodeId| -> Option<Hash> {
-            if node_id.is_root() {
-                return None;
-            }
-            preloaded.get_external(node_id).ok().flatten()
-        };
+        let hash_fn =
+            |node_id: NodeId| -> Result<Option<Hash>, atomic_core::pristine::PristineError> {
+                if node_id.is_root() {
+                    return Ok(None);
+                }
+                external_hashes.get(&node_id).copied().map(Some).ok_or(
+                    atomic_core::pristine::PristineError::ChangeNotFound { id: node_id.get() },
+                )
+            };
         output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
             .map_err(|e| format!("{}: name-conflict content: {:?}", path, e))?;
         let side = writer.into_inner();
@@ -375,7 +380,7 @@ impl Repository {
         let working_copy = FileSystem::from_root(&self.root);
         let options = MaterializeOptions::new()
             .with_graph_visibility(visibility)
-            .only_paths(present_paths);
+            .only_paths(present_paths.clone());
 
         let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
@@ -383,7 +388,7 @@ impl Repository {
         drop(txn);
 
         result.files_deleted += self.remove_absent_entries(&absent_entries, None, None)?;
-        self.populate_file_index(&result);
+        self.populate_file_index(&result, &present_paths)?;
 
         Ok(result)
     }
@@ -437,7 +442,7 @@ impl Repository {
         let working_copy = FileSystem::from_root(&self.root);
         let options = MaterializeOptions::new()
             .with_graph_visibility(visibility)
-            .only_paths(present_paths);
+            .only_paths(present_paths.clone());
 
         let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
@@ -445,9 +450,8 @@ impl Repository {
         drop(txn);
 
         result.files_deleted += self.remove_absent_entries(&absent_entries, Some(&paths), None)?;
-        // Update FILE_INDEX only for files that were actually written,
-        // reading back only the affected files instead of all tracked files.
-        self.populate_file_index_for_paths(&paths);
+        // Update FILE_INDEX only for selected paths that should be present.
+        self.populate_file_index_for_paths(&present_paths)?;
 
         Ok(result)
     }
@@ -487,6 +491,27 @@ impl Repository {
         only_paths: Option<std::collections::HashSet<String>>,
         visibility: GraphVisibilityClosure,
         view_id: u64,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.materialize_parallel_with_visibility_mode(only_paths, visibility, view_id, true)
+    }
+
+    /// Validate every target render before a switch performs external effects.
+    pub(super) fn validate_materialization_with_visibility(
+        &self,
+        only_paths: Option<std::collections::HashSet<String>>,
+        visibility: GraphVisibilityClosure,
+        view_id: u64,
+    ) -> Result<(), RepositoryError> {
+        self.materialize_parallel_with_visibility_mode(only_paths, visibility, view_id, false)
+            .map(|_| ())
+    }
+
+    fn materialize_parallel_with_visibility_mode(
+        &self,
+        only_paths: Option<std::collections::HashSet<String>>,
+        visibility: GraphVisibilityClosure,
+        view_id: u64,
+        execute: bool,
     ) -> Result<MaterializeResult, RepositoryError> {
         use atomic_core::output::repo::OutputItem;
         use atomic_core::output::RetrieveOptions;
@@ -573,30 +598,8 @@ impl Repository {
             conflicts
         };
 
-        // Phase 3: Create directories needed by passing files
         let mut result = MaterializeResult::new();
         result.files_skipped += skipped_in_filter;
-
-        let file_paths: StdHashSet<&str> = file_items.iter().map(|i| i.path.as_str()).collect();
-        for item in &items {
-            if !item.is_directory {
-                continue;
-            }
-            // Check if any file starts with this directory path
-            let dir_prefix = format!("{}/", item.path);
-            let has_children = file_paths.iter().any(|p| p.starts_with(&dir_prefix));
-            if !has_children {
-                result.record_skipped();
-                continue;
-            }
-            let abs_dir = self.root.join(&item.path);
-            if !abs_dir.exists() {
-                std::fs::create_dir_all(&abs_dir).map_err(|e| {
-                    RepositoryError::Output(format!("Failed to create directory: {}", e))
-                })?;
-            }
-            result.record_directory();
-        }
 
         // Phase 5a: Pre-warm the ChangeStore cache.
         //
@@ -611,27 +614,57 @@ impl Repository {
         let trace_mat = std::env::var_os("ATOMIC_TRACE_MATERIALIZE").is_some();
         let mat_start = std::time::Instant::now();
 
-        {
-            // Collect unique change hashes from all file positions
-            let mut change_ids_to_warm: std::collections::HashSet<NodeId> =
-                std::collections::HashSet::new();
+        let external_hashes = {
+            let mut change_paths: std::collections::HashMap<NodeId, Vec<String>> =
+                std::collections::HashMap::new();
             for item in &file_items {
                 if !item.position.change.is_root() {
-                    change_ids_to_warm.insert(item.position.change);
+                    change_paths
+                        .entry(item.position.change)
+                        .or_default()
+                        .push(item.path.clone());
                 }
             }
-            // Also include all changes in the view filter — any of them
-            // could have content vertices.
+            // Any visible change may own a content vertex reached while rendering.
             for id in visibility.iter_dependency_first().copied() {
                 if !id.is_root() {
-                    change_ids_to_warm.insert(id);
+                    change_paths.entry(id).or_default();
                 }
             }
-            // Resolve NodeId → Hash and pre-load each change
+
+            let mut change_ids_to_warm: Vec<NodeId> = change_paths.keys().copied().collect();
+            change_ids_to_warm.sort_by_key(|id| id.get());
+            let mut hashes = std::collections::HashMap::with_capacity(change_ids_to_warm.len());
             for node_id in &change_ids_to_warm {
-                if let Ok(Some(hash)) = txn.get_external(*node_id) {
-                    let _ = store.load_change(&hash);
-                }
+                let mut paths = change_paths.remove(node_id).unwrap_or_default();
+                paths.sort();
+                paths.dedup();
+                let context = if paths.is_empty() {
+                    format!("visible change {}", node_id.get())
+                } else {
+                    format!("change {} for path(s) {}", node_id.get(), paths.join(", "))
+                };
+                let hash = txn
+                    .get_external(*node_id)
+                    .map_err(|error| {
+                        RepositoryError::Database(format!(
+                            "failed to resolve {} while pre-warming materialization: {}",
+                            context, error
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "failed to resolve {} while pre-warming materialization: missing external hash",
+                            context
+                        ))
+                    })?;
+                store.load_change(&hash).map_err(|error| {
+                    RepositoryError::Output(format!(
+                        "failed to load {} ({}) while pre-warming materialization: {}",
+                        context, hash, error
+                    ))
+                })?;
+                hashes.insert(*node_id, hash);
             }
             if trace_mat {
                 eprintln!(
@@ -640,7 +673,8 @@ impl Repository {
                     mat_start.elapsed(),
                 );
             }
-        }
+            hashes
+        };
 
         // Phase 5b: Load FILE_INDEX for content-hash skip.
         //
@@ -653,7 +687,9 @@ impl Repository {
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let entries = idx_txn.iter_file_index().unwrap_or_default();
+            let entries = idx_txn
+                .iter_file_index()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
             entries
                 .into_iter()
                 .map(|(p, s, n, sz, h)| (p, (s, n, sz, h)))
@@ -666,8 +702,8 @@ impl Repository {
             .open_inode_graph_table()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Phase 5c: Process files in parallel — retrieve graph, buffer content,
-        // check content-hash, write to disk only if changed
+        // Phase 5c: Process files in parallel — retrieve, order, render, hash,
+        // and decide whether a write is needed. Workers never mutate the working copy.
         type FileResult = Result<Option<(MaterializedEntry, Hash, bool, Option<u32>)>, String>;
         let file_results: Vec<FileResult> = file_items
             .par_iter()
@@ -713,15 +749,24 @@ impl Repository {
                     let order_ms = t_order.elapsed();
 
                     let t_content = std::time::Instant::now();
-                    let resolved =
-                        resolve_conflicts_semantically(&preloaded, store, &graph, &order);
+                    let resolved = resolve_conflicts_semantically(
+                        &preloaded, store, &graph, &order,
+                    )
+                    .map_err(|error| format!("{}: semantic resolution: {}", item.path, error))?;
                     let buffer = Vec::with_capacity(graph.total_bytes());
                     let mut writer = Writer::new(buffer);
-                    let hash_fn = |node_id: NodeId| -> Option<Hash> {
+                    let hash_fn = |node_id: NodeId| -> Result<
+                        Option<Hash>,
+                        atomic_core::pristine::PristineError,
+                    > {
                         if node_id.is_root() {
-                            return None;
+                            return Ok(None);
                         }
-                        preloaded.get_external(node_id).ok().flatten()
+                        external_hashes.get(&node_id).copied().map(Some).ok_or(
+                            atomic_core::pristine::PristineError::ChangeNotFound {
+                                id: node_id.get(),
+                            },
+                        )
                     };
                     output_graph_content_resolved(
                         store,
@@ -745,6 +790,7 @@ impl Repository {
                         store,
                         &inode_graph_table,
                         &visibility,
+                        &external_hashes,
                         &item.path,
                         sides,
                     )?,
@@ -762,7 +808,7 @@ impl Repository {
 
                 // Compute content hash from the in-memory buffer.
                 let content_hash = Hash::of(content);
-                let bytes_written = content.len() as u64;
+                let rendered_bytes = content.len() as u64;
 
                 // Content-hash skip: if the file on disk already has this
                 // exact content, skip the write entirely.
@@ -801,17 +847,6 @@ impl Repository {
                     }
                 }
 
-                // Write to disk in a single call
-                let abs_path = root.join(&item.path);
-                if let Some(parent) = abs_path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("{}: create parent: {}", item.path, e))?;
-                    }
-                }
-                std::fs::write(&abs_path, &content)
-                    .map_err(|e| format!("{}: write: {}", item.path, e))?;
-
                 if trace_mat {
                     let elapsed = file_start.elapsed();
                     if elapsed > std::time::Duration::from_millis(50) {
@@ -819,7 +854,7 @@ impl Repository {
                             "[materialize] SLOW {} bytes={} vertices={} edges={} \
                              retrieve={:?} order={:?} content={:?} total={:?}",
                             item.path,
-                            bytes_written,
+                            rendered_bytes,
                             vertices,
                             edges,
                             retrieve_ms,
@@ -842,59 +877,32 @@ impl Repository {
             );
         }
 
-        // Phase 6: Aggregate results and update FILE_INDEX
-        let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+        // Validate the entire render batch before the first working-copy or
+        // pristine mutation. Rayon has already evaluated every item into this
+        // vector, so any graph/preload/content error aborts the batch here.
+        let rendered_files = file_results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RepositoryError::Output)?;
+
+        if !execute {
+            drop(inode_graph_table);
+            drop(txn);
+            return Ok(result);
+        }
+
         // Files whose materialized content carries conflict markers, with the
         // 1-based line of the first marker.
         let mut conflicts_by_path: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
-
-        for file_result in file_results {
-            let file_result = file_result.map_err(RepositoryError::Output)?;
-            let Some((entry, content_hash, was_written, marker_line)) = file_result else {
-                result.files_skipped += 1;
-                continue;
-            };
-            let path = entry.path().to_string();
-            let bytes = entry.bytes().map_or(0, |bytes| bytes.len() as u64);
-            if let Some(line) = marker_line {
-                conflicts_by_path.insert(path.clone(), line);
-            }
-            if was_written {
-                result.files_written += 1;
-                result.bytes_written += bytes;
-
-                // Stat the freshly written file for FILE_INDEX.
-                let abs_path = root.join(&path);
-                let metadata = std::fs::metadata(&abs_path).map_err(|error| {
-                    RepositoryError::Output(format!(
-                        "failed to stat materialized path '{}': {}",
-                        path, error
-                    ))
-                })?;
-                let mtime = metadata
-                    .modified()
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                let duration = mtime
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default();
-                index_entries.push((
-                    path,
-                    duration.as_secs() as i64,
-                    duration.subsec_nanos(),
-                    metadata.len(),
-                    content_hash,
-                ));
-            } else {
-                // Content-hash skip: file already had correct content.
-                result.files_skipped += 1;
+        for rendered in rendered_files.iter().flatten() {
+            if let Some(line) = rendered.3 {
+                conflicts_by_path.insert(rendered.0.path().to_string(), line);
             }
         }
 
-        // Persist conflict state so `atomic status` can surface conflicted
-        // files and `record` can refuse to bake markers into history.
-        // Build path→inode from the materialized items, then write in a
-        // dedicated txn (the read txn above is dropped first).
+        // Build path→inode while the projected items are still borrowed from
+        // the read transaction. Conflict persistence itself happens later.
         let mut path_to_inode: std::collections::HashMap<String, u64> = file_items
             .iter()
             .map(|i| (i.path.clone(), i.inode.get()))
@@ -904,6 +912,89 @@ impl Repository {
                 path_to_inode.insert(entry.path().to_string(), inode.get());
             }
         }
+
+        // Execution phase. From this point onward an external filesystem error
+        // can leave partial effects; graph/render/preload errors cannot reach it.
+        let file_paths: StdHashSet<&str> = file_items.iter().map(|i| i.path.as_str()).collect();
+        for item in &items {
+            if !item.is_directory {
+                continue;
+            }
+            let dir_prefix = format!("{}/", item.path);
+            let has_children = file_paths.iter().any(|path| path.starts_with(&dir_prefix));
+            if !has_children {
+                result.record_skipped();
+                continue;
+            }
+            let abs_dir = root.join(&item.path);
+            if !abs_dir.exists() {
+                std::fs::create_dir_all(&abs_dir).map_err(|error| {
+                    RepositoryError::Output(format!(
+                        "failed to create materialized directory '{}': {}",
+                        item.path, error
+                    ))
+                })?;
+            }
+            result.record_directory();
+        }
+
+        let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
+        for rendered in rendered_files {
+            let Some((entry, content_hash, needs_write, _marker_line)) = rendered else {
+                result.files_skipped += 1;
+                continue;
+            };
+            if !needs_write {
+                result.files_skipped += 1;
+                continue;
+            }
+
+            let path = entry.path().to_string();
+            let content = entry
+                .bytes()
+                .expect("parallel renderer always produces a present entry");
+            let abs_path = root.join(&path);
+            if let Some(parent) = abs_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        RepositoryError::Output(format!(
+                            "failed to create parent for '{}': {}",
+                            path, error
+                        ))
+                    })?;
+                }
+            }
+            std::fs::write(&abs_path, content).map_err(|error| {
+                RepositoryError::Output(format!("failed to write '{}': {}", path, error))
+            })?;
+
+            result.files_written += 1;
+            result.bytes_written += content.len() as u64;
+
+            let metadata = std::fs::metadata(&abs_path).map_err(|error| {
+                RepositoryError::Output(format!(
+                    "failed to stat materialized path '{}': {}",
+                    path, error
+                ))
+            })?;
+            let mtime = metadata.modified().map_err(|error| {
+                RepositoryError::Output(format!(
+                    "failed to read modification time for '{}': {}",
+                    path, error
+                ))
+            })?;
+            let duration = mtime
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            index_entries.push((
+                path,
+                duration.as_secs() as i64,
+                duration.subsec_nanos(),
+                metadata.len(),
+                content_hash,
+            ));
+        }
+
         drop(inode_graph_table);
         drop(txn);
 
@@ -917,102 +1008,94 @@ impl Repository {
         Ok(result)
     }
 
-    /// Populate the file index for all tracked files after a materialize.
+    /// Populate FILE_INDEX for the tracked paths that the lifecycle projection
+    /// says must be present after materialization.
     ///
-    /// Stats each tracked file from disk and stores its mtime + size +
-    /// content hash in the pristine database. Errors are silently ignored
-    /// (best-effort).
-    ///
-    /// Why we ignore `result.file_results` and walk the tracked set: the
-    /// `MaterializeResult.file_results` map is only populated when
-    /// `merge_file_result(_, store_result=true)` is called, and the
-    /// `materialize_view` call site in `atomic-core` passes `false`. As a
-    /// result `result.file_results.keys()` is empty in production, and the
-    /// previous implementation of this function silently no-op'd —
-    /// FILE_INDEX was never refreshed by materialize, leaving stale
-    /// per-view hashes after `view switch` and producing false `Modified`
-    /// reports from `status`.
-    ///
-    /// Walking `list_tracked_files()` is correct because materialize has
-    /// just brought the working copy into sync with the destination
-    /// view's recorded state — every tracked file's on-disk content is
-    /// the authoritative baseline FILE_INDEX should cache.
-    fn populate_file_index(&self, _result: &MaterializeResult) {
-        use std::time::SystemTime;
-
-        let tracked = match self.list_tracked_files() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-
-        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::with_capacity(tracked.len());
-
-        for file in &tracked {
-            let abs_path = self.root.join(&file.path);
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(m) if m.is_file() => m,
-                _ => continue,
-            };
-
-            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let duration = mtime
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            let secs = duration.as_secs() as i64;
-            let nanos = duration.subsec_nanos();
-            let size = metadata.len();
-
-            let content_hash = match std::fs::read(&abs_path) {
-                Ok(bytes) => Hash::of(&bytes),
-                Err(_) => continue,
-            };
-
-            let normalized = file.path.to_string_lossy().replace('\\', "/");
-            entries.push((normalized, secs, nanos, size, content_hash));
+    /// Tracked paths that are absent in this view are intentionally excluded;
+    /// every selected present path must stat and read successfully.
+    fn populate_file_index(
+        &self,
+        _result: &MaterializeResult,
+        present_paths: &std::collections::HashSet<String>,
+    ) -> Result<(), RepositoryError> {
+        let tracked = self.list_tracked_files()?;
+        let tracked_paths: std::collections::HashSet<String> = tracked
+            .iter()
+            .map(|file| file.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        if let Some(path) = present_paths
+            .iter()
+            .find(|path| !tracked_paths.contains(path.as_str()))
+        {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot index materialized path '{}': path is not tracked",
+                    path
+                ),
+            });
         }
-
-        if !entries.is_empty() {
-            let _ = self.update_file_index(&entries);
-        }
+        self.populate_file_index_for_paths(present_paths)
     }
 
-    /// Update FILE_INDEX for a specific set of paths.
+    /// Update FILE_INDEX for paths that must be present after materialization.
     ///
-    /// Reads only the specified files from disk to compute their content
-    /// hashes, rather than re-reading every tracked file. This is used
-    /// after selective materialization to update only the affected entries.
+    /// Callers pass the lifecycle-present subset, so a missing path is an error;
+    /// legitimately absent paths never enter this set.
     #[allow(dead_code)]
-    fn populate_file_index_for_paths(&self, paths: &std::collections::HashSet<String>) {
+    fn populate_file_index_for_paths(
+        &self,
+        paths: &std::collections::HashSet<String>,
+    ) -> Result<(), RepositoryError> {
         use std::time::SystemTime;
 
-        let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::with_capacity(paths.len());
+        let mut ordered_paths: Vec<&String> = paths.iter().collect();
+        ordered_paths.sort();
+        let mut entries: Vec<(String, i64, u32, u64, Hash)> =
+            Vec::with_capacity(ordered_paths.len());
 
-        for path in paths {
+        for path in ordered_paths {
             let abs_path = self.root.join(path);
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(m) if m.is_file() => m,
-                _ => continue,
-            };
+            let metadata = std::fs::metadata(&abs_path).map_err(|error| {
+                RepositoryError::Output(format!(
+                    "failed to stat materialized path '{}': {}",
+                    path, error
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "cannot index materialized path '{}': path is not a file",
+                        path
+                    ),
+                });
+            }
 
-            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime = metadata.modified().map_err(|error| {
+                RepositoryError::Output(format!(
+                    "failed to read modification time for '{}': {}",
+                    path, error
+                ))
+            })?;
             let duration = mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
-            let secs = duration.as_secs() as i64;
-            let nanos = duration.subsec_nanos();
-            let size = metadata.len();
+            let content = std::fs::read(&abs_path).map_err(|error| {
+                RepositoryError::Output(format!(
+                    "failed to read materialized path '{}': {}",
+                    path, error
+                ))
+            })?;
 
-            let content_hash = match std::fs::read(&abs_path) {
-                Ok(bytes) => Hash::of(&bytes),
-                Err(_) => continue,
-            };
-
-            entries.push((path.clone(), secs, nanos, size, content_hash));
+            entries.push((
+                path.clone(),
+                duration.as_secs() as i64,
+                duration.subsec_nanos(),
+                metadata.len(),
+                Hash::of(&content),
+            ));
         }
 
-        if !entries.is_empty() {
-            let _ = self.update_file_index(&entries);
-        }
+        self.update_file_index(&entries)
     }
 
     /// Materialize the working copy for a specific prefix only.
@@ -1058,7 +1141,7 @@ impl Repository {
         let options = MaterializeOptions::new()
             .prefix(prefix)
             .with_graph_visibility(visibility)
-            .only_paths(present_paths);
+            .only_paths(present_paths.clone());
 
         let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
             .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
@@ -1066,7 +1149,7 @@ impl Repository {
         drop(txn);
 
         result.files_deleted += self.remove_absent_entries(&absent_entries, None, Some(prefix))?;
-        self.populate_file_index(&result);
+        self.populate_file_index(&result, &present_paths)?;
 
         Ok(result)
     }

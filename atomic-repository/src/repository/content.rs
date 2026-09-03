@@ -599,7 +599,7 @@ impl Repository {
     where
         T: atomic_core::pristine::GraphTxnT
             + atomic_core::pristine::TreeTxnT
-            + atomic_core::pristine::InodeGraphOps,
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     {
         use atomic_core::output::alive::RetrieveOptions;
 
@@ -675,7 +675,8 @@ pub(crate) fn retrieve_content_with_filter_fast<T, C>(
     options: atomic_core::output::alive::RetrieveOptions,
 ) -> atomic_core::record::RecordResult<Vec<u8>>
 where
-    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     C: atomic_core::change::ChangeStore,
 {
     retrieve_content_with_filter_fast_with_fork_info(txn, changes, inode, position, options)
@@ -701,7 +702,8 @@ pub(crate) fn retrieve_content_with_filter_fast_with_fork_info<T, C>(
     options: atomic_core::output::alive::RetrieveOptions,
 ) -> atomic_core::record::RecordResult<(Vec<u8>, bool)>
 where
-    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     C: atomic_core::change::ChangeStore,
 {
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
@@ -757,7 +759,8 @@ fn select_linear_successor<T>(
     options: &atomic_core::output::alive::RetrieveOptions,
 ) -> atomic_core::record::RecordResult<LinearStep>
 where
-    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
 {
     use atomic_core::types::EdgeFlags;
 
@@ -766,10 +769,7 @@ where
         std::collections::HashSet::new();
 
     while let Some(edge_result) = txn.next_inode_adj(adj) {
-        let edge = match edge_result {
-            Ok(edge) => edge,
-            Err(_) => return Ok(LinearStep::Bail),
-        };
+        let edge = edge_result?;
         let flags = edge.flag();
         if flags.contains(EdgeFlags::PARENT)
             || flags.contains(EdgeFlags::PSEUDO)
@@ -780,10 +780,13 @@ where
         if !options.passes_filter(edge.introduced_by()) {
             continue;
         }
-        let dest = match txn.find_block_in_inode(inode, edge.dest()) {
-            Ok(Some(d)) => d,
-            Ok(None) | Err(_) => return Ok(LinearStep::Bail),
-        };
+        let edge_dest = edge.dest();
+        let dest = txn.find_block_in_inode(inode, edge_dest)?.ok_or_else(|| {
+            atomic_core::pristine::PristineError::BlockNotFound {
+                change: edge_dest.change.get(),
+                pos: edge_dest.pos.get(),
+            }
+        })?;
         if !options.passes_filter(dest.change) {
             continue;
         }
@@ -821,7 +824,8 @@ fn try_retrieve_linear_content_with_filter<T, C>(
     options: &atomic_core::output::alive::RetrieveOptions,
 ) -> atomic_core::record::RecordResult<Option<Vec<u8>>>
 where
-    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     C: atomic_core::change::ChangeStore,
 {
     #[allow(unused_imports)]
@@ -848,14 +852,7 @@ where
             return Ok(None);
         }
 
-        let mut adj = txn
-            .init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all())
-            .map_err(|e| {
-                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
-                    "Failed to init inode traversal: {}",
-                    e
-                )))
-            })?;
+        let mut adj = txn.init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all())?;
 
         let dest = match select_linear_successor(txn, inode, &mut adj, options)? {
             LinearStep::Follow(d) => d,
@@ -876,40 +873,37 @@ where
     let mut content = Vec::new();
     let mut change_contents = std::collections::HashMap::<Hash, Vec<u8>>::new();
     for node in vertices {
-        let Some(hash) = txn.get_external(node.change).ok().flatten() else {
-            if trace_retrieve {
-                eprintln!(
-                    "[try_retrieve_linear_content_with_filter] missing hash for {}",
-                    node
-                );
+        let hash = txn.get_external(node.change)?.ok_or_else(|| {
+            atomic_core::pristine::PristineError::ChangeNotFound {
+                id: node.change.get(),
             }
-            return Ok(None);
-        };
+        })?;
 
         if let std::collections::hash_map::Entry::Vacant(entry) = change_contents.entry(hash) {
-            let Ok(change) = changes.get_change(&hash) else {
-                if trace_retrieve {
-                    eprintln!(
-                        "[try_retrieve_linear_content_with_filter] load_change failed for {}",
-                        node
-                    );
-                }
-                return Ok(None);
-            };
+            let change = changes.get_change(&hash).map_err(|error| {
+                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
+                    "failed to load change {} for {}: {}",
+                    hash, node, error
+                )))
+            })?;
             entry.insert(change.contents);
         }
 
         let start = node.start.get() as usize;
         let end = node.end.get() as usize;
         let bytes = change_contents.get(&hash).expect("change contents cached");
-        if end > bytes.len() {
-            if trace_retrieve {
-                eprintln!(
-                    "[try_retrieve_linear_content_with_filter] span out of bounds for {}",
-                    node
-                );
+        if start > end || end > bytes.len() {
+            return Err(atomic_core::pristine::PristineError::InvalidVertex {
+                message: format!(
+                    "content span {}..{} for {} exceeds change {} content length {}",
+                    start,
+                    end,
+                    node,
+                    hash,
+                    bytes.len()
+                ),
             }
-            return Ok(None);
+            .into());
         }
         content.extend_from_slice(&bytes[start..end]);
     }

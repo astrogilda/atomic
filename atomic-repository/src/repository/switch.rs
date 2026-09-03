@@ -159,6 +159,22 @@ impl Repository {
             )
         };
 
+        let mut differing_paths = HashSet::new();
+        for hash in &differing_hashes {
+            let change = self.load_change(hash)?;
+            for op in change.hunks() {
+                if let Some(path) = op.path() {
+                    differing_paths.insert(path.to_string());
+                }
+            }
+        }
+
+        // Render the complete target before publishing the target pointer,
+        // shelving ignored files, or removing tracked paths. This does not make
+        // filesystem execution crash-safe, but it guarantees graph/preload/
+        // content errors refuse the switch before its first external effect.
+        self.validate_materialization_with_visibility(None, new_visibility.clone(), new_view_id)?;
+
         // Apply only the small set of view-scoped TREE operations and publish
         // the new pointer while holding the same database write lock. A marker
         // makes the transition recoverable if the process exits mid-switch.
@@ -315,17 +331,9 @@ impl Repository {
             }
 
             // Membership-only differences identify changes whose paths may
-            // need rematerialization. Visibility closure is intentionally not
-            // part of this presentation/impact domain.
-            for hash in &differing_hashes {
-                if let Ok(change) = self.load_change(hash) {
-                    for op in change.hunks() {
-                        if let Some(path) = op.path() {
-                            affected_paths.insert(path.to_string());
-                        }
-                    }
-                }
-            }
+            // need rematerialization. Their change objects were loaded and
+            // validated before the switch's first external effect.
+            affected_paths.extend(differing_paths);
 
             if affected_paths.is_empty() {
                 self.materialize_parallel_with_visibility(

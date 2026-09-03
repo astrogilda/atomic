@@ -212,10 +212,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
             // First resolve the position to an actual span using find_block.
             // This handles the case where position 9 could refer to either an
             // inode span V[9:9] or a content span V[9:23].
-            let resolved_vertex = match txn.find_block(dest_pos) {
-                Ok(v) => v,
-                Err(_) => continue, // Position doesn't resolve to a span
-            };
+            let resolved_vertex = txn.find_block(dest_pos)?;
 
             // Check if this span passes the change filter.
             // This is the key mechanism for state-based content retrieval:
@@ -458,10 +455,7 @@ fn walk_through_dead<T: GraphTxnT>(
 
         for edge in edges {
             let next_pos = edge.dest;
-            let next_vertex = match txn.find_block(next_pos) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let next_vertex = txn.find_block(next_pos)?;
 
             if seen.contains(&next_vertex) {
                 continue;
@@ -482,43 +476,37 @@ fn walk_through_dead<T: GraphTxnT>(
                 // Ancestors of `owner_parent` in the already-built alive
                 // graph do not count as alternates; they are the same
                 // linear chain we are currently bypassing for.
-                let has_alive_alt_parent = {
-                    let parents = txn.iter_parents(next_vertex, true)?;
-                    parents.iter().any(|p| {
-                        if !options.passes_filter(p.introduced_by) {
-                            return false;
-                        }
-                        match p.kind {
-                            crate::types::ParentEdgeKind::Block
-                            | crate::types::ParentEdgeKind::Folder => {
-                                let source_vertex = match txn.find_block_end(p.dest) {
-                                    Ok(v) => v,
-                                    Err(_) => return false,
-                                };
-                                let source_alive = match options.is_vertex_alive(txn, source_vertex)
-                                {
-                                    Ok(alive) => alive,
-                                    Err(_) => return false,
-                                };
-                                if !source_alive {
-                                    return false;
-                                }
-                                if source_vertex == owner_parent {
-                                    return false;
-                                }
-                                if let (Some(&source_vid), Some(&owner_vid)) =
-                                    (cache.get(&source_vertex), cache.get(&owner_parent))
-                                {
-                                    if alive_graph_reaches(&result.graph, source_vid, owner_vid) {
-                                        return false;
-                                    }
-                                }
-                                !dead_visited.contains(&source_vertex)
+                let mut has_alive_alt_parent = false;
+                for parent in txn.iter_parents(next_vertex, true)? {
+                    if !options.passes_filter(parent.introduced_by) {
+                        continue;
+                    }
+
+                    match parent.kind {
+                        crate::types::ParentEdgeKind::Block
+                        | crate::types::ParentEdgeKind::Folder => {
+                            let source_vertex = txn.find_block_end(parent.dest)?;
+                            if !options.is_vertex_alive(txn, source_vertex)? {
+                                continue;
                             }
-                            _ => false,
+                            if source_vertex == owner_parent {
+                                continue;
+                            }
+                            if let (Some(&source_vid), Some(&owner_vid)) =
+                                (cache.get(&source_vertex), cache.get(&owner_parent))
+                            {
+                                if alive_graph_reaches(&result.graph, source_vid, owner_vid) {
+                                    continue;
+                                }
+                            }
+                            if !dead_visited.contains(&source_vertex) {
+                                has_alive_alt_parent = true;
+                                break;
+                            }
                         }
-                    })
-                };
+                        _ => {}
+                    }
+                }
 
                 // Add to alive graph (so the normal traversal can find it
                 // via the alternate path).  Push onto stack so its
@@ -534,17 +522,24 @@ fn walk_through_dead<T: GraphTxnT>(
                 };
 
                 if !has_alive_alt_parent && !live_successors.contains(&vid) {
-                    let shadowed_by_existing =
-                        live_successors.iter().copied().any(|existing_vid| {
-                            let existing_node = result.graph.get_vertex(existing_vid).node;
-                            visible_chain_reaches(txn, options, existing_node, next_vertex)
-                        });
+                    let mut shadowed_by_existing = false;
+                    for existing_vid in live_successors.iter().copied() {
+                        let existing_node = result.graph.get_vertex(existing_vid).node;
+                        if visible_chain_reaches(txn, options, existing_node, next_vertex)? {
+                            shadowed_by_existing = true;
+                            break;
+                        }
+                    }
 
                     if !shadowed_by_existing {
-                        live_successors.retain(|existing_vid| {
-                            let existing_node = result.graph.get_vertex(*existing_vid).node;
-                            !visible_chain_reaches(txn, options, next_vertex, existing_node)
-                        });
+                        let mut retained = Vec::with_capacity(live_successors.len());
+                        for existing_vid in live_successors.drain(..) {
+                            let existing_node = result.graph.get_vertex(existing_vid).node;
+                            if !visible_chain_reaches(txn, options, next_vertex, existing_node)? {
+                                retained.push(existing_vid);
+                            }
+                        }
+                        live_successors = retained;
                         live_successors.push(vid);
                     }
                 }
@@ -572,9 +567,9 @@ fn visible_chain_reaches<T: GraphTxnT>(
     options: &RetrieveOptions,
     start: GraphNode<NodeId>,
     target: GraphNode<NodeId>,
-) -> bool {
+) -> Result<bool, PristineError> {
     if start == target {
-        return true;
+        return Ok(true);
     }
 
     let mut stack = vec![start];
@@ -585,34 +580,26 @@ fn visible_chain_reaches<T: GraphTxnT>(
             continue;
         }
 
-        let edges = match txn.iter_forward(current, true) {
-            Ok(edges) => edges,
-            Err(_) => continue,
-        };
-
-        for edge in edges {
+        for edge in txn.iter_forward(current, true)? {
             if edge.kind.is_pseudo() {
                 continue;
             }
 
-            let next = match txn.find_block(edge.dest) {
-                Ok(next) => next,
-                Err(_) => continue,
-            };
+            let next = txn.find_block(edge.dest)?;
 
             if !options.passes_filter(next.change) {
                 continue;
             }
 
             if next == target {
-                return true;
+                return Ok(true);
             }
 
             stack.push(next);
         }
     }
 
-    false
+    Ok(false)
 }
 
 fn alive_graph_reaches(graph: &AliveGraph, from: VertexId, target: VertexId) -> bool {
