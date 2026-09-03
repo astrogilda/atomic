@@ -884,19 +884,19 @@ main();
 }
 
 fn dump_filtered_alive_graph_for_test(repo: &Repository, path: &str) {
-    use crate::repository::filter::collect_visible_change_ids;
+    use crate::repository::filter::graph_visibility_closure;
     use atomic_core::change::ChangeStore as _;
     use atomic_core::output::alive::{compute_order, retrieve_graph, RetrieveOptions, VertexId};
     use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 
     let txn = repo.pristine.read_txn().unwrap();
     let view = txn.get_view(&repo.current_view).unwrap().unwrap();
-    let filter = collect_visible_change_ids(&txn, &view).unwrap();
+    let visibility = graph_visibility_closure(&txn, &view).unwrap();
     let (_, position) = repo.get_inode_and_position(path).unwrap().unwrap();
     let retrieve = retrieve_graph(
         &txn,
         position,
-        RetrieveOptions::new().with_change_filter(filter),
+        RetrieveOptions::new().with_graph_visibility(visibility),
     )
     .unwrap();
     let mut graph = retrieve.graph;

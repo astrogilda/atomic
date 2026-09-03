@@ -165,12 +165,52 @@ pub enum PristineError {
         parent_name: String,
     },
 
+    /// A persisted view references a parent that is not present.
+    BrokenViewParent {
+        /// Internal ID of the child view.
+        view_id: u64,
+        /// Human-readable child view name.
+        view_name: String,
+        /// Missing parent view ID.
+        parent_id: u64,
+    },
+
     /// Change not found by its internal ID
     ///
     /// The NodeId doesn't correspond to any registered change.
     ChangeNotFound {
         /// The internal ID that wasn't found
         id: u64,
+    },
+
+    /// A change has no dependency-index marker.
+    UnindexedChangeDependencies {
+        /// Internal ID of the change that needs dependency-index repair.
+        change_id: u64,
+    },
+
+    /// The dependency-index marker disagrees with the stored unique rows.
+    ChangeDependencyCountMismatch {
+        /// Internal ID of the inconsistent change.
+        change_id: u64,
+        /// Unique dependency count recorded in the marker table.
+        expected: u64,
+        /// Unique dependency rows actually found.
+        actual: u64,
+    },
+
+    /// A dependency hash is not registered in the local repository.
+    MissingRegisteredDependency {
+        /// Internal ID of the depending change.
+        change_id: u64,
+        /// External hash of the missing dependency.
+        dependency: String,
+    },
+
+    /// The indexed change dependency graph contains a cycle.
+    DependencyCycle {
+        /// Internal change IDs forming the cycle, with the first repeated last.
+        cycle: Vec<u64>,
     },
 
     /// Hash not found in the external→internal mapping
@@ -285,8 +325,51 @@ impl fmt::Display for PristineError {
                     name, parent_name
                 )
             }
+            Self::BrokenViewParent {
+                view_id,
+                view_name,
+                parent_id,
+            } => write!(
+                f,
+                "view '{}' ({}) references missing parent view {}; repair the view hierarchy before resolving visibility",
+                view_name, view_id, parent_id
+            ),
             Self::IdSpaceExhausted => write!(f, "internal ID space exhausted (u64::MAX reached)"),
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
+            Self::UnindexedChangeDependencies { change_id } => write!(
+                f,
+                "change {} has no indexed dependency metadata; backfill the dependency index before graph traversal",
+                change_id
+            ),
+            Self::ChangeDependencyCountMismatch {
+                change_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "change {} dependency index count mismatch: marker says {}, but {} unique rows were found; rebuild the dependency index",
+                change_id, expected, actual
+            ),
+            Self::MissingRegisteredDependency {
+                change_id,
+                dependency,
+            } => write!(
+                f,
+                "change {} depends on {}, which is not registered locally; fetch or register the dependency before graph traversal",
+                change_id, dependency
+            ),
+            Self::DependencyCycle { cycle } => {
+                let path = cycle
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                write!(
+                    f,
+                    "change dependency cycle detected ({}); repair the dependency index before graph traversal",
+                    path
+                )
+            }
             Self::HashNotFound { hash } => write!(f, "hash not found: {}", hash),
 
             // Data errors
@@ -428,8 +511,41 @@ mod tests {
                 &["cannot set parent", "a", "b", "cycle"],
             ),
             (
+                PristineError::BrokenViewParent {
+                    view_id: 3,
+                    view_name: "feature".into(),
+                    parent_id: 99,
+                },
+                &["feature", "3", "missing parent", "99", "repair"],
+            ),
+            (
                 PristineError::ChangeNotFound { id: 42 },
                 &["change not found", "42"],
+            ),
+            (
+                PristineError::UnindexedChangeDependencies { change_id: 7 },
+                &["7", "no indexed dependency", "backfill"],
+            ),
+            (
+                PristineError::ChangeDependencyCountMismatch {
+                    change_id: 7,
+                    expected: 2,
+                    actual: 1,
+                },
+                &["7", "count mismatch", "2", "1", "rebuild"],
+            ),
+            (
+                PristineError::MissingRegisteredDependency {
+                    change_id: 7,
+                    dependency: "ABCD1234".into(),
+                },
+                &["7", "ABCD1234", "not registered locally", "fetch"],
+            ),
+            (
+                PristineError::DependencyCycle {
+                    cycle: vec![1, 2, 1],
+                },
+                &["dependency cycle", "1 -> 2 -> 1", "repair"],
             ),
             (
                 PristineError::HashNotFound {
@@ -497,7 +613,23 @@ mod tests {
                 name: "a".into(),
                 parent_name: "b".into(),
             },
+            PristineError::BrokenViewParent {
+                view_id: 1,
+                view_name: "x".into(),
+                parent_id: 2,
+            },
             PristineError::ChangeNotFound { id: 1 },
+            PristineError::UnindexedChangeDependencies { change_id: 1 },
+            PristineError::ChangeDependencyCountMismatch {
+                change_id: 1,
+                expected: 2,
+                actual: 1,
+            },
+            PristineError::MissingRegisteredDependency {
+                change_id: 1,
+                dependency: "x".into(),
+            },
+            PristineError::DependencyCycle { cycle: vec![1, 1] },
             PristineError::HashNotFound { hash: "x".into() },
             PristineError::InvalidVertex {
                 message: "x".into(),

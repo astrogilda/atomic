@@ -9,7 +9,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use types::{MaterializeError, MaterializeOptions, OutputItem};
+pub use types::{MaterializeError, MaterializeOptions, MaterializedEntry, OutputItem};
 
 use std::collections::BTreeMap;
 
@@ -227,7 +227,7 @@ where
 
     // ── View-aware pre-filter ──────────────────────────────────────
     let (passing_file_paths, passing_ancestors) =
-        filter::compute_filters(&items, &options.change_filter);
+        filter::compute_filters(&items, options.graph_visibility.as_ref());
 
     for item in items {
         if item.is_directory {
@@ -274,7 +274,7 @@ where
             }
 
             // Output file
-            match output_file_with_filter(
+            let file_result = output_file_with_filter(
                 txn,
                 changes,
                 working_copy,
@@ -282,16 +282,13 @@ where
                 item.position,
                 &item.path,
                 file_options,
-                options.change_filter.clone(),
-            ) {
-                Ok(file_result) => {
-                    result.merge_file_result(file_result, false);
-                }
-                Err(e) => {
-                    // Log error but continue with other files
-                    log::warn!("Failed to output {}: {:?}", item.path, e);
-                }
-            }
+                options.graph_visibility.clone(),
+            )
+            .map_err(|source| MaterializeError::FileOutput {
+                path: item.path.clone(),
+                source,
+            })?;
+            result.merge_file_result(file_result, false);
         }
     }
 

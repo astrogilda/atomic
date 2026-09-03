@@ -11,7 +11,10 @@ use git2::{
 };
 use serde::{Deserialize, Serialize};
 
-use atomic_repository::{InsertOptions, Repository, StatusOptions};
+use atomic_core::pristine::{GraphTxnT, ViewTxnT};
+use atomic_repository::{
+    graph_visibility_closure, InsertOptions, Repository, RepositoryError, StatusOptions,
+};
 
 use super::Import;
 use crate::commands::{find_repository_root, Command};
@@ -402,19 +405,48 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
     drop(git);
 
     // `git checkout -b topic` changes only the symbolic branch while keeping
-    // the bound commit/tree. Reuse the existing Atomic closure by creating a
-    // child view from the checkpoint instead of replaying the same Git history
-    // into an empty shared view.
+    // the bound commit/tree. Reuse the existing validated Atomic closure by
+    // creating a self-contained shared view instead of replaying Git history.
     if let Some(checkpoint) = read_workspace_metadata(root)? {
         let mut repo = Repository::open(root).map_err(CliError::from)?;
         let view_exists = repo.view_exists(&view).map_err(CliError::from)?;
         if git_head == checkpoint.git_head && !view_exists {
-            let closure = repo
-                .effective_history(Some(&checkpoint.view))
-                .map_err(CliError::from)?;
+            // Validate and resolve the complete dependency closure before the
+            // first mutation. A legacy source with missing dependency metadata
+            // must not leave a partially created adoption view behind.
+            let closure = {
+                let txn = repo.pristine().read_txn().map_err(|error| {
+                    CliError::from(RepositoryError::Database(error.to_string()))
+                })?;
+                let source = txn
+                    .get_view(&checkpoint.view)
+                    .map_err(|error| CliError::from(RepositoryError::Database(error.to_string())))?
+                    .ok_or_else(|| {
+                        CliError::from(RepositoryError::ViewNotFound {
+                            name: checkpoint.view.clone(),
+                        })
+                    })?;
+                let visibility = graph_visibility_closure(&txn, &source).map_err(CliError::from)?;
+                let mut hashes = Vec::with_capacity(visibility.len());
+                for change_id in visibility.iter_dependency_first().copied() {
+                    let hash = txn
+                        .get_external(change_id)
+                        .map_err(|error| {
+                            CliError::from(RepositoryError::Database(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            CliError::from(RepositoryError::Database(format!(
+                                "visible change {} has no external hash",
+                                change_id.get()
+                            )))
+                        })?;
+                    hashes.push(hash);
+                }
+                hashes
+            };
             repo.create_shared_view(&view).map_err(CliError::from)?;
-            for entry in closure {
-                repo.insert_change(&entry.hash, InsertOptions::with_dependencies().view(&view))
+            for hash in closure {
+                repo.insert_change(&hash, InsertOptions::with_dependencies().view(&view))
                     .map_err(CliError::from)?;
             }
             repo.align_to_view(&view).map_err(CliError::from)?;

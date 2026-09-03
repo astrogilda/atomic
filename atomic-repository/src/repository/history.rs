@@ -52,7 +52,7 @@ impl Repository {
         // can filter out inherited entries.  This makes `atomic log` on a
         // draft view show only "what's new" rather than the full history
         // of every ancestor view.
-        let ancestor_ids: Option<HashSet<NodeId>> =
+        let ancestor_ids: Option<ViewMembershipSet> =
             if view.kind.is_draft() && !options.include_inherited {
                 Some(Self::collect_ancestor_change_ids(&txn, &view)?)
             } else {
@@ -87,22 +87,17 @@ impl Repository {
         Ok(entries)
     }
 
-    /// Get the full **effective** change set of a view in dependency order.
+    /// Get the ordered direct membership of a view and its full parent chain.
     ///
     /// Unlike [`log`](Self::log) — which for a draft view returns only that
-    /// view's own *new* changes — this returns every change visible from the
-    /// view: the draft's own changes plus all changes inherited from its
-    /// ancestor draft views and its nearest shared ancestor (the graph base).
-    /// Entries are ordered base-first, so the list is a valid dependency
-    /// order for replay or upload.
+    /// view's own changes — this includes membership inherited from every
+    /// ancestor. Entries preserve root-to-leaf view-log order with first
+    /// duplicates removed.
     ///
-    /// For a shared view this is identical to `log` with no ancestor
-    /// filtering — shared views are self-contained.
-    ///
-    /// This is what `push` uploads: the complete graph a view depends on, so
-    /// a flattened (shared) remote view receives every change it needs rather
-    /// than only the draft's delta. Changes the remote already holds are
-    /// deduplicated by the caller.
+    /// This is deliberately not a graph traversal closure: dependencies omitted
+    /// from direct `VIEW_CHANGES` membership do not appear here. Callers that
+    /// read graph bytes or copy a self-contained causal state must build a
+    /// [`GraphVisibilityClosure`] through [`graph_visibility_closure`].
     ///
     /// # Arguments
     ///
@@ -124,46 +119,25 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        // Build the view chain base-first: walk `.parent` up from this view,
-        // stopping at (and including) the nearest shared ancestor, which
-        // holds a self-contained change set. Reversing yields shared base →
-        // draft ancestors (oldest first) → this view.
-        let mut chain: Vec<atomic_core::pristine::ViewState> = Vec::new();
-        let mut cursor = Some(view);
-        while let Some(v) = cursor {
-            let is_shared = v.kind.is_shared();
-            let parent = v.parent;
-            chain.push(v);
-            if is_shared {
-                break;
-            }
-            cursor = match parent {
-                Some(pid) => txn
-                    .get_view_by_id(pid)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?,
-                None => None,
-            };
-        }
-        chain.reverse();
+        let membership = view_membership(&txn, &view)?;
+        let chain = txn
+            .resolve_full_view_chain(&view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Concatenate each view's own change log (sequence order respects
-        // dependencies), skipping changes already emitted by an earlier view
-        // in the chain (a draft created via `create_view_from` carries copies
-        // of its base's changes in its own log).
-        let mut seen: HashSet<NodeId> = HashSet::new();
-        let mut entries: Vec<crate::history::HistoryEntry> = Vec::new();
-        for v in &chain {
-            let iter = crate::history::log(&txn, v, &HistoryOptions::default())
+        let mut entries_by_id = std::collections::HashMap::new();
+        for chain_view in &chain {
+            let iter = crate::history::log(&txn, chain_view, &HistoryOptions::default())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             for result in iter {
                 let entry = result.map_err(|e| RepositoryError::Database(e.to_string()))?;
-                if seen.insert(entry.node_id) {
-                    entries.push(entry);
-                }
+                entries_by_id.entry(entry.node_id).or_insert(entry);
             }
         }
 
-        Ok(entries)
+        Ok(membership
+            .iter()
+            .filter_map(|change_id| entries_by_id.remove(change_id))
+            .collect())
     }
 
     /// Get a reverse history log (most recent first).
@@ -221,23 +195,22 @@ impl Repository {
     fn collect_ancestor_change_ids<T: ViewTxnT>(
         txn: &T,
         view: &atomic_core::pristine::ViewState,
-    ) -> Result<HashSet<NodeId>, RepositoryError> {
-        let mut ids = HashSet::new();
-        let mut cursor = view.parent;
-        while let Some(pid) = cursor {
-            let parent = txn
-                .get_view_by_id(pid)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            match parent {
-                Some(p) => {
-                    let parent_ids = super::filter::collect_view_change_ids(txn, &p)?;
-                    ids.extend(parent_ids);
-                    cursor = p.parent;
-                }
-                None => break,
+    ) -> Result<ViewMembershipSet, RepositoryError> {
+        let chain = txn
+            .resolve_full_view_chain(view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut ordered = Vec::new();
+        for ancestor in chain.iter().take(chain.len().saturating_sub(1)) {
+            for entry in txn
+                .iter_changes(ancestor, 0)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                let (_sequence, change_id, _state) =
+                    entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+                ordered.push(change_id);
             }
         }
-        Ok(ids)
+        Ok(ViewMembershipSet::from_ordered(ordered))
     }
 
     /// Get a summary of the current view's history.

@@ -45,4 +45,7 @@ pub use tree::{FileIndexEntry, FileIndexMetadata, TreeTxnT};
 pub use triples::{KgMutTxnT, KgTxnT};
 pub use vault::{VaultEntryMeta, VaultMutTxnT, VaultTxnT};
 pub use vertex_ext::VertexExt;
-pub use view::{StoredConflict, StoredConflictKind, ViewScope, ViewState, ViewTxnT};
+pub use view::{
+    GraphVisibilityClosure, StoredConflict, StoredConflictKind, ViewMembershipSet, ViewScope,
+    ViewState, ViewTxnT,
+};

@@ -163,12 +163,45 @@ pub trait GraphTxnT {
         Ok(Vec::new())
     }
 
+    /// Return the unique dependency count recorded by the index marker.
+    ///
+    /// `None` distinguishes dependency metadata that predates the index from a
+    /// valid indexed change with zero dependencies.
+    fn change_deps_indexed_count(&self, _change_id: NodeId) -> Result<Option<u64>, PristineError> {
+        Ok(None)
+    }
+
+    /// Read and validate one change's indexed dependencies.
+    ///
+    /// This fails closed when the marker is absent or its unique count does not
+    /// match the stored rows. Returned hashes are sorted for deterministic
+    /// dependency traversal.
+    fn get_indexed_change_deps(&self, change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+        let expected = self.change_deps_indexed_count(change_id)?.ok_or(
+            PristineError::UnindexedChangeDependencies {
+                change_id: change_id.get(),
+            },
+        )?;
+        let mut dependencies = self.get_change_deps(change_id)?;
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        let actual = dependencies.len() as u64;
+        if actual != expected {
+            return Err(PristineError::ChangeDependencyCountMismatch {
+                change_id: change_id.get(),
+                expected,
+                actual,
+            });
+        }
+        Ok(dependencies)
+    }
+
     /// Return whether a change's dependency list has been indexed.
     ///
     /// This distinguishes a legitimate zero-dependency change from a change
     /// whose dependency metadata predates the index and needs repair.
-    fn is_change_deps_indexed(&self, _change_id: NodeId) -> Result<bool, PristineError> {
-        Ok(false)
+    fn is_change_deps_indexed(&self, change_id: NodeId) -> Result<bool, PristineError> {
+        Ok(self.change_deps_indexed_count(change_id)?.is_some())
     }
 
     /// Get all local changes whose indexed dependencies include `dep_hash`.

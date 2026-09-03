@@ -247,10 +247,10 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         Ok(result)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
         let table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
-        let indexed = table.get(change_id.get())?.is_some();
-        Ok(indexed)
+        let count = table.get(change_id.get())?.map(|value| value.value());
+        Ok(count)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {

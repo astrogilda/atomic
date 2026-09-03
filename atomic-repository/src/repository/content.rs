@@ -1,5 +1,27 @@
 use super::*;
-use atomic_core::pristine::CachedGraphTxn;
+use atomic_core::pristine::{CachedGraphTxn, ViewGraph};
+
+fn graph_visibility_at_change<T: ViewTxnT>(
+    txn: &T,
+    view: &atomic_core::pristine::ViewState,
+    change_hash: &Hash,
+    inclusive: bool,
+) -> Result<Option<GraphVisibilityClosure>, RepositoryError> {
+    let Some(change_id) = txn
+        .get_internal(change_hash)
+        .map_err(|error| RepositoryError::Database(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let full = graph_visibility_closure(txn, view)?;
+    let ordered: Vec<NodeId> = full.iter_dependency_first().copied().collect();
+    let Some(position) = ordered.iter().position(|candidate| *candidate == change_id) else {
+        return Ok(None);
+    };
+    let end = position + usize::from(inclusive);
+    let membership = ViewMembershipSet::from_ordered(ordered.into_iter().take(end));
+    graph_visibility_from_membership(txn, &membership).map(Some)
+}
 
 impl Repository {
     /// Get the recorded content for a tracked file.
@@ -28,139 +50,24 @@ impl Repository {
         &self,
         path: P,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use atomic_core::output::alive::RetrieveOptions;
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
-
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        // Check if file is tracked (tree tables are global)
-        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
-            return Ok(None);
+        match self.get_materialized_entry_on_view(path, &self.current_view)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
         }
-
-        // Get inode → position
-        let inode = match get_inode(&txn, &normalized) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        let position = match txn.inode_position(inode) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // NOTE on CRDT-driven output (task #24):
-        // The new `output_file_via_crdt` walker in atomic_core::output::crdt
-        // is faster and avoids the byte-graph linear-walker bugs that
-        // overcount bytes on multi-edge vertices.  Callers that want the
-        // *materialized* (no-filter, single-view) content can call it
-        // directly via `get_file_content_via_crdt`.
-        //
-        // We don't use it here because this entry point honors the
-        // view's `change_filter`, and the CRDT walker reads
-        // `branch.state` directly — the materialized state across all
-        // applied changes.  For multi-view scenarios that would expose
-        // branches from views the caller isn't on.
-        //
-        // Wiring the CRDT walker into the filter-aware path requires
-        // either (a) per-(change, branch) state-change tracking or
-        // (b) replaying BranchOps from filter-in changes — both deferred.
-
-        // Always build the change filter.
-        //
-        // There is no "fast path" for shared root views: draft views
-        // also write their vertices into the global GRAPH (the ambient
-        // graph model), so an unfiltered retrieval on a shared root
-        // would see vertices from drafts that aren't in its VIEW_CHANGES.
-        //
-        // The filter is the source of truth for what each view sees —
-        // it's computed cheaply at read time from VIEW_CHANGES plus the
-        // parent chain.
-        let change_filter = collect_visible_change_ids_with_deps(&txn, &view)?;
-        let options = RetrieveOptions::new().with_change_filter(change_filter);
-
-        // All edges are in GRAPH — raw transaction sees everything.
-        // The change_filter handles view isolation.
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let content = retrieve_content_with_filter_fast(
-            &cached_txn,
-            &self.change_store,
-            inode,
-            position,
-            options,
-        )
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Presence was established by TREE + INODES above. Empty content is a
-        // tracked zero-byte file, not an absent path.
-        Ok(Some(content))
     }
 
-    /// Get file content using the CRDT-driven walker (task #24).
+    /// Get file content through the canonical view-aware retrieval path.
     ///
-    /// Walks the `Trunk → Branch` chain in file order and fetches each
-    /// alive branch's bytes from its recorded `BRANCH_VERTEX` span.  This
-    /// bypasses the byte-graph linear walker entirely.
-    ///
-    /// # When to use
-    ///
-    /// Use this when you want the *materialized* file content — the state
-    /// after all applied changes — without filtering by view.  This is
-    /// correct for single-view linear history and for tools that want a
-    /// canonical snapshot.
-    ///
-    /// For view-scoped reads, use [`Self::get_file_content`] instead.
-    /// That entry point honors the view's `change_filter` (at the cost of
-    /// going through the byte-graph walker).
-    ///
-    /// Falls back to byte-graph output when the CRDT layer has no row
-    /// for this file (legacy repos that predate CRDT population) or when
-    /// any alive branch lacks a `BRANCH_VERTEX` mapping.
+    /// The CRDT tables are currently ambient and cannot prove per-view
+    /// dependency visibility. Until the semantic layer records view-scoped
+    /// state transitions, this compatibility entry point delegates to
+    /// [`Self::get_file_content`] so incomplete dependency metadata fails before
+    /// bytes are read and sibling-view content cannot leak.
     pub fn get_file_content_via_crdt<P: AsRef<Path>>(
         &self,
         path: P,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use atomic_core::output::crdt::{output_file_via_crdt, CrdtOutputError};
-
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
-
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        match output_file_via_crdt(&txn, &self.change_store, &normalized) {
-            Ok(content) if !content.is_empty() => Ok(Some(content)),
-            Ok(_) => {
-                // Empty result — file not in CRDT layer.  Fall back to the
-                // view-scoped byte-graph walker.
-                drop(txn);
-                self.get_file_content(path)
-            }
-            Err(CrdtOutputError::OrphanBranch(_)) => {
-                // Alive branch without BRANCH_VERTEX — pre-walker data.
-                // Fall back to byte-graph walker.
-                drop(txn);
-                self.get_file_content(path)
-            }
-            Err(CrdtOutputError::Pristine(e)) => Err(RepositoryError::Database(e.to_string())),
-            Err(CrdtOutputError::Store(e)) => Err(RepositoryError::Database(e.to_string())),
-        }
+        self.get_file_content(path)
     }
 
     /// Get file content, excluding a specific change.
@@ -174,9 +81,7 @@ impl Repository {
         path: P,
         exclude_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use atomic_core::output::alive::RetrieveOptions;
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
+        let normalized = normalize_path(path.as_ref());
 
         let txn = self
             .pristine
@@ -190,48 +95,16 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
 
-        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
+        let Some(visibility) = graph_visibility_at_change(&txn, &view, exclude_hash, false)? else {
             return Ok(None);
-        }
-
-        let inode = match get_inode(&txn, &normalized) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
         };
-
-        let position = match txn.inode_position(inode) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        let mut change_filter = if view.kind.is_shared() && view.parent.is_none() {
-            collect_view_change_ids(&txn, &view)?
-        } else {
-            collect_visible_change_ids_with_deps(&txn, &view)?
-        };
-
-        // Remove the excluded change from the filter
-        if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
-            change_filter.remove(&exclude_id);
-        }
-
-        let options = RetrieveOptions::new().with_change_filter(change_filter);
 
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let content = retrieve_content_with_filter_fast(
-            &cached_txn,
-            &self.change_store,
-            inode,
-            position,
-            options,
-        )
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // The path and inode were resolved above; preserve zero-byte presence.
-        Ok(Some(content))
+        match self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
+        }
     }
 
     /// Diff two views: returns (changes only in A, changes only in B, common changes).
@@ -360,32 +233,38 @@ impl Repository {
         path: P,
         view_name: &str,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
+        match self.get_materialized_entry_on_view(path, view_name)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
+        }
+    }
 
+    /// Resolve a file as an explicit present/absent materialization entry on a view.
+    ///
+    /// Presence comes from the operation-aware path lifecycle projection. Empty
+    /// rendered bytes therefore remain a present tracked file, while a visible
+    /// whole-file deletion is absent even if global TREE metadata survives for
+    /// another view.
+    pub fn get_materialized_entry_on_view<P: AsRef<Path>>(
+        &self,
+        path: P,
+        view_name: &str,
+    ) -> Result<MaterializedEntry, RepositoryError> {
+        let normalized = normalize_path(path.as_ref());
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the specified view (read-only — no set_current_stack)
         let view = txn
             .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-
-        let change_filter = if view.kind.is_shared() && view.parent.is_none() {
-            collect_view_change_ids(&txn, &view)?
-        } else {
-            collect_visible_change_ids_with_deps(&txn, &view)?
-        };
-
-        // Use the filtered retrieval method with cached graph access
+        let visibility = graph_visibility_closure(&txn, &view)?;
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.get_file_content_with_filter(&cached_txn, &normalized, change_filter, true)
+        self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -432,30 +311,26 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Check if file is tracked
-        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let Some(item) = projection.present.get(&normalized) else {
+            return Ok(None);
+        };
+        if item.is_directory {
             return Ok(None);
         }
 
-        // Get the inode for the file
-        let inode = match get_inode(&txn, &normalized) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // Get the position for this inode from the INODES table
-        let position = match txn.inode_position(inode) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // Retrieve content from the graph with options
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view_graph = ViewGraph::new(&cached_txn, visibility);
         let result =
-            retrieve_content_with_options(&cached_txn, &self.change_store, position, options)
+            retrieve_content_with_options(&view_graph, &self.change_store, item.position, options)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(Some(result))
@@ -484,27 +359,25 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Check if file is tracked
-        if !is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))? {
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let Some(item) = projection.present.get(&normalized) else {
+            return Ok(false);
+        };
+        if item.is_directory {
             return Ok(false);
         }
 
-        // Get the inode for the file
-        let inode = match get_inode(&txn, &normalized) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => return Ok(false),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // Get the position for this inode from the INODES table
-        let position = match txn.inode_position(inode) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => return Ok(false),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // Check if position has content
-        let has = has_content(&txn, &self.change_store, position)
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view_graph = ViewGraph::new(&cached_txn, visibility);
+        let has = has_content(&view_graph, &self.change_store, item.position)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(has)
@@ -565,8 +438,6 @@ impl Repository {
         path: P,
         change_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use crate::history::{get_changes_up_to_sequence, get_state_before_change};
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -583,31 +454,16 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
 
-        // Find the state before this change
-        let state_info = get_state_before_change(&txn, &view, change_hash)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let state_info = match state_info {
-            Some(info) => info,
-            None => return Ok(None), // Change not in this view
+        let Some(visibility) = graph_visibility_at_change(&txn, &view, change_hash, false)? else {
+            return Ok(None);
         };
 
-        // If this is the first change, there's no content before it
-        if state_info.is_first_change() {
-            return Ok(None);
-        }
-
-        // Get the set of changes applied before this change
-        let change_set =
-            get_changes_up_to_sequence(&txn, &view, state_info.parent_max_sequence_exclusive())
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Retrieve content with the change filter.
-        // Pass require_tracked=false: the file may have been deleted after
-        // this point, but we want its content as it existed before the change.
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, false)
+        match self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
+        }
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -647,8 +503,6 @@ impl Repository {
         path: P,
         change_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use crate::history::get_changes_up_to_change;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -665,20 +519,16 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
 
-        // Get all changes up to and including this change
-        let change_set = match get_changes_up_to_change(&txn, &view, change_hash)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            Some(set) => set,
-            None => return Ok(None), // Change not in this view
+        let Some(visibility) = graph_visibility_at_change(&txn, &view, change_hash, true)? else {
+            return Ok(None);
         };
 
-        // Retrieve content with the change filter.
-        // require_tracked=true: if the file was deleted before this point,
-        // there is no "after" content to return.
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
+        match self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
+        }
     }
 
     /// Get file content at a specific sequence number.
@@ -712,8 +562,6 @@ impl Repository {
         path: P,
         max_sequence: u64,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        use crate::history::get_changes_up_to_sequence;
-
         let path = path.as_ref();
         let normalized = normalize_path(path);
 
@@ -730,70 +578,59 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
 
-        // Get the set of changes up to the sequence
-        let change_set = get_changes_up_to_sequence(&txn, &view, max_sequence)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let membership = view_membership_at_sequence(&txn, &view, max_sequence)?;
+        let visibility = graph_visibility_from_membership(&txn, &membership)?;
 
-        // Retrieve content with the change filter
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, true)
+        match self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)? {
+            MaterializedEntry::Absent { .. } => Ok(None),
+            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
+        }
     }
 
-    /// Internal helper to retrieve file content with a change filter.
-    ///
-    /// This method handles the common logic for state-based content retrieval:
-    /// 1. Check if file is tracked
-    /// 2. Get the inode and position
-    /// 3. Retrieve content using the change filter
-    fn get_file_content_with_filter<T>(
+    /// Resolve lifecycle presence and render bytes under validated visibility.
+    pub(super) fn get_materialized_entry_with_visibility<T>(
         &self,
         txn: &T,
         normalized_path: &str,
-        change_set: std::collections::HashSet<NodeId>,
-        require_tracked: bool,
-    ) -> Result<Option<Vec<u8>>, RepositoryError>
+        visibility: GraphVisibilityClosure,
+    ) -> Result<MaterializedEntry, RepositoryError>
     where
         T: atomic_core::pristine::GraphTxnT
             + atomic_core::pristine::TreeTxnT
             + atomic_core::pristine::InodeGraphOps,
     {
         use atomic_core::output::alive::RetrieveOptions;
-        // Check if file is tracked (skip for deleted files — they are no
-        // longer in the TREE but their inode/content is still in the graph).
-        if require_tracked
-            && !is_tracked(txn, normalized_path)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            return Ok(None);
+
+        let projection = self.project_tree_for_visibility(txn, &visibility)?;
+        let Some(item) = projection.present.get(normalized_path) else {
+            let inode = projection
+                .absent
+                .iter()
+                .find(|entry| entry.path() == normalized_path)
+                .and_then(MaterializedEntry::inode);
+            return Ok(MaterializedEntry::absent(normalized_path, inode));
+        };
+        if item.is_directory {
+            return Ok(MaterializedEntry::absent(normalized_path, Some(item.inode)));
         }
 
-        // Get the inode for the file
-        let inode = match get_inode(txn, normalized_path) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
+        let options = RetrieveOptions::new().with_graph_visibility(visibility);
+        let bytes = retrieve_content_with_filter_fast(
+            txn,
+            &self.change_store,
+            item.inode,
+            item.position,
+            options,
+        )
+        .map_err(|e: atomic_core::record::RecordError| RepositoryError::Database(e.to_string()))?;
 
-        // Get the position for this inode from the INODES table
-        let position = match txn.inode_position(inode) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(RepositoryError::Database(e.to_string())),
-        };
-
-        // Create options with the change filter
-        let options = RetrieveOptions::new().with_change_filter(change_set.clone());
-
-        // Retrieve content from the graph with the filter
-        let content =
-            retrieve_content_with_filter_fast(txn, &self.change_store, inode, position, options)
-                .map_err(|e: atomic_core::record::RecordError| {
-                    RepositoryError::Database(e.to_string())
-                })?;
-
-        // Tracking/inode checks distinguish absence from a present empty file.
-        Ok(Some(content))
+        Ok(MaterializedEntry::present(
+            normalized_path,
+            item.inode,
+            bytes,
+        ))
     }
 
     // Archive Operations

@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
 use super::*;
 use crate::apply::InsertOptions;
-use crate::repository::collect_visible_change_ids;
 use atomic_core::pristine::{CachedGraphTxn, ViewGraph};
 
 impl Repository {
@@ -54,7 +51,7 @@ impl Repository {
             DetectedFile, RecordedFile,
         };
 
-        // Build the final header (may get message from options)
+        // Build the final header (may get message from options).
         let final_header = build_header(header, &options);
 
         // Get repository status to find modified files
@@ -283,15 +280,25 @@ impl Repository {
 
         use super::content::retrieve_content_with_filter_fast_with_fork_info;
 
-        // Pre-compute the change filter and cached graph transaction ONCE
-        // for the entire record operation.  Previously, get_file_content()
-        // rebuilt these per file, which dominated record time.
+        // Build and validate the target view's graph visibility once for all
+        // record traversal, then share O(1) clones across files and assembly.
         let shared_txn = self
             .pristine
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
         let view_name_for_filter = options.get_view().unwrap_or(&self.current_view);
-        // Alongside the change filter, collect the paths with a PERSISTED
+        let view = shared_txn
+            .get_view(view_name_for_filter)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Repository(RepositoryError::ViewNotFound {
+                    name: view_name_for_filter.to_string(),
+                })
+            })?;
+        let shared_graph_visibility =
+            graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
+
+        // Alongside visibility, collect paths with a PERSISTED
         // conflict on this view (the raw CONFLICTS table, deliberately NOT the
         // marker-gated `list_conflicts`). At resolution time the user has
         // already edited the markers out of the file, so a Modified record for
@@ -300,34 +307,22 @@ impl Repository {
         // the expected workflow, not an anomaly. Used below to route the
         // fork-structure log to debug for resolutions and keep WARN for
         // genuinely unexpected fork structure.
-        let (shared_change_filter, conflicted_paths) = if let Some(view) = shared_txn
-            .get_view(view_name_for_filter)
-            .map_err(|e| RecordError::Database(e.to_string()))?
-        {
-            let filter = collect_visible_change_ids(&shared_txn, &view)?;
-            let mut conflicted: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            if let Ok(conflicts) = shared_txn.iter_conflicts(view.id) {
-                for (_inode, records) in conflicts {
-                    for c in records {
-                        conflicted.insert(c.path.clone());
-                    }
+        let mut conflicted_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Ok(conflicts) = shared_txn.iter_conflicts(view.id) {
+            for (_inode, records) in conflicts {
+                for conflict in records {
+                    conflicted_paths.insert(conflict.path.clone());
                 }
             }
-            (filter, conflicted)
-        } else {
-            (
-                std::collections::HashSet::new(),
-                std::collections::HashSet::new(),
-            )
-        };
+        }
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
 
         if trace_record {
             eprintln!(
                 "[record] change filter: {} visible changes",
-                shared_change_filter.len()
+                shared_graph_visibility.len()
             );
         }
 
@@ -648,8 +643,8 @@ impl Repository {
                 // `force_whole_file_replace` below instead of diffing against it.
                 let (old_content, had_fork_structure) = {
                     use atomic_core::output::alive::RetrieveOptions;
-                    let opts =
-                        RetrieveOptions::new().with_change_filter(shared_change_filter.clone());
+                    let opts = RetrieveOptions::new()
+                        .with_graph_visibility(shared_graph_visibility.clone());
                     match retrieve_content_with_filter_fast_with_fork_info(
                         &shared_cached_txn,
                         &self.change_store,
@@ -705,7 +700,7 @@ impl Repository {
                 let can_use_crdt_old_content = !existing_branches.is_empty()
                     && existing_branches
                         .iter()
-                        .all(|b| shared_change_filter.contains(&b.change_id()));
+                        .all(|branch| shared_graph_visibility.contains(branch.change_id()));
                 let crdt_old_content: Option<Vec<u8>> = if can_use_crdt_old_content {
                     match self.get_file_content_via_crdt(path.as_str()) {
                         Ok(Some(content)) if content == old_content => Some(content),
@@ -830,7 +825,6 @@ impl Repository {
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
-        let view_name = options.get_view().unwrap_or(&self.current_view);
         // Wrap the read transaction in CachedGraphTxn to avoid reopening
         // the GRAPH table on every find_block/iter_adjacent call during
         // globalization. This alone eliminates ~90% of the per-vertex
@@ -838,16 +832,7 @@ impl Repository {
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RecordError::Database(e.to_string()))?;
 
-        let view_graph = if let Some(view) = txn
-            .get_view(view_name)
-            .map_err(|e| RecordError::Database(e.to_string()))?
-        {
-            let change_filter = collect_visible_change_ids(&txn, &view)
-                .map_err(|e| RecordError::Database(e.to_string()))?;
-            ViewGraph::new(&cached_txn, Arc::new(change_filter))
-        } else {
-            ViewGraph::new(&cached_txn, Arc::new(std::collections::HashSet::new()))
-        };
+        let view_graph = ViewGraph::new(&cached_txn, shared_graph_visibility.clone());
 
         let assembly_options = options.to_assembly_options();
 
@@ -1132,19 +1117,22 @@ impl Repository {
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
-        // Use a bare transaction — no ViewGraph filter needed.
-        //
-        // This method is the fast path for git import, where every change
-        // is written to a shared view and all edges land in the global
-        // GRAPH table.  A bare ReadTxn sees every edge directly.
-        //
-        // Wrapping in ViewGraph + collect_visible_change_ids would scan
-        // the entire view change log on every call (O(N) per commit,
-        // O(N²) total for N commits), which makes large imports
-        // progressively slower.
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RecordError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Repository(RepositoryError::ViewNotFound {
+                    name: self.current_view.clone(),
+                })
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view).map_err(RecordError::Repository)?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RecordError::Database(e.to_string()))?;
+        let view_graph = ViewGraph::new(&cached_txn, visibility);
         let assembly_options = AssemblyOptions::default();
 
-        let assembly_result = assemble_change(&txn, recorded_files, header, &assembly_options)?;
+        let assembly_result =
+            assemble_change(&view_graph, recorded_files, header, &assembly_options)?;
 
         let change = assembly_result.into_change();
         log::debug!(

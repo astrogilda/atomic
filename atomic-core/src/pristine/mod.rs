@@ -165,9 +165,10 @@ pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
     CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata,
-    GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, StoredConflict,
-    StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
-    VaultMutTxnT, VaultTxnT, VertexExt, ViewScope, ViewState, ViewTxnT,
+    GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT,
+    MutTxnT, StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
+    VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState,
+    ViewTxnT,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

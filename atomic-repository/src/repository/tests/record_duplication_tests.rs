@@ -24,6 +24,14 @@ fn record_all(repo: &Repository, message: &str) {
     repo.record(header, options).unwrap();
 }
 
+fn create_parentless_shared_view(repo: &Repository, name: &str) {
+    use atomic_core::pristine::{MutTxnT, ViewScope};
+
+    let mut txn = repo.pristine.write_txn().unwrap();
+    txn.create_view(name, ViewScope::Shared, None).unwrap();
+    txn.commit().unwrap();
+}
+
 fn count_occurrences(content: &str, pattern: &str) -> usize {
     content.matches(pattern).count()
 }
@@ -400,12 +408,10 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
     repo.add("main.go", TrackingOptions::default()).unwrap();
     record_all(&repo, "Add main.go");
 
-    // Step 2: simulate an orphaned session view directly — the exact
-    // low-level mechanism of the orphan-view duplication bug.
-    // `RecordOptions::view("orphan-xyz")` with a view name that doesn't
-    // exist yet reaches `open_or_create_view`'s
-    // parentless-Shared fallback, since nothing here calls
-    // `create_view_from` first (unlike a properly-forked session).
+    // Step 2: simulate the old orphan-session topology explicitly. Recording
+    // against a missing view now fails closed, so the fixture creates the
+    // parentless Shared view before reproducing the historical duplication.
+    create_parentless_shared_view(&repo, "orphan-xyz");
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
     std::fs::write(&file, &edited).unwrap();
     repo.record(
@@ -539,9 +545,9 @@ fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
     repo.add("main.go", TrackingOptions::default()).unwrap();
     record_all(&repo, "Add main.go");
 
-    // Step 2: simulate an orphaned session view directly (the orphan-view
-    // duplication mechanism), producing a second, duplicate copy of the
-    // file's content once merged.
+    // Step 2: simulate the old orphan-session topology explicitly, producing
+    // a second, duplicate copy of the file's content once merged.
+    create_parentless_shared_view(&repo, "orphan-xyz");
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
     std::fs::write(&file, &edited).unwrap();
     repo.record(

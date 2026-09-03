@@ -91,16 +91,78 @@ impl Repository {
     pub fn switch_view(&mut self, view: &str) -> Result<MaterializeResult, RepositoryError> {
         let old_view_name = self.current_view.clone();
 
-        // Compute files visible on the OLD view.
-        let old_files = self.visible_file_paths(&old_view_name)?;
+        // Resolve both views and validate both dependency closures before the
+        // switch publishes a pointer or mutates TREE-derived state.
+        let (old_files, new_files, new_visibility, new_view_id, differing_hashes) = {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let old_view = txn
+                .get_view(&old_view_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: old_view_name.clone(),
+                })?;
+            let new_view = txn
+                .get_view(view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+
+            let old_membership = view_membership(&txn, &old_view)?;
+            let new_membership = view_membership(&txn, &new_view)?;
+            let old_visibility = graph_visibility_from_membership(&txn, &old_membership)?;
+            let new_visibility = graph_visibility_from_membership(&txn, &new_membership)?;
+            let old_projection = self.project_tree_for_visibility(&txn, &old_visibility)?;
+            let new_projection = self.project_tree_for_visibility(&txn, &new_visibility)?;
+            let old_files: HashSet<String> = old_projection
+                .present
+                .into_iter()
+                .filter_map(|(path, item)| (!item.is_directory).then_some(path))
+                .collect();
+            let new_files: HashSet<String> = new_projection
+                .present
+                .into_iter()
+                .filter_map(|(path, item)| (!item.is_directory).then_some(path))
+                .collect();
+
+            let differing_ids = old_membership
+                .iter()
+                .filter(|change_id| !new_membership.contains(**change_id))
+                .chain(
+                    new_membership
+                        .iter()
+                        .filter(|change_id| !old_membership.contains(**change_id)),
+                );
+            let mut differing_hashes = Vec::new();
+            for change_id in differing_ids.copied() {
+                let hash = txn
+                    .get_external(change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "change {} has no external hash",
+                            change_id.get()
+                        ))
+                    })?;
+                differing_hashes.push(hash);
+            }
+
+            (
+                old_files,
+                new_files,
+                new_visibility,
+                new_view.id,
+                differing_hashes,
+            )
+        };
 
         // Apply only the small set of view-scoped TREE operations and publish
         // the new pointer while holding the same database write lock. A marker
         // makes the transition recoverable if the process exits mid-switch.
-        let deferred_paths = self.align_deferred_tree_and_publish_view(view)?;
-
-        // Compute files visible on the NEW view.
-        let new_files = self.visible_file_paths(view)?;
+        let deferred_paths = self.align_deferred_tree_and_publish_view(view, &new_visibility)?;
 
         if std::env::var_os("ATOMIC_TRACE_SWITCH").is_some() {
             eprintln!("[switch] {} -> {}", old_view_name, view);
@@ -252,53 +314,31 @@ impl Repository {
                 affected_paths.insert(path.clone());
             }
 
-            // Find changes that differ between the two views.
-            // Use the FULL visible change sets (including parent chains)
-            // so that inherited changes don't show up as differences.
-            // get_view_changes only returns a view's OWN change log,
-            // which would flag every inherited change as "different".
-            {
-                let txn = self
-                    .pristine
-                    .read_txn()
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-                let old_view = txn
-                    .get_view(&old_view_name)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| RepositoryError::ViewNotFound {
-                        name: old_view_name.clone(),
-                    })?;
-                let new_view = txn
-                    .get_view(view)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| RepositoryError::ViewNotFound {
-                        name: view.to_string(),
-                    })?;
-
-                let old_ids = collect_visible_change_ids(&txn, &old_view)?;
-                let new_ids = collect_visible_change_ids(&txn, &new_view)?;
-
-                // NodeIds that are in one view but not the other
-                let diff_ids: Vec<_> = old_ids.symmetric_difference(&new_ids).copied().collect();
-
-                for node_id in &diff_ids {
-                    if let Ok(Some(hash)) = txn.get_external(*node_id) {
-                        if let Ok(change) = self.load_change(&hash) {
-                            for op in change.hunks() {
-                                if let Some(p) = op.path() {
-                                    affected_paths.insert(p.to_string());
-                                }
-                            }
+            // Membership-only differences identify changes whose paths may
+            // need rematerialization. Visibility closure is intentionally not
+            // part of this presentation/impact domain.
+            for hash in &differing_hashes {
+                if let Ok(change) = self.load_change(hash) {
+                    for op in change.hunks() {
+                        if let Some(path) = op.path() {
+                            affected_paths.insert(path.to_string());
                         }
                     }
                 }
             }
 
             if affected_paths.is_empty() {
-                self.materialize()?
+                self.materialize_parallel_with_visibility(
+                    None,
+                    new_visibility.clone(),
+                    new_view_id,
+                )?
             } else {
-                self.materialize_paths(affected_paths)?
+                self.materialize_parallel_with_visibility(
+                    Some(affected_paths),
+                    new_visibility.clone(),
+                    new_view_id,
+                )?
             }
         };
 

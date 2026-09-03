@@ -98,36 +98,41 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: target.to_string(),
             })?;
-        let target_visible = collect_visible_change_ids_with_deps(&txn, &target_view)?;
+        let target_visible = graph_visibility_closure(&txn, &target_view)?;
 
         // Seed the closure with the only-in-feature node ids, remembering the
         // seed set so we can subtract it from the additions later.
-        let mut feature_node_ids: HashSet<NodeId> = HashSet::new();
+        let mut feature_node_ids = Vec::new();
         for hash in &only_in_feature_hashes {
-            if let Some(id) = txn
+            let id = txn
                 .get_internal(hash)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                feature_node_ids.insert(id);
-            }
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: hash.to_base32(),
+                })?;
+            feature_node_ids.push(id);
         }
+        let feature_membership = ViewMembershipSet::from_ordered(feature_node_ids);
 
-        // Step 2: expand the transitive dependency closure in place.
-        let mut closure: HashSet<NodeId> = feature_node_ids.clone();
-        expand_indexed_dependency_closure(&txn, &mut closure)?;
+        // Step 2: validate and complete the transitive dependency closure.
+        let closure = graph_visibility_from_membership(&txn, &feature_membership)?;
 
         // Closure additions = closure minus the seed minus the target's set.
         let mut addition_hashes: Vec<Hash> = Vec::new();
-        for id in &closure {
-            if feature_node_ids.contains(id) || target_visible.contains(id) {
+        for id in closure.iter_dependency_first().copied() {
+            if feature_membership.contains(id) || target_visible.contains(id) {
                 continue;
             }
-            if let Some(hash) = txn
-                .get_external(*id)
+            let hash = txn
+                .get_external(id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                addition_hashes.push(hash);
-            }
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "validated closure change {} has no external hash",
+                        id.get()
+                    ))
+                })?;
+            addition_hashes.push(hash);
         }
 
         // Deterministic ordering.

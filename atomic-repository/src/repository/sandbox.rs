@@ -25,13 +25,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atomic_core::pristine::Pristine;
+use atomic_core::output::alive::RetrieveOptions;
+use atomic_core::pristine::{CachedGraphTxn, Pristine, ViewTxnT};
 use serde::{Deserialize, Serialize};
 
 use crate::changestore::{ChangeStore, DEFAULT_CACHE_CAPACITY};
 use crate::oci::{self, OciImageConfig};
 
-use super::{Repository, DOT_DIR};
+use super::content::retrieve_content_with_filter_fast;
+use super::{graph_visibility_closure, Repository, DOT_DIR};
 use crate::RepositoryError;
 
 /// Options for [`Repository::stage`].
@@ -185,6 +187,19 @@ impl Repository {
         view: &str,
     ) -> Result<usize, RepositoryError> {
         let dest = dest.as_ref();
+        {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let view_state = txn
+                .get_view(view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+            graph_visibility_closure(&txn, &view_state)?;
+        }
         let count = provision_working_tree(&self.root, dest)?;
 
         let pointer = SandboxPointer {
@@ -198,29 +213,68 @@ impl Repository {
         Ok(count)
     }
 
+    fn materialized_view_files(
+        &self,
+        view_name: &str,
+    ) -> Result<BTreeMap<String, Vec<u8>>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut files = BTreeMap::new();
+        for item in projection.present.into_values() {
+            if item.is_directory {
+                continue;
+            }
+            let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
+            let bytes = retrieve_content_with_filter_fast(
+                &cached_txn,
+                &self.change_store,
+                item.inode,
+                item.position,
+                options,
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            files.insert(item.path, bytes);
+        }
+        Ok(files)
+    }
+
+    fn write_materialized_files(
+        dir: &Path,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), RepositoryError> {
+        std::fs::create_dir_all(dir)?;
+        for (path, bytes) in files {
+            let target = dir.join(path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, bytes)?;
+        }
+        Ok(())
+    }
+
     /// Materialize a view's visible file content into `dir` (created if needed).
     ///
     /// Writes each visible file's bytes exactly as they appear on `view` (the
     /// view's own changes plus its parent chain). Returns the number of files
     /// written.
     pub fn materialize_view_to(&self, view: &str, dir: &Path) -> Result<usize, RepositoryError> {
-        std::fs::create_dir_all(dir)?;
-
-        let mut count = 0usize;
-        for path in self.visible_file_paths(view)? {
-            let bytes = match self.get_file_content_on_view(&path, view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let target = dir.join(&path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, &bytes)?;
-            count += 1;
-        }
-
-        Ok(count)
+        let files = self.materialized_view_files(view)?;
+        Self::write_materialized_files(dir, &files)?;
+        Ok(files.len())
     }
 
     /// Produce a two-layer OCI image: a base layer (the `base_view`
@@ -232,32 +286,29 @@ impl Repository {
     /// delta. Provenance (view names and Merkle states) is recorded in the
     /// manifest annotations. Returns the manifest digest and base `diff_id`.
     pub fn stage(&self, opts: StageOptions) -> Result<StageResult, RepositoryError> {
+        // Resolve both snapshots before creating output state. Each snapshot
+        // builds and validates its view closure once.
+        let base_files = self.materialized_view_files(&opts.base_view)?;
+        let view_files = self.materialized_view_files(&opts.view)?;
+
         // 1. Base layer: materialize the shared base view to a temp dir.
         let base_dir = tempfile::tempdir()?;
-        self.materialize_view_to(&opts.base_view, base_dir.path())?;
+        Self::write_materialized_files(base_dir.path(), &base_files)?;
         let base_layer = oci::layer_from_dir(base_dir.path())?;
         let base_diff_id = base_layer.diff_id.clone();
 
         // 2. Delta: files new or changed on `view` vs. `base_view`, plus
         //    whiteouts for files present on the base but gone on `view`.
-        let view_paths = self.visible_file_paths(&opts.view)?;
-        let base_paths = self.visible_file_paths(&opts.base_view)?;
-
         let mut changed: Vec<(String, Vec<u8>)> = Vec::new();
-        for path in &view_paths {
-            let view_bytes = match self.get_file_content_on_view(path, &opts.view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let base_bytes = self.get_file_content_on_view(path, &opts.base_view)?;
-            if base_bytes.as_deref() != Some(view_bytes.as_slice()) {
-                changed.push((path.clone(), view_bytes));
+        for (path, view_bytes) in &view_files {
+            if base_files.get(path) != Some(view_bytes) {
+                changed.push((path.clone(), view_bytes.clone()));
             }
         }
 
         let mut whiteouts: Vec<String> = Vec::new();
-        for path in &base_paths {
-            if !view_paths.contains(path) {
+        for path in base_files.keys() {
+            if !view_files.contains_key(path) {
                 whiteouts.push(path.clone());
             }
         }
@@ -307,8 +358,10 @@ impl Repository {
     /// Provenance (view name and Merkle state) is recorded in the manifest
     /// annotations. Returns the manifest digest and file count.
     pub fn seal(&self, opts: SealOptions) -> Result<SealResult, RepositoryError> {
+        let materialized = self.materialized_view_files(&opts.view)?;
+        let files = materialized.len();
         let work_dir = tempfile::tempdir()?;
-        let files = self.materialize_view_to(&opts.view, work_dir.path())?;
+        Self::write_materialized_files(work_dir.path(), &materialized)?;
         let layer = oci::layer_from_dir(work_dir.path())?;
 
         let view_info = self.get_view_info(&opts.view)?;

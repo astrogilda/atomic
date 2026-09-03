@@ -1504,6 +1504,10 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn put_change_deps(&mut self, change_id: NodeId, deps: &[Hash]) -> PristineResult<()> {
+        let mut unique_deps = deps.to_vec();
+        unique_deps.sort_unstable();
+        unique_deps.dedup();
+
         let existing: Vec<[u8; 32]> = {
             let table = self.txn.open_multimap_table(CHANGE_DEPS)?;
             let iter = table.get(change_id.get())?;
@@ -1531,19 +1535,19 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         {
             let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
-            for dep in deps {
+            for dep in &unique_deps {
                 table.insert(change_id.get(), dep.as_bytes())?;
             }
         }
         {
             let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
-            for dep in deps {
+            for dep in &unique_deps {
                 table.insert(dep.as_bytes(), change_id.get())?;
             }
         }
         {
             let mut table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
-            table.insert(change_id.get(), deps.len() as u64)?;
+            table.insert(change_id.get(), unique_deps.len() as u64)?;
         }
 
         Ok(())

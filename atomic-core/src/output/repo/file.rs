@@ -87,14 +87,12 @@
 //! subgraph and E is the number of edges. The SCC computation adds O(V + E)
 //! for Tarjan's algorithm, giving overall O(V + E) complexity.
 
-use std::collections::HashSet;
 use std::io::Write;
-use std::sync::Arc;
 
 use crate::change::ChangeStore;
 use crate::output::alive::{compute_order, retrieve_graph, RetrieveOptions};
 use crate::output::traits::{WorkingCopy, Writer};
-use crate::pristine::GraphTxnT;
+use crate::pristine::{GraphTxnT, GraphVisibilityClosure};
 use crate::types::{Hash, Inode, NodeId, Position};
 
 use super::conflict::{FileConflict, FileConflictType};
@@ -586,11 +584,12 @@ where
     )
 }
 
-/// Output a single file from the graph with an optional change filter.
+/// Output a single file from the graph with optional validated visibility.
 ///
 /// This is the core file output function that supports view-aware output.
-/// When a `change_filter` is provided, only vertices from changes in the filter
-/// (or ROOT) will be included in the output.
+/// When `graph_visibility` is provided, only vertices from changes in the
+/// dependency closure (or ROOT) are included. `None` explicitly reads the
+/// unfiltered ambient graph.
 ///
 /// # Arguments
 ///
@@ -601,7 +600,7 @@ where
 /// * `position` - Starting position in the graph
 /// * `path` - Path where the file should be written
 /// * `options` - Output options
-/// * `change_filter` - Optional set of change NodeIds to include
+/// * `graph_visibility` - Optional validated dependency closure to include
 ///
 /// # Returns
 ///
@@ -615,7 +614,7 @@ pub fn output_file_with_filter<T, C, W>(
     position: Position<NodeId>,
     path: &str,
     options: FileOutputOptions,
-    change_filter: Option<Arc<HashSet<NodeId>>>,
+    graph_visibility: Option<GraphVisibilityClosure>,
 ) -> Result<FileOutputResult, FileOutputError<W::Error>>
 where
     T: GraphTxnT,
@@ -626,10 +625,10 @@ where
     // Initialize result
     let mut result = FileOutputResult::new(path, inode);
 
-    // Retrieve the alive graph with optional change filter
+    // Retrieve the alive graph with optional validated visibility.
     let mut retrieve_opts = options.to_retrieve_options();
-    if let Some(filter) = change_filter {
-        retrieve_opts = retrieve_opts.with_change_filter_arc(filter);
+    if let Some(visibility) = graph_visibility {
+        retrieve_opts = retrieve_opts.with_graph_visibility(visibility);
     }
     let retrieve_result = retrieve_graph(txn, position, retrieve_opts)?;
 
@@ -637,21 +636,10 @@ where
     result.edges_traversed = retrieve_result.edges_traversed;
     result.was_truncated = retrieve_result.truncated;
 
-    // Handle empty graph.
-    //
-    // When a change_filter is active (view-aware output), an empty graph
-    // means the file has no content on the target view.  In that case we
-    // must NOT create the file — it belongs to a different view and should
-    // not appear in the working copy.
-    //
-    // Without a change_filter the empty graph represents a genuinely empty
-    // file, so we create it as before.
+    // An empty graph represents present, zero-byte content at this layer.
+    // Presence and lifecycle filtering are the caller's responsibility, so
+    // create or truncate the file even when graph visibility was applied.
     if retrieve_result.graph.is_empty() {
-        if retrieve_result.was_filtered {
-            // File has no vertices after filtering — skip it entirely.
-            return Ok(result);
-        }
-        // No filter active: create an empty file on disk.
         let writer = working_copy
             .write_file(path, inode)
             .map_err(FileOutputError::WorkingCopy)?;
@@ -820,13 +808,13 @@ where
 /// Output a file's content to a buffer with explicit retrieve options.
 ///
 /// This is a lower-level function that allows passing custom [`RetrieveOptions`]
-/// directly, enabling features like change filtering for state-based content
+/// directly, enabling validated graph visibility for state-based content
 /// retrieval.
 ///
 /// # State-Based Content Retrieval
 ///
 /// The primary use case for this function is retrieving file content at a
-/// specific historical state. By setting a change filter in the options,
+/// specific historical state. By setting graph visibility in the options,
 /// you can retrieve content as it existed before or after a specific change:
 ///
 /// ```text
@@ -849,7 +837,7 @@ where
 /// * `changes` - Change store for span content
 /// * `position` - Starting position in the graph (file's inode position)
 /// * `file_options` - Basic file output options (max_vertices, include_deleted)
-/// * `retrieve_options` - Advanced retrieve options including change filter
+/// * `retrieve_options` - Advanced retrieve options including graph visibility
 ///
 /// # Returns
 ///
@@ -873,13 +861,11 @@ where
 /// ```rust,ignore
 /// use atomic_core::output::alive::RetrieveOptions;
 /// use atomic_core::output::repo::{output_file_to_buffer_with_options, FileOutputOptions};
-/// use std::collections::HashSet;
+/// use atomic_core::pristine::GraphVisibilityClosure;
 ///
-/// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
-///
-/// // Create retrieve options with the filter
-/// let retrieve_opts = RetrieveOptions::new().with_change_filter(change_set);
+/// let membership = get_membership_up_to_sequence(&txn, &view, 5)?;
+/// let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership)?;
+/// let retrieve_opts = RetrieveOptions::new().with_graph_visibility(visibility);
 /// let file_opts = FileOutputOptions::new();
 ///
 /// // Get content at that historical state
@@ -910,7 +896,7 @@ where
     T: GraphTxnT,
     C: ChangeStore,
 {
-    // Retrieve the alive graph with the provided options (including change filter)
+    // Retrieve the alive graph with the provided options (including visibility).
     let retrieve_result = retrieve_graph(txn, position, retrieve_options)
         .map_err(|e| OutputError::Pristine(Box::new(e)))?;
 

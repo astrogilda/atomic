@@ -623,22 +623,26 @@ impl Repository {
         // actual graph membership rather than by assuming the own log is a
         // superset of the parent (which only holds for `create_view_from`
         // drafts, not for record- or split-created drafts).
+        let membership = view_membership(&txn, &view)?;
         let (parent_name, own_change_count, inherited_change_count) = match view.parent {
             Some(parent_id) => {
-                match txn
+                let parent = txn
                     .get_view_by_id(parent_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    Some(parent) => {
-                        let parent_visible = collect_visible_change_ids(&txn, &parent)?;
-                        let own_ids = collect_view_change_ids(&txn, &view)?;
-                        let own = own_ids.difference(&parent_visible).count() as u64;
-                        (Some(parent.name), own, parent_visible.len() as u64)
-                    }
-                    None => (None, view.change_count, 0),
-                }
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "view '{}' ({}) references missing parent {}",
+                            view.name, view.id, parent_id
+                        ))
+                    })?;
+                let inherited = view_membership(&txn, &parent)?;
+                let own = membership
+                    .iter()
+                    .filter(|change_id| !inherited.contains(**change_id))
+                    .count() as u64;
+                (Some(parent.name), own, inherited.len() as u64)
             }
-            None => (None, view.change_count, 0),
+            None => (None, membership.len() as u64, 0),
         };
 
         Ok(ViewInfo {

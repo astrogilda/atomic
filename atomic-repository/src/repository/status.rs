@@ -66,41 +66,18 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let view_state = txn
+        let view = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .map(|s| s.state);
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let projected_present_paths: HashSet<PathBuf> =
+            projection.present.into_keys().map(PathBuf::from).collect();
 
-        let mut status = RepositoryStatus::new(self.current_view.clone(), view_state);
-
-        // ── View-aware filtering ───────────────────────────────────────
-        //
-        // Always build the explicit change filter.  The TREE table is
-        // global — it contains entries from ALL views, including child
-        // views.  Without filtering, files recorded on child views leak
-        // into the parent's status as false "Deleted" entries.
-        //
-        // The previous "universal" fast-path (skip filter for
-        // is_shared() && parent.is_none()) was unsound: the dev view is
-        // shared with no parent, but child/sibling views may have unique
-        // changes.  Skipping the filter caused TREE entries created by
-        // those changes to surface as phantom `Deleted` files in dev's
-        // status.
-        //
-        // The filter computation is O(C) where C is changes on the view —
-        // a single B-tree scan, fast even on large repos.
-        //
-        // None means "no current view" (a misconfigured repo); preserve
-        // the legacy "show everything" behavior in that case rather than
-        // producing an empty status.
-        let current_view_change_ids: Option<HashSet<NodeId>> = if let Some(ref view) = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            Some(collect_visible_change_ids_with_deps(&txn, view)?)
-        } else {
-            None
-        };
+        let mut status = RepositoryStatus::new(self.current_view.clone(), Some(view.state));
 
         let phase1_ms = overall_start.elapsed().as_millis();
         log::debug!("status: view filter setup took {}ms", phase1_ms);
@@ -144,23 +121,19 @@ impl Repository {
             // filesystem walk doesn't mark them Untracked) but flag them
             // so that if they're absent from disk we skip them silently
             // instead of reporting Deleted.
-            let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
-                if let Some(ref ids) = current_view_change_ids {
-                    if !position.change.is_root() && !ids.contains(&position.change) {
-                        // Foreign file — tracked globally, not on this view.
-                        // Include in tracked_paths with has_graph=false so
-                        // it shows as Added if on disk, and track it as
-                        // foreign so we skip it when not on disk.
-                        foreign_paths.insert(normalized.clone());
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
+            let has_graph = match txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                Some(position)
+                    if !position.change.is_root() && !visibility.contains(position.change) =>
+                {
+                    // Foreign file — tracked globally, not on this view.
+                    foreign_paths.insert(normalized.clone());
+                    false
                 }
-            } else {
-                false
+                Some(_) => true,
+                None => false,
             };
 
             // Apply path filter if specified
@@ -274,30 +247,13 @@ impl Repository {
                         continue;
                     }
 
-                    // File missing from disk.  Check whether the deletion
-                    // has already been recorded in the graph.
-                    //
-                    // The graph uses an additive-only edge model: the
-                    // original alive BLOCK edge and the new BLOCK|DELETED
-                    // edge coexist.  A simple "any alive edge?" check
-                    // gives wrong answers.  Instead, use the
-                    // change-filter-aware retrieval path (the same one
-                    // materialize uses) to ask: does this file have
-                    // content from this view's perspective?  If not, the
-                    // deletion is already recorded.
-                    if has_graph {
-                        if let Some(inode_val) = inode {
-                            if let Ok(Some(position)) = txn.inode_position(inode_val) {
-                                if let Some(ref ids) = current_view_change_ids {
-                                    if !is_file_alive_via_retrieval(&txn, inode_val, position, ids)
-                                    {
-                                        // Deletion already recorded — skip
-                                        found_on_disk.insert(path.clone());
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
+                    // Lifecycle projection, not content length, decides whether
+                    // the missing path is an already-recorded deletion. A
+                    // present zero-byte file remains in this set and is reported
+                    // Deleted when missing from disk.
+                    if has_graph && !projected_present_paths.contains(path) {
+                        found_on_disk.insert(path.clone());
+                        continue;
                     }
                     // File is genuinely missing and deletion not yet recorded
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Deleted);
@@ -663,58 +619,24 @@ impl Repository {
     }
 }
 
-/// Check whether a file has live content from a view's perspective.
+/// Check whether an explicit delete still has surviving content spans.
 ///
-/// Uses the change-filter-aware `is_vertex_alive` logic from the retrieval
-/// pipeline.  In Atomic's additive-only graph model, both the original alive
-/// edge and the DELETED edge coexist.  The retrieval path correctly handles
-/// supersession: a vertex is dead when a DELETED parent edge was introduced
-/// by a change *in* the filter, even if an older alive parent edge also
-/// exists.
-///
-/// Returns `false` when the deletion has been recorded (no alive content
-/// from this view's perspective).
+/// This is only a tie-breaker for lifecycle projection: an ordinary tracked
+/// empty file is present because its path lifecycle says so. For a visible
+/// `FileDel`, surviving spans from concurrent modifications keep the file
+/// present; a graph with no live byte spans leaves the deletion absent.
 pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     txn: &T,
     _inode: Inode,
     position: Position<NodeId>,
-    visible_changes: &HashSet<NodeId>,
-) -> bool {
-    use atomic_core::output::alive::RetrieveOptions;
+    visibility: &GraphVisibilityClosure,
+) -> Result<bool, RepositoryError> {
+    use atomic_core::output::alive::{retrieve_graph, RetrieveOptions};
 
-    let inode_node = position.inode_node();
-    let options = RetrieveOptions::new().with_change_filter(visible_changes.clone());
-
-    // Check forward edges from the inode vertex.  If any destination
-    // content vertex is alive (per the full supersession logic), the
-    // file has live content.
-    let edges = match txn.iter_forward(inode_node, false) {
-        Ok(edges) => edges,
-        Err(_) => return false,
-    };
-
-    if edges.is_empty() {
-        return false;
-    }
-
-    for edge in &edges {
-        // Only consider edges introduced by visible changes
-        if !edge.introduced_by.is_root() && !visible_changes.contains(&edge.introduced_by) {
-            continue;
-        }
-        // Build the destination vertex from the edge
-        let dest_vertex = match txn.find_block(edge.dest) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // Use the retrieval pipeline's supersession-aware aliveness check
-        match options.is_vertex_alive(txn, dest_vertex) {
-            Ok(true) => return true,
-            _ => continue,
-        }
-    }
-
-    false
+    let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
+    let retrieved = retrieve_graph(txn, position, options)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    Ok(retrieved.graph.total_bytes() > 0)
 }
 
 /// Normalize a tracked path from the TREE table to a relative PathBuf

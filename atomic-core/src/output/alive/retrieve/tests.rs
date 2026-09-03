@@ -1,9 +1,14 @@
 use super::super::graph::AliveGraph;
 use super::super::vertex::{AliveVertex, VertexFlags, VertexId};
 use super::options::{RetrieveOptions, RetrieveResult};
+use crate::pristine::GraphVisibilityClosure;
 use crate::types::{ChangePosition, EdgeFlags, EdgeKind, ForwardEdge, GraphNode, NodeId, Position};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+fn visibility(changes: impl IntoIterator<Item = NodeId>) -> GraphVisibilityClosure {
+    GraphVisibilityClosure::from_ordered_unchecked(changes)
+}
 
 // -------------------------------------------------------------------------
 // RetrieveOptions Tests
@@ -14,7 +19,7 @@ fn test_retrieve_options_default() {
     let opts = RetrieveOptions::default();
     assert!(!opts.include_deleted);
     assert!(opts.max_vertices.is_none());
-    assert!(opts.change_filter.is_none());
+    assert!(opts.graph_visibility.is_none());
 }
 
 #[test]
@@ -211,13 +216,12 @@ fn test_retrieve_options_debug() {
 // Change Filter Tests
 
 #[test]
-fn test_retrieve_options_with_change_filter() {
-    let mut filter = HashSet::new();
-    filter.insert(NodeId::new(1));
-    filter.insert(NodeId::new(2));
-
-    let opts = RetrieveOptions::new().with_change_filter(filter);
+fn test_retrieve_options_with_graph_visibility() {
+    let opts =
+        RetrieveOptions::new().with_graph_visibility(visibility([NodeId::new(1), NodeId::new(2)]));
     assert!(opts.has_filter());
+    assert!(opts.passes_filter(NodeId::new(1)));
+    assert!(opts.passes_filter(NodeId::new(2)));
 }
 
 #[test]
@@ -275,13 +279,14 @@ fn test_passes_filter_not_in_set() {
 }
 
 #[test]
-fn test_passes_filter_empty_set() {
-    let filter: HashSet<NodeId> = HashSet::new();
-    let opts = RetrieveOptions::new().with_change_filter(filter);
+fn test_empty_visibility_is_filtered_but_none_is_ambient() {
+    let opts = RetrieveOptions::new().with_graph_visibility(GraphVisibilityClosure::empty());
 
-    // Empty filter means only ROOT passes
+    // An empty closure is active visibility and means only ROOT passes.
     assert!(opts.passes_filter(NodeId::ROOT));
     assert!(!opts.passes_filter(NodeId::new(1)));
+    assert!(!RetrieveOptions::new().has_filter());
+    assert!(RetrieveOptions::new().passes_filter(NodeId::new(1)));
 }
 
 #[test]
@@ -351,11 +356,7 @@ fn test_retrieve_options_shared_filter_arc() {
     let opts1 = RetrieveOptions::new().with_change_filter_arc(arc.clone());
     let opts2 = RetrieveOptions::new().with_change_filter_arc(arc.clone());
 
-    // Both should reference the same Arc
-    assert!(Arc::ptr_eq(
-        opts1.change_filter.as_ref().unwrap(),
-        opts2.change_filter.as_ref().unwrap()
-    ));
+    assert_eq!(opts1.graph_visibility, opts2.graph_visibility);
 }
 
 // -------------------------------------------------------------------------

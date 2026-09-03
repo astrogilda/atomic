@@ -27,45 +27,44 @@ fn is_file_only_on_view<T: GraphTxnT + ViewTxnT + TreeTxnT>(
     txn: &T,
     inode: Inode,
     current_view: &str,
-) -> bool {
-    // Look up the position for this inode.  If there is no position the
-    // file was never recorded, so removing from TREE is safe.
-    let position = match txn.inode_position(inode) {
-        Ok(Some(pos)) => pos,
-        _ => return true,
+) -> Result<bool, RepositoryError> {
+    // Look up the position for this inode. If there is no position the file
+    // was never recorded, so removing from TREE is safe. Database failures
+    // are not absence and must fail closed.
+    let Some(position) = txn
+        .inode_position(inode)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    else {
+        return Ok(true);
     };
 
     let creating_change = position.change;
     if creating_change.is_root() {
-        return true;
+        return Ok(true);
     }
 
     // Walk every view and check whether the creating change appears on
     // any view OTHER than `current_view`.
-    let view_names = match txn.list_views() {
-        Ok(names) => names,
-        Err(_) => return true,
-    };
+    let view_names = txn
+        .list_views()
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
     for name in view_names {
         if name == current_view {
             continue;
         }
-        let view = match txn.get_view(&name) {
-            Ok(Some(s)) => s,
-            _ => continue,
-        };
-        if collect_visible_change_ids(txn, &view)
-            .map(|ids| ids.contains(&creating_change))
-            .unwrap_or(false)
-        {
+        let view = txn
+            .get_view(&name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+        if graph_visibility_closure(txn, &view)?.contains(creating_change) {
             // Another view still references this file — not safe to remove.
-            return false;
+            return Ok(false);
         }
     }
 
     // No other view references the creating change.
-    true
+    Ok(true)
 }
 
 /// Timing details for the git-import fresh-write path.
@@ -259,20 +258,23 @@ fn import_direct_can_apply(change: &Change) -> bool {
     })
 }
 
-fn import_seed_edge_visible(edge: &SerializedGraphEdge, visible: &HashSet<NodeId>) -> bool {
+fn import_seed_edge_visible(
+    edge: &SerializedGraphEdge,
+    visibility: &GraphVisibilityClosure,
+) -> bool {
     let change = edge.introduced_by();
-    change.is_root() || visible.contains(&change)
+    change.is_root() || visibility.contains(change)
 }
 
-fn import_seed_node_visible(node: GraphNode<NodeId>, visible: &HashSet<NodeId>) -> bool {
-    node.change.is_root() || visible.contains(&node.change)
+fn import_seed_node_visible(node: GraphNode<NodeId>, visibility: &GraphVisibilityClosure) -> bool {
+    node.change.is_root() || visibility.contains(node.change)
 }
 
 fn import_seed_is_dead<T>(
     txn: &T,
     inode: Inode,
     node: GraphNode<NodeId>,
-    visible: &HashSet<NodeId>,
+    visibility: &GraphVisibilityClosure,
 ) -> bool
 where
     T: GraphTxnT + InodeGraphOps,
@@ -288,7 +290,7 @@ where
         let flags = edge.flag();
         if flags.contains(EdgeFlags::PARENT)
             && flags.contains(EdgeFlags::DELETED)
-            && import_seed_edge_visible(&edge, visible)
+            && import_seed_edge_visible(&edge, visibility)
         {
             return true;
         }
@@ -301,7 +303,7 @@ fn import_seed_alive_reaches<T>(
     inode: Inode,
     start: GraphNode<NodeId>,
     target: GraphNode<NodeId>,
-    visible: &HashSet<NodeId>,
+    visibility: &GraphVisibilityClosure,
 ) -> bool
 where
     T: GraphTxnT + InodeGraphOps,
@@ -331,7 +333,7 @@ where
             if flags.contains(EdgeFlags::PARENT)
                 || flags.contains(EdgeFlags::DELETED)
                 || flags.contains(EdgeFlags::PSEUDO)
-                || !import_seed_edge_visible(&edge, visible)
+                || !import_seed_edge_visible(&edge, visibility)
             {
                 continue;
             }
@@ -344,8 +346,8 @@ where
             else {
                 continue;
             };
-            if !import_seed_node_visible(dest, visible)
-                || import_seed_is_dead(txn, inode, dest, visible)
+            if !import_seed_node_visible(dest, visibility)
+                || import_seed_is_dead(txn, inode, dest, visibility)
             {
                 continue;
             }
@@ -568,7 +570,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: self.current_view.clone(),
             })?;
-        let visible = collect_visible_change_ids_with_deps(&txn, &view)?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
 
         let Some(inode) = txn
             .get_inode(&normalized)
@@ -582,7 +584,7 @@ impl Repository {
         else {
             return Ok(None);
         };
-        if !import_seed_node_visible(position.inode_node(), &visible) {
+        if !import_seed_node_visible(position.inode_node(), &visibility) {
             return Ok(None);
         }
         let Some(inode_change) = txn
@@ -619,7 +621,7 @@ impl Repository {
                 if flags.contains(EdgeFlags::PARENT)
                     || flags.contains(EdgeFlags::DELETED)
                     || flags.contains(EdgeFlags::PSEUDO)
-                    || !import_seed_edge_visible(&edge, &visible)
+                    || !import_seed_edge_visible(&edge, &visibility)
                 {
                     continue;
                 }
@@ -631,11 +633,11 @@ impl Repository {
                 else {
                     continue;
                 };
-                if visited.contains(&dest) || !import_seed_node_visible(dest, &visible) {
+                if visited.contains(&dest) || !import_seed_node_visible(dest, &visibility) {
                     continue;
                 }
                 let introduced_by = edge.introduced_by();
-                if !import_seed_is_dead(&txn, inode, dest, &visible) {
+                if !import_seed_is_dead(&txn, inode, dest, &visibility) {
                     alive_candidates.push((dest, introduced_by));
                 } else if next_dead.is_none() {
                     next_dead = Some((dest, introduced_by));
@@ -652,14 +654,22 @@ impl Repository {
                         let reaches_other = alive_candidates.iter().copied().any(|(other, _)| {
                             other != *candidate
                                 && import_seed_alive_reaches(
-                                    &txn, inode, *candidate, other, &visible,
+                                    &txn,
+                                    inode,
+                                    *candidate,
+                                    other,
+                                    &visibility,
                                 )
                         });
                         let reached_by_other =
                             alive_candidates.iter().copied().any(|(other, _)| {
                                 other != *candidate
                                     && import_seed_alive_reaches(
-                                        &txn, inode, other, *candidate, &visible,
+                                        &txn,
+                                        inode,
+                                        other,
+                                        *candidate,
+                                        &visibility,
                                     )
                             });
                         reaches_other && !reached_by_other
@@ -669,7 +679,11 @@ impl Repository {
                             alive_candidates.iter().copied().any(|(other, _)| {
                                 other != *candidate
                                     && import_seed_alive_reaches(
-                                        &txn, inode, *candidate, other, &visible,
+                                        &txn,
+                                        inode,
+                                        *candidate,
+                                        other,
+                                        &visibility,
                                     )
                             })
                         })
@@ -682,7 +696,7 @@ impl Repository {
             };
 
             let is_inode_marker = dest.start == dest.end && dest.start == position.pos;
-            let is_alive = !import_seed_is_dead(&txn, inode, dest, &visible);
+            let is_alive = !import_seed_is_dead(&txn, inode, dest, &visibility);
             if is_alive && !is_inode_marker && !dest.change.is_root() && dest.start != dest.end {
                 let Some(change) = txn
                     .get_external(dest.change)
@@ -823,21 +837,26 @@ impl Repository {
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } if !preserve_existing_tree_paths => {
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
+                    if let Some(inode) = txn
+                        .get_inode(path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        if is_file_only_on_view(&txn, inode, view_name)? {
+                            txn.del_tree(path)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         }
                     }
                 }
                 GraphOp::DirDel { path, .. } if !preserve_existing_tree_paths => {
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
-                            let _ = txn.del_directory(inode);
+                    if let Some(inode) = txn
+                        .get_inode(path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        if is_file_only_on_view(&txn, inode, view_name)? {
+                            txn.del_tree(path)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                            txn.del_directory(inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         }
                     }
                 }
@@ -864,11 +883,13 @@ impl Repository {
 
         if !preserve_existing_tree_paths {
             for deleted_path in deleted_paths {
-                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                    let dominated = is_file_only_on_view(&txn, inode, view_name);
-                    if dominated {
-                        let _ = txn.del_tree(deleted_path);
-                        let _ = txn.del_inode(inode);
+                if let Some(inode) = txn
+                    .get_inode(deleted_path)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    if is_file_only_on_view(&txn, inode, view_name)? {
+                        txn.del_tree(deleted_path)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
                 }
             }
@@ -966,6 +987,7 @@ impl Repository {
 
             txn.put_change_deps(change_id, final_change.dependencies())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let tree_ops = collect_tree_ops(&txn, hash, &final_change, deleted_paths)?;
 
             let mut view = txn
                 .open_or_create_view(view_name)
@@ -986,6 +1008,12 @@ impl Repository {
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
             }
 
+            self.append_deferred_tree_ops(
+                &txn,
+                &tree_ops,
+                view_name,
+                preserve_existing_tree_paths,
+            )?;
             txn.commit()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -1042,10 +1070,13 @@ impl Repository {
 
         if !preserve_existing_tree_paths {
             for deleted_path in deleted_paths {
-                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                    let _ = txn.del_tree(deleted_path);
-                    if is_file_only_on_view(&txn, inode, view_name) {
-                        let _ = txn.del_inode(inode);
+                if let Some(inode) = txn
+                    .get_inode(deleted_path)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    if is_file_only_on_view(&txn, inode, view_name)? {
+                        txn.del_tree(deleted_path)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
                 }
             }
@@ -1778,10 +1809,13 @@ impl Repository {
                     GraphOp::FileDel { path, .. } if !preserve_existing_tree_paths => {
                         // View-aware: only remove TREE entry when no other
                         // view still references the file's creating change.
-                        if let Ok(Some(inode)) = txn.get_inode(path) {
-                            let dominated = is_file_only_on_view(&txn, inode, view_name);
-                            if dominated {
-                                let _ = txn.del_tree(path);
+                        if let Some(inode) = txn
+                            .get_inode(path)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?
+                        {
+                            if is_file_only_on_view(&txn, inode, view_name)? {
+                                txn.del_tree(path)
+                                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
                             }
                         }
                     }
@@ -1887,31 +1921,7 @@ impl Repository {
             log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
         }
 
-        // Working-copy cleanup for whole-file deletions (FileDel hunks).
-        //
-        // TREE/INODES are global and only cleaned up when no other view still
-        // references the file, so a delete inserted into the current view can
-        // leave the (now dead) file's stale bytes on disk — materialize only
-        // writes or skips, it never removes. Re-check the file's visible
-        // content on this view AFTER the change is applied and remove the
-        // stale working-copy file when the content is truly gone. A
-        // delete-vs-modify merge where lines survive yields Some(content) and
-        // is left for materialize to rewrite. Truncate-to-empty is recorded
-        // as an Edit (not FileDel) and never reaches this path.
         if view_name == self.current_view {
-            for graph_op in change.hunks() {
-                if let GraphOp::FileDel { path, .. } = graph_op {
-                    let gone = matches!(self.get_file_content_on_view(path, view_name), Ok(None));
-                    if gone {
-                        let abs = self.root.join(path);
-                        if abs.is_file() {
-                            let _ = std::fs::remove_file(&abs);
-                        }
-                        let _ = self.del_file_index(path);
-                    }
-                }
-            }
-
             // Remove the stale source of each applied FileMove. TREE was
             // repointed old→new above, so materialize will write the new path
             // but never deletes the old one. Only remove when the old path is
@@ -2214,31 +2224,30 @@ impl Repository {
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 }
                 GraphOp::FileDel { path, .. } if !preserve_existing_tree_paths => {
-                    // View-aware deletion: only remove TREE/INODES entries
-                    // when no OTHER view still references the file's creating
-                    // change.  The TREE and INODES tables are global — removing
-                    // an entry here would make the file invisible on every
-                    // view, not just the one where the deletion was recorded.
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
+                    // TREE is a projected path cache. The stable INODES mapping
+                    // survives deletion so lifecycle projection, undelete, and
+                    // stale-file cleanup can still resolve the original inode.
+                    if let Some(inode) = txn
+                        .get_inode(path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        if is_file_only_on_view(&txn, inode, view_name)? {
+                            txn.del_tree(path)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         }
                     }
-                    // When other views still reference the file we leave
-                    // TREE/INODES intact.  The deletion is represented in
-                    // the graph via DELETED edges and will be honoured by
-                    // materialize's change_filter / retrieve_graph.
                 }
                 GraphOp::DirDel { path, .. } if !preserve_existing_tree_paths => {
-                    // Same view-aware logic as FileDel above.
-                    if let Ok(Some(inode)) = txn.get_inode(path) {
-                        let dominated = is_file_only_on_view(&txn, inode, view_name);
-                        if dominated {
-                            let _ = txn.del_tree(path);
-                            let _ = txn.del_inode(inode);
-                            let _ = txn.del_directory(inode);
+                    // Same stable-inode rule as FileDel above.
+                    if let Some(inode) = txn
+                        .get_inode(path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        if is_file_only_on_view(&txn, inode, view_name)? {
+                            txn.del_tree(path)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                            txn.del_directory(inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
                         }
                     }
                 }
@@ -2272,11 +2281,13 @@ impl Repository {
         // View-aware: only remove if no other view still references the file.
         if !preserve_existing_tree_paths {
             for deleted_path in outcome.deleted_files() {
-                if let Ok(Some(inode)) = txn.get_inode(deleted_path) {
-                    let dominated = is_file_only_on_view(&txn, inode, view_name);
-                    if dominated {
-                        let _ = txn.del_tree(deleted_path);
-                        let _ = txn.del_inode(inode);
+                if let Some(inode) = txn
+                    .get_inode(deleted_path)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                {
+                    if is_file_only_on_view(&txn, inode, view_name)? {
+                        txn.del_tree(deleted_path)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     }
                 }
             }

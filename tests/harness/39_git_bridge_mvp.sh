@@ -81,8 +81,9 @@ else
         "expected feature, got $(git_current_branch)"
 fi
 create_file "src/nested/feature.txt" "feature\n"
+: > feature-empty.txt
 overwrite_file "README.md" "bridge mvp\nfeature\n"
-git add README.md src/nested/feature.txt
+git add README.md src/nested/feature.txt feature-empty.txt
 git commit --quiet -m "Feature commit"
 FEATURE_HEAD="$(git_head_sha_full)"
 
@@ -110,6 +111,12 @@ else
     _fail "reconcile preserves Git HEAD" "expected $FEATURE_HEAD, got $(git_head_sha_full)"
 fi
 assert_file_content "reconciled feature content is present" "src/nested/feature.txt" "feature\n"
+if [[ -f feature-empty.txt && ! -s feature-empty.txt ]]; then
+    _pass "feature-local zero-byte file is present after reconcile"
+else
+    _fail "feature-local zero-byte file is present after reconcile" \
+        "feature-empty.txt missing or non-empty"
+fi
 assert_complete_paths_match "all Git HEAD paths exactly match working-tree paths"
 assert_success "explicit bridge verify proves Git/Atomic equality" atomic git bridge verify
 if [[ -s .atomic/bridge/workspace.json ]]; then
@@ -348,6 +355,7 @@ else
     _fail "main zero-byte file remains empty" "tracked-empty.txt is non-empty"
 fi
 assert_file_not_exists "feature-added path is absent on main" src/nested/feature.txt
+assert_file_not_exists "feature-local zero-byte path is absent on main" feature-empty.txt
 assert_file_not_exists "Atomic-origin path is absent on main" src/nested/atomic-origin.txt
 assert_complete_paths_match "main materialization has exact projected path list"
 assert_clean_statuses "after bridge switch to main"
@@ -371,6 +379,12 @@ if [[ -f tracked-empty.txt && ! -s tracked-empty.txt ]]; then
     _pass "feature zero-byte file is present and empty"
 else
     _fail "feature zero-byte file is present and empty" "tracked-empty.txt missing or non-empty"
+fi
+if [[ -f feature-empty.txt && ! -s feature-empty.txt ]]; then
+    _pass "selected-path switch recreates feature-local zero-byte file"
+else
+    _fail "selected-path switch recreates feature-local zero-byte file" \
+        "feature-empty.txt missing or non-empty"
 fi
 snapshot_materialized_state "$CURRENT_PATHS" "$CURRENT_HASHES"
 if cmp -s "$FEATURE_PATHS" "$CURRENT_PATHS" && cmp -s "$FEATURE_HASHES" "$CURRENT_HASHES"; then

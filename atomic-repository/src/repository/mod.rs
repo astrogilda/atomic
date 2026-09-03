@@ -42,10 +42,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomic_core::change::{Change, ChangeHeader, GraphOp};
-use atomic_core::output::repo::{materialize_view, MaterializeOptions, MaterializeResult};
+pub use atomic_core::output::repo::MaterializedEntry;
+use atomic_core::output::repo::{
+    materialize_view, MaterializeOptions, MaterializeResult, OutputItem,
+};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
-use atomic_core::pristine::{GraphTxnT, MutTxnT, Pristine, TreeTxnT, ViewScope, ViewTxnT};
+use atomic_core::pristine::{
+    GraphTxnT, GraphVisibilityClosure, MutTxnT, Pristine, TreeTxnT, ViewMembershipSet, ViewScope,
+    ViewTxnT,
+};
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
 
@@ -88,7 +94,8 @@ mod views;
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
-    expand_indexed_dependency_closure, view_set_id,
+    graph_visibility_closure, graph_visibility_from_membership, view_membership,
+    view_membership_at_sequence, view_set_id,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
@@ -712,7 +719,21 @@ default = "{}"
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
     pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
-        self.align_deferred_tree_and_publish_view(view).map(|_| ())
+        let visibility = {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let view_state = txn
+                .get_view(view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+            graph_visibility_closure(&txn, &view_state)?
+        };
+        self.align_deferred_tree_and_publish_view(view, &visibility)
+            .map(|_| ())
     }
 
     /// Set the current view on this handle only.

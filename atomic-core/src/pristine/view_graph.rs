@@ -1,8 +1,8 @@
 //! View-scoped graph wrapper that filters edge traversal by visibility.
 //!
-//! `ViewGraph` wraps any `GraphTxnT` implementor and a set of visible
-//! change `NodeId`s. When iterating adjacent edges, only edges whose
-//! `introduced_by` is in the visible set (or is ROOT) are returned.
+//! `ViewGraph` wraps any `GraphTxnT` implementor and a validated
+//! [`GraphVisibilityClosure`]. When iterating adjacent edges, only edges whose
+//! `introduced_by` is in the closure (or is ROOT) are returned.
 //!
 //! Position lookups (`find_block`, `find_block_end`) are NOT filtered
 //! because they are structural — a vertex exists at a position regardless
@@ -12,20 +12,17 @@
 //! `GRAPH`. In the ambient graph model, there is only `GRAPH`, and
 //! `ViewGraph` controls which edges are visible per-view.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
 use crate::pristine::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, InodeAdjState, InodeGraphOps, PristineError,
-    TreeTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, InodeAdjState,
+    InodeGraphOps, PristineError, TreeTxnT,
 };
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 /// A view-scoped graph wrapper that filters edge traversal by visibility.
 ///
-/// `ViewGraph` wraps any `GraphTxnT` implementor and a set of visible
-/// change `NodeId`s. When iterating adjacent edges, only edges whose
-/// `introduced_by` is in the visible set (or is ROOT) are returned.
+/// `ViewGraph` wraps any `GraphTxnT` implementor and a validated visibility
+/// closure. When iterating adjacent edges, only edges whose `introduced_by` is
+/// in the closure (or is ROOT) are returned.
 ///
 /// Position lookups (`find_block`, `find_block_end`) are NOT filtered
 /// because they are structural — a vertex exists at a position regardless
@@ -34,19 +31,18 @@ use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, Serializ
 /// # Example
 ///
 /// ```rust,ignore
-/// use atomic_core::pristine::ViewGraph;
-/// use std::sync::Arc;
-/// use std::collections::HashSet;
+/// use atomic_core::pristine::{GraphVisibilityClosure, ViewGraph};
 ///
-/// let visible = Arc::new(collect_visible_change_ids(&txn, &view)?);
-/// let vg = ViewGraph::new(&txn, visible);
+/// let membership = txn.view_membership_set(&view)?;
+/// let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership)?;
+/// let vg = ViewGraph::new(&txn, visibility);
 ///
 /// // iter_adjacent now only returns edges from the view's changes
 /// let edges = vg.iter_adjacent(node, min_flag, max_flag)?;
 /// ```
 pub struct ViewGraph<'a, T> {
     inner: &'a T,
-    visible: Arc<HashSet<NodeId>>,
+    visibility: GraphVisibilityClosure,
 }
 
 impl<'a, T> ViewGraph<'a, T> {
@@ -55,9 +51,9 @@ impl<'a, T> ViewGraph<'a, T> {
     /// # Arguments
     ///
     /// * `inner` - The underlying transaction implementing `GraphTxnT`
-    /// * `visible` - Set of `NodeId`s whose edges should be visible
-    pub fn new(inner: &'a T, visible: Arc<HashSet<NodeId>>) -> Self {
-        Self { inner, visible }
+    /// * `visibility` - Validated dependency closure whose edges are visible
+    pub fn new(inner: &'a T, visibility: GraphVisibilityClosure) -> Self {
+        Self { inner, visibility }
     }
 
     /// Get a reference to the inner transaction.
@@ -70,7 +66,7 @@ impl<'a, T> ViewGraph<'a, T> {
     /// ROOT is always visible regardless of the filter set.
     #[cfg(test)]
     fn is_visible(&self, change_id: NodeId) -> bool {
-        change_id == NodeId::ROOT || self.visible.contains(&change_id)
+        change_id == NodeId::ROOT || self.visibility.contains(change_id)
     }
 }
 
@@ -101,7 +97,7 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
             match self.inner.next_inode_adj(adj) {
                 Some(Ok(edge)) => {
                     let introduced = edge.introduced_by();
-                    if introduced.is_root() || self.visible.contains(&introduced) {
+                    if introduced.is_root() || self.visibility.contains(introduced) {
                         return Some(Ok(edge));
                     }
                     // Edge from a non-visible change — skip it
@@ -146,7 +142,7 @@ impl<'a, T: InodeGraphOps> InodeGraphOps for ViewGraph<'a, T> {
 /// Filtered adjacency iterator that only yields edges from visible changes.
 pub struct FilteredAdj<I> {
     inner: I,
-    visible: Arc<HashSet<NodeId>>,
+    visibility: GraphVisibilityClosure,
 }
 
 impl<I> Iterator for FilteredAdj<I>
@@ -160,7 +156,7 @@ where
             match self.inner.next() {
                 Some(Ok(edge)) => {
                     let introduced_by = edge.introduced_by();
-                    if introduced_by == NodeId::ROOT || self.visible.contains(&introduced_by) {
+                    if introduced_by == NodeId::ROOT || self.visibility.contains(introduced_by) {
                         return Some(Ok(edge));
                     }
                     // Skip edges not visible in this view
@@ -189,7 +185,7 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         let inner_iter = self.inner.iter_adjacent(node, min_flag, max_flag)?;
         Ok(FilteredAdj {
             inner: inner_iter,
-            visible: Arc::clone(&self.visible),
+            visibility: self.visibility.clone(),
         })
     }
 
@@ -238,9 +234,9 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         self.inner.get_change_deps(change_id)
     }
 
-    /// Indexed dependency marker lookup — no filtering. Delegates to inner.
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> Result<bool, PristineError> {
-        self.inner.is_change_deps_indexed(change_id)
+    /// Indexed dependency count lookup — no filtering. Delegates to inner.
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> Result<Option<u64>, PristineError> {
+        self.inner.change_deps_indexed_count(change_id)
     }
 
     /// Reverse indexed normal change dependency lookup — no filtering. Delegates to inner.
@@ -316,7 +312,7 @@ mod tests {
 
         let vg: ViewGraph<'_, DummyTxn> = ViewGraph {
             inner: &DummyTxn,
-            visible: Arc::new(HashSet::new()),
+            visibility: GraphVisibilityClosure::empty(),
         };
 
         // ROOT is always visible even with an empty filter
@@ -327,13 +323,12 @@ mod tests {
     fn test_is_visible_checks_set() {
         struct DummyTxn;
 
-        let mut visible = HashSet::new();
-        visible.insert(NodeId::new(42));
-        visible.insert(NodeId::new(99));
+        let visibility =
+            GraphVisibilityClosure::from_ordered_unchecked([NodeId::new(42), NodeId::new(99)]);
 
         let vg: ViewGraph<'_, DummyTxn> = ViewGraph {
             inner: &DummyTxn,
-            visible: Arc::new(visible),
+            visibility,
         };
 
         assert!(vg.is_visible(NodeId::new(42)));
@@ -351,7 +346,7 @@ mod tests {
         let txn = DummyTxn(123);
         let vg = ViewGraph {
             inner: &txn,
-            visible: Arc::new(HashSet::new()),
+            visibility: GraphVisibilityClosure::empty(),
         };
 
         assert_eq!(vg.inner().0, 123);

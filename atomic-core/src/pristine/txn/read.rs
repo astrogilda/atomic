@@ -20,7 +20,8 @@ use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, StoredConflict, TreeTxnT,
+    ViewState, ViewTxnT,
 };
 
 use super::helpers::{
@@ -296,10 +297,10 @@ impl GraphTxnT for ReadTxn {
         Ok(result)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
         let table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
-        let indexed = table.get(change_id.get())?.is_some();
-        Ok(indexed)
+        let count = table.get(change_id.get())?.map(|value| value.value());
+        Ok(count)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
@@ -1638,8 +1639,8 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         self.txn.get_change_deps(change_id)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
-        self.txn.is_change_deps_indexed(change_id)
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.change_deps_indexed_count(change_id)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
@@ -1989,17 +1990,17 @@ impl<'txn> InodePreloadTxn<'txn> {
     }
 
     /// Whether any pre-loaded edge for this inode is a DELETED edge whose
-    /// introducing change is in `visible`.
+    /// introducing change is in the validated visibility closure.
     ///
     /// Distinguishes "content was deleted on this view" from "file is
     /// empty / has no visible content": a file recorded empty carries no
     /// visible DELETED edges, while a (partially or fully) deleted file
     /// does. Used by materialize to decide when a stale on-disk file whose
     /// visible content vanished should be removed.
-    pub fn has_visible_deleted_edge(&self, visible: &std::collections::HashSet<NodeId>) -> bool {
-        self.edges.values().flatten().any(|e| {
-            e.flag().contains(crate::types::EdgeFlags::DELETED)
-                && visible.contains(&e.introduced_by())
+    pub fn has_visible_deleted_edge(&self, visibility: &GraphVisibilityClosure) -> bool {
+        self.edges.values().flatten().any(|edge| {
+            edge.flag().contains(crate::types::EdgeFlags::DELETED)
+                && visibility.contains(edge.introduced_by())
         })
     }
 }
@@ -2132,8 +2133,8 @@ impl<'txn> GraphTxnT for InodePreloadTxn<'txn> {
         self.txn.get_change_deps(change_id)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
-        self.txn.is_change_deps_indexed(change_id)
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.change_deps_indexed_count(change_id)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {

@@ -56,10 +56,19 @@ impl Default for DeferredTreeJournal {
 #[derive(Debug, Clone)]
 struct DesiredTreePath {
     desired_path: Option<String>,
+    last_present_path: Option<String>,
+    known_paths: HashSet<String>,
+    deleted: bool,
     /// Journal order of the visible Set that currently claims this path.
     /// A visible Set outranks an inherited baseline, and later visible Sets
     /// resolve two view overlays that independently created the same path.
     last_set_order: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct TreeProjection {
+    pub(super) present: HashMap<String, OutputItem>,
+    pub(super) absent: Vec<MaterializedEntry>,
 }
 
 type DeferredPathClaim = (Position<Hash>, Option<usize>);
@@ -71,9 +80,15 @@ fn desired_tree_paths(
     let mut desired = HashMap::new();
 
     for (order, op) in ops.iter().enumerate() {
-        let state = desired.entry(op.inode).or_insert_with(|| DesiredTreePath {
-            desired_path: op.baseline_path.clone(),
-            last_set_order: None,
+        let state = desired.entry(op.inode).or_insert_with(|| {
+            let known_paths = op.baseline_path.iter().cloned().collect();
+            DesiredTreePath {
+                desired_path: op.baseline_path.clone(),
+                last_present_path: op.baseline_path.clone(),
+                known_paths,
+                deleted: false,
+                last_set_order: None,
+            }
         });
         if !visible_changes.contains(&op.change) {
             continue;
@@ -81,11 +96,15 @@ fn desired_tree_paths(
 
         match &op.action {
             DeferredTreeAction::Set { path } => {
+                state.known_paths.insert(path.clone());
                 state.desired_path = Some(path.clone());
+                state.last_present_path = Some(path.clone());
+                state.deleted = false;
                 state.last_set_order = Some(order);
             }
             DeferredTreeAction::Delete => {
                 state.desired_path = None;
+                state.deleted = true;
                 state.last_set_order = None;
             }
         }
@@ -128,6 +147,85 @@ fn desired_tree_paths(
     }
 
     desired
+}
+
+fn causally_order_tree_ops<T: GraphTxnT>(
+    txn: &T,
+    ops: &[DeferredTreeOp],
+) -> Result<Vec<DeferredTreeOp>, RepositoryError> {
+    fn visit<T: GraphTxnT>(
+        txn: &T,
+        change: Hash,
+        groups: &HashMap<Hash, Vec<DeferredTreeOp>>,
+        visiting: &mut HashSet<Hash>,
+        visited: &mut HashSet<Hash>,
+        ordered: &mut Vec<DeferredTreeOp>,
+    ) -> Result<(), RepositoryError> {
+        if visited.contains(&change) {
+            return Ok(());
+        }
+        if !visiting.insert(change) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "deferred TREE lifecycle contains a dependency cycle at {}",
+                    change.to_base32()
+                ),
+            });
+        }
+
+        let change_id = txn
+            .get_internal(&change)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!(
+                    "deferred TREE lifecycle references unknown change {}",
+                    change.to_base32()
+                ),
+            })?;
+        for dependency in txn
+            .get_change_deps(change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            if groups.contains_key(&dependency) {
+                visit(txn, dependency, groups, visiting, visited, ordered)?;
+            }
+        }
+
+        visiting.remove(&change);
+        visited.insert(change);
+        ordered.extend(
+            groups
+                .get(&change)
+                .expect("visited deferred TREE change has an operation group")
+                .iter()
+                .cloned(),
+        );
+        Ok(())
+    }
+
+    let mut group_order = Vec::new();
+    let mut groups: HashMap<Hash, Vec<DeferredTreeOp>> = HashMap::new();
+    for op in ops {
+        if !groups.contains_key(&op.change) {
+            group_order.push(op.change);
+        }
+        groups.entry(op.change).or_default().push(op.clone());
+    }
+
+    let mut ordered = Vec::with_capacity(ops.len());
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for change in group_order {
+        visit(
+            txn,
+            change,
+            &groups,
+            &mut visiting,
+            &mut visited,
+            &mut ordered,
+        )?;
+    }
+    Ok(ordered)
 }
 
 fn external_inode_position<T: GraphTxnT + TreeTxnT>(
@@ -229,13 +327,11 @@ fn inode_is_visible_on_another_view<T: GraphTxnT + TreeTxnT + ViewTxnT>(
         if name == current_view {
             continue;
         }
-        let Some(view) = txn
+        let view = txn
             .get_view(&name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-        else {
-            continue;
-        };
-        if collect_visible_change_ids(txn, &view)?.contains(&internal_change) {
+            .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+        if graph_visibility_closure(txn, &view)?.contains(internal_change) {
             return Ok(true);
         }
     }
@@ -423,6 +519,162 @@ impl Repository {
         Ok(journal)
     }
 
+    /// Project the path/lifecycle state for a change closure without treating
+    /// the global TREE cache or rendered byte length as file presence.
+    pub(super) fn project_tree_for_visibility<T>(
+        &self,
+        txn: &T,
+        visibility: &GraphVisibilityClosure,
+    ) -> Result<TreeProjection, RepositoryError>
+    where
+        T: GraphTxnT + TreeTxnT,
+    {
+        let journal = self.load_deferred_tree_journal()?;
+        let mut visible_hashes = HashSet::with_capacity(visibility.len());
+        for change_id in visibility.iter_dependency_first().copied() {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "validated visible change {} has no external hash",
+                        change_id.get()
+                    ))
+                })?;
+            visible_hashes.insert(hash);
+        }
+        let ordered_ops = causally_order_tree_ops(txn, &journal.ops)?;
+        let desired = desired_tree_paths(&ordered_ops, &visible_hashes);
+
+        let mut current = HashMap::new();
+        for entry in txn
+            .iter_tree()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let (path, inode) = entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let Some(position) = txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            if position.change.is_root() {
+                continue;
+            }
+            let Some(change) = txn
+                .get_external(position.change)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            current.insert(
+                Position::new(change, position.pos),
+                (
+                    inode,
+                    path,
+                    txn.is_directory(inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                    position,
+                ),
+            );
+        }
+
+        let mut positions: HashSet<Position<Hash>> = current.keys().copied().collect();
+        positions.extend(desired.keys().copied());
+
+        let mut projection = TreeProjection::default();
+        let mut absent_by_path = HashMap::new();
+        for external_position in positions {
+            let resolved = if let Some((inode, path, is_directory, position)) =
+                current.get(&external_position)
+            {
+                Some((*inode, Some(path.clone()), *is_directory, *position))
+            } else {
+                let Some(internal_change) = txn
+                    .get_internal(&external_position.change)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                else {
+                    continue;
+                };
+                let position = Position::new(internal_change, external_position.pos);
+                let Some(inode) = txn
+                    .position_inode(position)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                else {
+                    continue;
+                };
+                Some((
+                    inode,
+                    txn.get_path(inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                    txn.is_directory(inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                    position,
+                ))
+            };
+            let Some((inode, current_path, is_directory, position)) = resolved else {
+                continue;
+            };
+
+            if !visibility.contains(position.change) {
+                continue;
+            }
+
+            match desired.get(&external_position) {
+                None => {
+                    if let Some(path) = current_path {
+                        let item = if is_directory {
+                            OutputItem::directory(path.clone(), inode)
+                        } else {
+                            OutputItem::file(path.clone(), inode, position)
+                        };
+                        projection.present.insert(path, item);
+                    }
+                }
+                Some(state) => {
+                    let mut projected_path = state.desired_path.clone();
+                    if projected_path.is_none() && state.deleted && !is_directory {
+                        if crate::repository::status::is_file_alive_via_retrieval(
+                            txn, inode, position, visibility,
+                        )? {
+                            projected_path = state
+                                .last_present_path
+                                .clone()
+                                .or_else(|| current_path.clone());
+                        }
+                    }
+
+                    if let Some(path) = projected_path {
+                        let item = if is_directory {
+                            OutputItem::directory(path.clone(), inode)
+                        } else {
+                            OutputItem::file(path.clone(), inode, position)
+                        };
+                        projection.present.insert(path, item);
+                    } else if !is_directory {
+                        for path in &state.known_paths {
+                            absent_by_path.insert(
+                                path.clone(),
+                                MaterializedEntry::absent(path.clone(), Some(inode)),
+                            );
+                        }
+                        if let Some(path) = current_path {
+                            absent_by_path
+                                .insert(path.clone(), MaterializedEntry::absent(path, Some(inode)));
+                        }
+                    }
+                }
+            }
+        }
+
+        absent_by_path.retain(|path, _| !projection.present.contains_key(path));
+        projection.absent = absent_by_path.into_values().collect();
+        projection
+            .absent
+            .sort_by(|left, right| left.path().cmp(right.path()));
+        Ok(projection)
+    }
+
     /// Persist deferred operations atomically. The caller holds pristine's
     /// write transaction, which serializes journal writers across processes.
     pub(super) fn append_deferred_tree_ops<T: GraphTxnT + TreeTxnT + ViewTxnT>(
@@ -445,7 +697,14 @@ impl Repository {
         for op in &journal.ops {
             remember_op_paths(op, &mut tracked_paths);
         }
-        let mut batch_participates = include_new_inodes;
+        // Explicit deletion is a lifecycle fact even in a single-view
+        // repository. Ordinary Set operations retain the sparse participation
+        // policy so same-path concurrent creates continue to be surfaced by
+        // graph claims until PATH_CLAIMS replaces the legacy indexes.
+        let mut batch_participates = include_new_inodes
+            || ops
+                .iter()
+                .any(|op| matches!(&op.action, DeferredTreeAction::Delete));
         if !batch_participates {
             for op in ops {
                 let inode_is_tracked = tracked_inodes.contains(&op.inode);
@@ -580,26 +839,24 @@ impl Repository {
         &self,
         txn: &mut atomic_core::pristine::WriteTxn<'_>,
         journal: &DeferredTreeJournal,
-        view_name: &str,
+        visibility: &GraphVisibilityClosure,
     ) -> Result<HashSet<String>, RepositoryError> {
-        let view = txn
-            .get_view(view_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: view_name.to_string(),
-            })?;
-        let visible_ids = collect_visible_change_ids(&*txn, &view)?;
-        let mut visible_hashes = HashSet::with_capacity(visible_ids.len());
-        for change_id in visible_ids {
-            if let Some(hash) = txn
+        let mut visible_hashes = HashSet::with_capacity(visibility.len());
+        for change_id in visibility.iter_dependency_first().copied() {
+            let hash = txn
                 .get_external(change_id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                visible_hashes.insert(hash);
-            }
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "validated visible change {} has no external hash",
+                        change_id.get()
+                    ))
+                })?;
+            visible_hashes.insert(hash);
         }
 
-        let desired = desired_tree_paths(&journal.ops, &visible_hashes);
+        let ordered_ops = causally_order_tree_ops(&*txn, &journal.ops)?;
+        let desired = desired_tree_paths(&ordered_ops, &visible_hashes);
         let mut updates = Vec::new();
         let mut affected_paths = HashSet::new();
         for (external_position, state) in desired {
@@ -689,7 +946,14 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let journal = self.load_deferred_tree_journal()?;
-        self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &pending.source_view)?;
+        let source_view = txn
+            .get_view(&pending.source_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: pending.source_view.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &source_view)?;
+        self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &visibility)?;
         self.write_current_view(&pending.source_view)?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -705,6 +969,7 @@ impl Repository {
     pub(super) fn align_deferred_tree_and_publish_view(
         &mut self,
         view_name: &str,
+        visibility: &GraphVisibilityClosure,
     ) -> Result<HashSet<String>, RepositoryError> {
         let _alignment_lock = self.lock_deferred_tree_alignment()?;
         // `current_view` can intentionally be scoped to a background target
@@ -722,7 +987,7 @@ impl Repository {
         // marker survives, recovery restores the source view.
         self.write_deferred_tree_alignment_pending(&old_view, view_name)?;
         let affected_paths =
-            match self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, view_name) {
+            match self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, visibility) {
                 Ok(paths) => paths,
                 Err(error) => {
                     let _ = self.clear_deferred_tree_alignment_pending();
