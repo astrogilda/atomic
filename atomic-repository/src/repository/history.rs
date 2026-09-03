@@ -69,7 +69,7 @@ impl Repository {
 
             // Skip inherited entries on draft views
             if let Some(ref ids) = ancestor_ids {
-                if ids.contains(&entry.node_id) {
+                if ids.contains(entry.node_id) {
                     continue;
                 }
             }
@@ -172,7 +172,7 @@ impl Repository {
         // For draft views, filter out inherited entries
         if view.kind.is_draft() && !options.include_inherited {
             let ancestor_ids = Self::collect_ancestor_change_ids(&txn, &view)?;
-            entries.retain(|e| !ancestor_ids.contains(&e.node_id));
+            entries.retain(|e| !ancestor_ids.contains(e.node_id));
         }
 
         // Load headers if requested

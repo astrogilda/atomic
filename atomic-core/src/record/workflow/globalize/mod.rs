@@ -122,7 +122,7 @@ mod vertex;
 pub use context::*;
 pub use error::*;
 pub use file::*;
-pub use helpers::{extract_filename, extract_parent, split_into_lines};
+pub use helpers::{ancestor_directories, extract_filename, extract_parent, split_into_lines};
 pub(crate) use helpers::{
     node_id_to_option_hash, position_to_option_hash, position_to_option_hash_resolved,
     vertex_to_option_hash,

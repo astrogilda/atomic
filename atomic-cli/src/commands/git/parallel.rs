@@ -70,10 +70,10 @@ use atomic_core::change::{
     Atom, Author, Change, ChangeHeader, EdgeUpdate, GraphOp, Insertion, NewEdge,
 };
 use atomic_core::change::{Encoding, Local};
-use atomic_core::record::workflow::extract_filename;
 use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
 use atomic_core::record::workflow::RecordedFile;
+use atomic_core::record::workflow::{ancestor_directories, extract_filename, extract_parent};
 use atomic_core::types::{
     Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position,
 };
@@ -489,6 +489,7 @@ struct ImportIndexedFile {
 #[derive(Default)]
 struct ImportLineIndex {
     files: HashMap<String, ImportIndexedFile>,
+    directories: HashMap<String, Position<Option<ContentHash>>>,
 }
 
 impl ImportLineIndex {
@@ -526,6 +527,17 @@ impl ImportLineIndex {
                         },
                     );
                 }
+                GraphOp::DirAdd {
+                    add_inode, path, ..
+                } => {
+                    self.directories.insert(
+                        path.clone(),
+                        Position {
+                            change: Some(change_hash),
+                            pos: add_inode.start,
+                        },
+                    );
+                }
                 GraphOp::Edit {
                     change: Atom::Insertion(insertion),
                     local,
@@ -546,6 +558,36 @@ impl ImportLineIndex {
                 _ => {}
             }
         }
+    }
+
+    fn seed_missing_parent_directories(
+        &mut self,
+        repo: &Repository,
+        parsed: &ParsedCommit,
+    ) -> Result<(), atomic_repository::RepositoryError> {
+        let mut required = HashSet::new();
+        for file in &parsed.files {
+            if matches!(file.operation, FileOperation::Added | FileOperation::Copied) {
+                required.extend(ancestor_directories(&file.path));
+            }
+        }
+
+        let mut missing: Vec<String> = required
+            .into_iter()
+            .filter(|path| !self.directories.contains_key(path))
+            .collect();
+        missing.sort_by_key(|path| (path.matches('/').count(), path.clone()));
+
+        for (path, position) in repo.import_directory_anchor_seeds(&missing)? {
+            self.directories.insert(
+                path,
+                Position {
+                    change: Some(position.change),
+                    pos: position.pos,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn seed_missing_modified_files(&mut self, repo: &Repository, parsed: &ParsedCommit) {
@@ -736,6 +778,10 @@ impl ImportLineIndex {
 
 #[derive(Debug)]
 enum PendingLineIndexUpdate {
+    DirectoryAdd {
+        path: String,
+        inode_pos: Position<Option<ContentHash>>,
+    },
     Add {
         path: String,
         inode_pos: Position<Option<ContentHash>>,
@@ -1222,6 +1268,87 @@ fn build_graph_first_change(
     let mut deleted_paths = Vec::new();
     let mut skips = Vec::new();
 
+    // Git trees do not contain explicit directory entries. Build the required
+    // parent anchors first so every nested name attaches to an actual directory
+    // inode, including directories introduced earlier in this same change.
+    let mut directory_anchors = line_index.directories.clone();
+    let mut required_directories = HashSet::new();
+    for file in &parsed.files {
+        if matches!(file.operation, FileOperation::Added | FileOperation::Copied) {
+            required_directories.extend(ancestor_directories(&file.path));
+        }
+    }
+    let mut required_directories: Vec<String> = required_directories.into_iter().collect();
+    required_directories.sort_by_key(|path| (path.matches('/').count(), path.clone()));
+
+    for directory_path in required_directories {
+        if let Some(anchor) = directory_anchors.get(&directory_path) {
+            dependencies.extend(position_hashes(anchor));
+            continue;
+        }
+
+        let parent_path = extract_parent(&directory_path);
+        let parent_pos = if parent_path.is_empty() {
+            Position {
+                change: Some(ContentHash::NONE),
+                pos: ChangePosition::ROOT,
+            }
+        } else if let Some(anchor) = directory_anchors.get(parent_path).copied() {
+            anchor
+        } else {
+            return Err(vec![GraphFirstSkip {
+                path: directory_path,
+                operation: FileOperation::Added,
+                reason: "missing_parent_directory_anchor",
+            }]);
+        };
+        dependencies.extend(position_hashes(&parent_pos));
+
+        let dirname = extract_filename(&directory_path);
+        if dirname.is_empty() {
+            return Err(vec![GraphFirstSkip {
+                path: directory_path,
+                operation: FileOperation::Added,
+                reason: "invalid_directory_path",
+            }]);
+        }
+        let name_start = ChangePosition::new(contents.len() as u64);
+        contents.extend_from_slice(dirname.as_bytes());
+        let name_end = ChangePosition::new(contents.len() as u64);
+        let inode_pos = Position {
+            change: None,
+            pos: name_end,
+        };
+
+        hunks.push(GraphOp::DirAdd {
+            add_name: Insertion {
+                predecessors: vec![parent_pos],
+                successors: vec![],
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                start: name_start,
+                end: name_end,
+                inode: parent_pos,
+            },
+            add_inode: Insertion {
+                predecessors: vec![Position {
+                    change: None,
+                    pos: name_end,
+                }],
+                successors: vec![],
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                start: name_end,
+                end: name_end,
+                inode: inode_pos,
+            },
+            path: directory_path.clone(),
+        });
+        pending.push(PendingLineIndexUpdate::DirectoryAdd {
+            path: directory_path.clone(),
+            inode_pos,
+        });
+        directory_anchors.insert(directory_path, inode_pos);
+    }
+
     for file in &parsed.files {
         match file.operation {
             FileOperation::Added | FileOperation::Copied => {
@@ -1240,10 +1367,19 @@ fn build_graph_first_change(
                     change: None,
                     pos: name_end,
                 };
-                let parent_pos = Position {
-                    change: Some(ContentHash::NONE),
-                    pos: ChangePosition::ROOT,
+                let parent_path = extract_parent(&file.path);
+                let parent_pos = if parent_path.is_empty() {
+                    Position {
+                        change: Some(ContentHash::NONE),
+                        pos: ChangePosition::ROOT,
+                    }
+                } else if let Some(anchor) = directory_anchors.get(parent_path).copied() {
+                    anchor
+                } else {
+                    skips.push(GraphFirstSkip::new(file, "missing_parent_directory_anchor"));
+                    continue;
                 };
+                dependencies.extend(position_hashes(&parent_pos));
 
                 let new_line_contents: Vec<Vec<u8>> =
                     if encoding == Encoding::Binary || is_generated_diff_skip_path(&file.path) {
@@ -2060,6 +2196,15 @@ fn apply_line_index_updates(
 ) {
     for update in pending {
         match update {
+            PendingLineIndexUpdate::DirectoryAdd { path, inode_pos } => {
+                line_index.directories.insert(
+                    path,
+                    Position {
+                        change: Some(change_hash),
+                        pos: inode_pos.pos,
+                    },
+                );
+            }
             PendingLineIndexUpdate::Add {
                 path,
                 inode_pos,
@@ -2931,6 +3076,9 @@ impl ParallelImporter {
             return self.write_empty_commit(repo, parsed, header);
         }
 
+        line_index
+            .seed_missing_parent_directories(repo, parsed)
+            .map_err(|e| CliError::Internal(e.into()))?;
         line_index.seed_missing_modified_files(repo, parsed);
         let graph_first_skips = build_graph_first_skip_reasons(parsed, line_index);
         let graph_first_result =
@@ -4570,6 +4718,164 @@ fn parse_commit_message(message: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn added_commit(path: &str, content: &[u8]) -> ParsedCommit {
+        ParsedCommit {
+            git_sha: "0123456789abcdef".to_string(),
+            short_sha: "01234567".to_string(),
+            metadata: CommitMetadata {
+                author_name: "Test".to_string(),
+                author_email: Some("test@example.com".to_string()),
+                timestamp: Utc::now(),
+                message: format!("add {path}"),
+                description: None,
+            },
+            files: vec![ParsedFile {
+                path: path.to_string(),
+                operation: FileOperation::Added,
+                new_content: Some(content.to_vec()),
+                old_content: None,
+                diff_lines: None,
+                old_path: None,
+            }],
+            parent_index: None,
+            is_merge: false,
+            is_empty: false,
+            push_trailer: None,
+        }
+    }
+
+    #[test]
+    fn graph_first_nested_add_uses_parent_inode_anchors_and_dependencies() {
+        let parsed = added_commit("src/domain/model.rs", b"pub struct Model;\n");
+        let mut line_index = ImportLineIndex::default();
+        let (change, pending, _) =
+            build_graph_first_change(ChangeHeader::new("nested"), &parsed, &line_index, true)
+                .unwrap();
+        let root = Position {
+            change: Some(ContentHash::NONE),
+            pos: ChangePosition::ROOT,
+        };
+
+        let domain_anchor = match change.hunks() {
+            [GraphOp::DirAdd {
+                add_name: src_name,
+                add_inode: src_inode,
+                path: src_path,
+            }, GraphOp::DirAdd {
+                add_name: domain_name,
+                add_inode: domain_inode,
+                path: domain_path,
+            }, GraphOp::FileAdd {
+                add_name: file_name,
+                path: file_path,
+                ..
+            }, ..] => {
+                assert_eq!(src_path, "src");
+                assert_eq!(domain_path, "src/domain");
+                assert_eq!(file_path, "src/domain/model.rs");
+                assert_eq!(src_name.predecessors, vec![root]);
+                assert_eq!(src_name.inode, root);
+
+                let src_anchor = Position {
+                    change: None,
+                    pos: src_inode.start,
+                };
+                assert_eq!(domain_name.predecessors, vec![src_anchor]);
+                assert_eq!(domain_name.inode, src_anchor);
+
+                let domain_anchor = Position {
+                    change: None,
+                    pos: domain_inode.start,
+                };
+                assert_eq!(file_name.predecessors, vec![domain_anchor]);
+                assert_eq!(file_name.inode, domain_anchor);
+                domain_anchor
+            }
+            hunks => panic!("unexpected graph-first topology: {hunks:#?}"),
+        };
+        assert!(change.dependencies().is_empty());
+
+        let first_hash = ContentHash::of(b"first imported change");
+        apply_line_index_updates(&mut line_index, first_hash, pending);
+        let second = added_commit("src/domain/service.rs", b"pub struct Service;\n");
+        let (second_change, _, _) = build_graph_first_change(
+            ChangeHeader::new("nested sibling"),
+            &second,
+            &line_index,
+            true,
+        )
+        .unwrap();
+        assert!(!second_change
+            .hunks()
+            .iter()
+            .any(|op| matches!(op, GraphOp::DirAdd { .. })));
+        let parent = second_change
+            .hunks()
+            .iter()
+            .find_map(|op| match op {
+                GraphOp::FileAdd { add_name, .. } => Some(add_name.predecessors[0]),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(parent.change, Some(first_hash));
+        assert_eq!(parent.pos, domain_anchor.pos);
+        assert!(second_change.dependencies().contains(&first_hash));
+    }
+
+    #[test]
+    fn graph_first_nested_add_writes_and_materializes_after_reopen() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let parsed = added_commit("src/domain/model.rs", b"git model\n");
+        let (change, _, deleted) = build_graph_first_change(
+            ChangeHeader::new("git nested"),
+            &parsed,
+            &ImportLineIndex::default(),
+            true,
+        )
+        .unwrap();
+        let first = repo
+            .write_import_graph_change(change, &deleted, false, Default::default())
+            .unwrap();
+        assert_eq!(
+            repo.get_file_content("src/domain/model.rs").unwrap(),
+            Some(b"git model\n".to_vec())
+        );
+
+        // Simulate a later incremental import process: rebuild only the parent
+        // directory anchors from durable repository metadata.
+        drop(repo);
+        let reopened = Repository::open(temp.path()).unwrap();
+        let second = added_commit("src/domain/service.rs", b"git service\n");
+        let mut rebuilt_index = ImportLineIndex::default();
+        rebuilt_index
+            .seed_missing_parent_directories(&reopened, &second)
+            .unwrap();
+        let (second_change, _, second_deleted) = build_graph_first_change(
+            ChangeHeader::new("git nested sibling"),
+            &second,
+            &rebuilt_index,
+            true,
+        )
+        .unwrap();
+        assert!(second_change.dependencies().contains(&first.hash));
+        reopened
+            .write_import_graph_change(second_change, &second_deleted, false, Default::default())
+            .unwrap();
+
+        drop(reopened);
+        let final_repo = Repository::open(temp.path()).unwrap();
+        final_repo.materialize().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("src/domain/model.rs")).unwrap(),
+            b"git model\n"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("src/domain/service.rs")).unwrap(),
+            b"git service\n"
+        );
+    }
 
     #[test]
     fn test_parse_commit_message_subject_only() {

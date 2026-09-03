@@ -239,6 +239,10 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
         self.inner.list_registered_changes()
     }
 
+    fn is_change_visible(&self, id: NodeId) -> bool {
+        id.is_root() || self.visibility.contains(id)
+    }
+
     /// Node type lookup — no filtering. Delegates to inner.
     fn get_node_type(&self, node_id: NodeId) -> Result<Option<u8>, PristineError> {
         self.inner.get_node_type(node_id)

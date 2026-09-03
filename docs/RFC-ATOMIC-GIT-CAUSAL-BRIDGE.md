@@ -969,7 +969,7 @@ Phases are dependency-ordered workstreams, not independently deployable promises
 This is native Atomic work and may ship in parallel with Phase 0, but Phases 3–13 cannot complete without it.
 
 **Tasks**
-1. Fix nested parent globalization for `FileAdd`/`DirAdd`; dependency and context tests for three-level trees.
+1. **Complete (N1, 2026-09-03):** nested `FileAdd`/`DirAdd` globalization now emits parent-first directory anchors, connects same-change children through `add_inode.start`, resolves persisted parents through strict view-aware metadata, and records external parent changes as dependencies. Native record and Git graph-first import regressions cover three-level trees, sibling views, insert/unrecord/reinsert, close/reopen, materialization, content retrieval, incremental import, and corrupt-parent failure without partial history advancement.
 2. Introduce one operation-aware tree projection API used by record/import/insert/undelete/replay; derive `DIRECTORIES`/`DIR_EMPTY` occupancy centrally.
 3. Correct `DirDel`; implement complete `FileUndel`/`DirUndel` metadata projection and normal record constructors.
 4. Classify explicit directories correctly and preserve explicit empty directories in native materialization.
@@ -978,6 +978,8 @@ This is native Atomic work and may ship in parallel with Phase 0, but Phases 3�
 7. Add `ViewMembershipSet`/`GraphVisibilityClosure`; replace every graph traversal filter with the canonical dependency-expanded builder; repair/fail on unindexed dependencies.
 8. Add native rename-plus-edit recording preserving inode identity. Permission/symlink/gitlink work is delivered with the attribute-register portion of Phase 3 but tested here as an end-to-end native invariant.
 9. Add integrity/repair command checks for all derived indexes and projection caches.
+
+**Recommended next:** task 2 — the central operation-aware tree projection and directory-occupancy API. Phase 1 remains blocked until the remaining Phase N prerequisites are complete.
 
 **Acceptance**
 - Nested add, move, delete, undelete, and reinsert produce the same graph/path projection after close/reopen and across sibling views; nested names are connected to actual parent inode anchors, never `ROOT`.

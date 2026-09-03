@@ -12,12 +12,11 @@ const BAD_DEST_POS: u64 = 55_000_000;
 const GOOD_SENTINEL: &[u8] = b"sentinel good working copy\n";
 const BAD_SENTINEL: &[u8] = b"sentinel bad working copy\n";
 
-fn pristine_snapshot(
-    repo: &Repository,
-) -> (
-    Vec<(String, i64, u32, u64, Hash)>,
-    Vec<(u64, Vec<StoredConflict>)>,
-) {
+type FileIndexSnapshot = Vec<(String, i64, u32, u64, Hash)>;
+type ConflictSnapshot = Vec<(u64, Vec<StoredConflict>)>;
+type PristineSnapshot = (FileIndexSnapshot, ConflictSnapshot);
+
+fn pristine_snapshot(repo: &Repository) -> PristineSnapshot {
     let txn = repo.pristine.read_txn().unwrap();
     let view = txn.get_view("dev").unwrap().unwrap();
     let mut file_index = txn.iter_file_index().unwrap();

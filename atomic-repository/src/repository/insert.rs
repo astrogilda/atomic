@@ -364,7 +364,7 @@ where
 fn import_graph_first_can_apply(change: &Change) -> bool {
     !change.hunks().is_empty()
         && change.hunks().iter().all(|op| match op {
-            GraphOp::FileAdd { .. } => true,
+            GraphOp::FileAdd { .. } | GraphOp::DirAdd { .. } => true,
             GraphOp::FileMove { add, .. } => {
                 !add.predecessors.is_empty() && add.predecessors.len() == 1
             }
@@ -423,8 +423,13 @@ fn import_graph_first_resolved_inode<T: GraphTxnT + TreeTxnT>(
     if resolved.change.is_root() {
         return Ok(None);
     }
-    txn.position_inode(resolved)
-        .map_err(|e| RepositoryError::Database(e.to_string()))
+    let inode = txn
+        .position_inode(resolved)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+        .ok_or_else(|| {
+            RepositoryError::Apply(format!("inode anchor {:?} has no inode mapping", resolved))
+        })?;
+    Ok(Some(inode))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,6 +555,83 @@ fn import_direct_write_insertion(
 
 impl Repository {
     // Change Insertion Methods
+
+    /// Resolve visible persisted directory anchors for Git import.
+    ///
+    /// Missing paths and sibling-only paths are omitted so the importer can
+    /// synthesize view-local directory anchors. Partially present or malformed
+    /// metadata is an integrity error and never degrades to `ROOT`.
+    pub fn import_directory_anchor_seeds(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, Position<Hash>>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let mut anchors = HashMap::new();
+
+        for path in paths {
+            let normalized = path.replace('\\', "/");
+            let Some(inode) = txn
+                .get_inode(&normalized)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            else {
+                continue;
+            };
+            let position = txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Apply(format!(
+                        "directory '{}' has no inode position",
+                        normalized
+                    ))
+                })?;
+            let hash = txn
+                .get_external(position.change)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Apply(format!(
+                        "directory '{}' references change {} without an external hash",
+                        normalized, position.change
+                    ))
+                })?;
+
+            if !visibility.contains(position.change) {
+                continue;
+            }
+            if !txn
+                .is_directory(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                return Err(RepositoryError::Apply(format!(
+                    "parent path '{}' is not a directory",
+                    normalized
+                )));
+            }
+            if !txn
+                .has_vertex(position.inode_node())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                return Err(RepositoryError::Apply(format!(
+                    "directory '{}' inode anchor is missing from the graph",
+                    normalized
+                )));
+            }
+
+            anchors.insert(normalized, Position::new(hash, position.pos));
+        }
+
+        Ok(anchors)
+    }
 
     /// Rebuild ordered line vertex metadata for a tracked file from the
     /// current view's graph. Git import uses this as a conservative repair
@@ -761,8 +843,16 @@ impl Repository {
         let mut change = if recorded_files.is_empty() {
             Change::empty(header)
         } else {
+            let view = txn
+                .get_view(view_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view_name.to_string(),
+                })?;
+            let visibility = graph_visibility_closure(&txn, &view)?;
+            let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
             match assemble_change(
-                &txn,
+                &view_graph,
                 recorded_files,
                 header.clone(),
                 &AssemblyOptions::default(),
@@ -1210,6 +1300,76 @@ impl Repository {
                             current_by_end.insert(content_node.end_pos(), content_node);
                             current_by_start.insert(content_node.start_pos(), content_node);
                         }
+                    }
+                    GraphOp::DirAdd {
+                        add_name,
+                        add_inode,
+                        path,
+                    } => {
+                        use atomic_core::pristine::directory_flags;
+
+                        let inode_position = Position::new(change_id, add_inode.start);
+                        let inode = txn
+                            .alloc_inode()
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        if !preserve_existing_tree_paths {
+                            txn.put_tree(path, inode)
+                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        }
+                        txn.put_inode(inode, inode_position)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                        txn.put_directory(inode, directory_flags::explicit_empty())
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+                        let name_node = GraphNode {
+                            change: change_id,
+                            start: add_name.start,
+                            end: add_name.end,
+                        };
+                        let name_inode =
+                            import_graph_first_resolved_inode(&*txn, &add_name.inode, change_id)?;
+                        let name_source = import_graph_first_source(
+                            &*txn,
+                            &add_name.predecessors[0],
+                            &add_name.inode,
+                            name_inode,
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            name_inode,
+                            add_name.flag | EdgeFlags::BLOCK,
+                            name_source,
+                            name_node,
+                        ));
+                        current_by_end.insert(name_node.end_pos(), name_node);
+                        current_by_start.insert(name_node.start_pos(), name_node);
+
+                        let inode_node = GraphNode {
+                            change: change_id,
+                            start: add_inode.start,
+                            end: add_inode.end,
+                        };
+                        let inode_source = import_graph_first_source(
+                            &*txn,
+                            &add_inode.predecessors[0],
+                            &add_inode.inode,
+                            Some(inode),
+                            &old_by_end,
+                            &current_by_end,
+                            &mut vertex_cache,
+                            change_id,
+                        )?;
+                        pending_edges.push((
+                            Some(inode),
+                            add_inode.flag | EdgeFlags::BLOCK,
+                            inode_source,
+                            inode_node,
+                        ));
+                        current_by_end.insert(inode_node.end_pos(), inode_node);
+                        current_by_start.insert(inode_node.start_pos(), inode_node);
                     }
                     GraphOp::Replacement {
                         change: edge_update,

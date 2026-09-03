@@ -449,15 +449,16 @@ pub trait InodeGraphOps {
 
 // INODE EDGE ITERATOR
 
+type InodeVertexIter<'a> =
+    Box<dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>> + 'a>;
+
 /// Iterator over edges within an inode scope.
 ///
 /// This iterator uses the `InodeGraphOps` trait to efficiently iterate
 /// over all edges belonging to a file.
 pub struct InodeEdgeIter<'a, T: InodeGraphOps> {
     /// All inode vertices and their edges in storage order.
-    vertices: Box<
-        dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>> + 'a,
-    >,
+    vertices: InodeVertexIter<'a>,
     /// Minimum edge flags.
     min_flag: EdgeFlags,
     /// Maximum edge flags.

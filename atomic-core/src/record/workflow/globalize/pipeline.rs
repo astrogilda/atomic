@@ -38,74 +38,15 @@ where
     let path = recorded.path();
     let mut result = GlobalizedFile::new(path);
 
-    // Handle directory additions (DirAdd)
+    // Handle directory additions (DirAdd). Missing ancestors are emitted as
+    // implicit directory anchors before the requested directory, so input order
+    // cannot flatten nested names under ROOT.
     if recorded.is_directory() {
-        // Create a DirAdd graph_op for an explicitly tracked directory
-        // The directory has no content, just name and inode vertices
-
-        let parent_context_pos: Position<Option<Hash>> = {
-            let parent_path = extract_parent(path);
-            if parent_path.is_empty() {
-                // Top-level directory - parent is ROOT
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                // Nested directory - for now use ROOT
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            }
-        };
-
-        // Add the directory name to the content buffer
-        let dirname = extract_filename(path);
-        let dirname_bytes = dirname.as_bytes();
-        let (name_start, name_end) = ctx.append_content(dirname_bytes);
-
-        // The inode span is empty (marks the directory's root)
-        let inode_start = name_end;
-        let inode_end = inode_start;
-
-        // Create name span with FOLDER flag
-        let add_name = Insertion {
-            predecessors: vec![parent_context_pos],
-            successors: vec![],
-            flag: EdgeFlags::FOLDER, // FOLDER flag for directory entry
-            start: name_start,
-            end: name_end,
-            inode: Position {
-                change: None, // Self-reference (current change)
-                pos: inode_start,
-            },
-        };
-
-        // Create inode span (empty)
-        let add_inode = Insertion {
-            predecessors: vec![Position {
-                change: None,
-                pos: name_end,
-            }],
-            successors: vec![],
-            flag: EdgeFlags::FOLDER,
-            start: inode_start,
-            end: inode_end,
-            inode: Position {
-                change: None,
-                pos: inode_start,
-            },
-        };
-
-        let graph_op: GraphOp<Option<Hash>> = GraphOp::DirAdd {
-            add_name,
-            add_inode,
-            path: path.to_string(),
-        };
-
-        result.add_hunk(graph_op);
-        result.set_bytes_added(dirname_bytes.len() as u64);
+        let initial_content_len = ctx.content_len();
+        let initial_deps = ctx.dependencies().len();
+        ensure_directory_anchor(ctx, path, path, &mut result)?;
+        result.set_bytes_added(ctx.content_len() - initial_content_len);
+        result.set_dependency_count(ctx.dependencies().len() - initial_deps);
         return Ok(result);
     }
 
@@ -431,33 +372,7 @@ where
         // - add_inode: Span for the file's inode (root of file content graph)
         // - contents: Span containing the actual file content
 
-        // Determine the parent context position.
-        // For top-level files (no directory prefix), we use ROOT.
-        // For nested files, we would resolve the parent directory's position.
-        //
-        // The ROOT position is represented as:
-        // Position { change: Some(Hash::NONE), pos: ChangePosition::ROOT }
-        //
-        // This is the virtual root span that all top-level files reference.
-        let parent_context_pos: Position<Option<Hash>> = {
-            let parent_path = extract_parent(path);
-            if parent_path.is_empty() {
-                // Top-level file - parent is ROOT
-                Position {
-                    change: Some(Hash::NONE), // Hash::NONE indicates ROOT
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                // Nested file - try to resolve parent directory position
-                // For now, use ROOT as we don't have nested directory support yet
-                // In a full implementation, we would resolve the parent directory's
-                // inode and get its graph position
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            }
-        };
+        let parent_context_pos = ensure_parent_directory_anchor(ctx, path, path, &mut result)?;
 
         // Add the filename to the content buffer
         let filename = extract_filename(path);
@@ -607,6 +522,131 @@ where
     result.set_dependency_count(ctx.dependencies().len() - initial_deps);
 
     Ok(result)
+}
+
+fn root_directory_anchor() -> Position<Option<Hash>> {
+    Position {
+        change: Some(Hash::NONE),
+        pos: ChangePosition::ROOT,
+    }
+}
+
+fn ensure_parent_directory_anchor<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    path: &str,
+    child_path: &str,
+    result: &mut GlobalizedFile,
+) -> GlobalizeResult<Position<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let parent = extract_parent(path);
+    if parent.is_empty() {
+        Ok(root_directory_anchor())
+    } else {
+        ensure_directory_anchor(ctx, parent, child_path, result)
+    }
+}
+
+fn ensure_directory_anchor<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    directory_path: &str,
+    child_path: &str,
+    result: &mut GlobalizedFile,
+) -> GlobalizeResult<Position<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    if let Some(anchor) = ctx.directory_anchor(directory_path) {
+        return Ok(anchor);
+    }
+
+    if let Some(inode) = ctx.txn().get_inode(directory_path)? {
+        let position = ctx.txn().inode_position(inode)?.ok_or_else(|| {
+            GlobalizeError::InvalidParentMetadata {
+                path: child_path.to_string(),
+                parent: directory_path.to_string(),
+                reason: "directory inode has no graph position",
+            }
+        })?;
+        let hash = ctx.txn().get_external(position.change)?.ok_or(
+            GlobalizeError::MissingExternalHash {
+                node_id: position.change,
+            },
+        )?;
+
+        // TREE is a global projection. An entry introduced only on a sibling
+        // view is absent from this filtered graph and must not become a causal
+        // dependency of the current view.
+        if ctx.txn().is_change_visible(position.change) {
+            if !ctx.txn().is_directory(inode)? {
+                return Err(GlobalizeError::ParentNotDirectory {
+                    path: child_path.to_string(),
+                    parent: directory_path.to_string(),
+                });
+            }
+
+            let inode_node = GraphNode::new(position.change, position.pos, position.pos);
+            if !ctx.txn().has_vertex(inode_node)? {
+                return Err(GlobalizeError::InvalidParentMetadata {
+                    path: child_path.to_string(),
+                    parent: directory_path.to_string(),
+                    reason: "directory inode anchor is missing from the graph",
+                });
+            }
+
+            let anchor = Position {
+                change: Some(hash),
+                pos: position.pos,
+            };
+            ctx.add_dependency(hash);
+            ctx.register_directory_anchor(directory_path, anchor);
+            return Ok(anchor);
+        }
+    }
+
+    let parent_anchor = ensure_parent_directory_anchor(ctx, directory_path, child_path, result)?;
+    let dirname = extract_filename(directory_path);
+    if dirname.is_empty() {
+        return Err(GlobalizeError::InvalidParentMetadata {
+            path: child_path.to_string(),
+            parent: directory_path.to_string(),
+            reason: "directory path has no name component",
+        });
+    }
+
+    let (name_start, name_end) = ctx.append_content(dirname.as_bytes());
+    let inode_anchor = Position {
+        change: None,
+        pos: name_end,
+    };
+    let name_anchor = Position {
+        change: None,
+        pos: name_end,
+    };
+
+    result.add_hunk(GraphOp::DirAdd {
+        add_name: Insertion {
+            predecessors: vec![parent_anchor],
+            successors: vec![],
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            start: name_start,
+            end: name_end,
+            inode: parent_anchor,
+        },
+        add_inode: Insertion {
+            predecessors: vec![name_anchor],
+            successors: vec![],
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            start: name_end,
+            end: name_end,
+            inode: inode_anchor,
+        },
+        path: directory_path.to_string(),
+    });
+    ctx.register_directory_anchor(directory_path, inode_anchor);
+
+    Ok(inode_anchor)
 }
 
 /// Return the byte slice of `content` covering `len` lines starting at line

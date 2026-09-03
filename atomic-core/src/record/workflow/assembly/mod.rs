@@ -361,7 +361,7 @@ where
     let mut ctx = AssemblyContext::new(header);
     let mut stats = AssemblyStats::new();
     let mut globalized_files = Vec::new();
-    let mut globalize_errors = Vec::new();
+    let globalize_errors = Vec::new();
 
     // Process each file
     let total_files = files.len();
@@ -525,18 +525,19 @@ where
                 stats.add_content_bytes(globalized.bytes_added());
                 globalized_files.push(globalized);
             }
-            Err(e) => {
-                let glob_ms = glob_start.elapsed().as_millis();
+            Err(source) => {
                 log::debug!(
-                    "assemble_change: file {}/{} '{}' globalize error in {}ms: {}",
+                    "assemble_change: file {}/{} '{}' globalization failed after {}ms: {}",
                     file_idx + 1,
                     total_files,
                     file.path(),
-                    glob_ms,
-                    e,
+                    glob_start.elapsed().as_millis(),
+                    source,
                 );
-                stats.record_error();
-                globalize_errors.push((file.path().to_string(), e));
+                return Err(types::AssemblyError::Globalize {
+                    path: file.path().to_string(),
+                    source,
+                });
             }
         }
     }

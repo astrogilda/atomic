@@ -111,6 +111,61 @@ fn build_turn_header(
 
 // record_turn (the main entry point)
 
+fn align_or_repair_session_view(
+    repo: &mut atomic_repository::Repository,
+    options: &TurnRecordOptions<'_>,
+) -> AgentResult<()> {
+    match repo.align_to_view(&options.session.view_name) {
+        Ok(()) => Ok(()),
+        Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
+            let parent = options
+                .session
+                .parent_view()
+                .map(str::to_string)
+                .unwrap_or_else(|| repo.current_view().to_string());
+
+            match repo.create_view_from(&options.session.view_name, &parent) {
+                Ok(()) => {
+                    log::warn!(
+                        "session view '{}' was missing at record time (SessionStart fork \
+                         likely skipped or failed); forked it from '{}' just-in-time",
+                        options.session.view_name,
+                        parent,
+                    );
+                }
+                Err(atomic_repository::RepositoryError::ViewAlreadyExists { .. }) => {}
+                Err(error) => {
+                    return Err(AgentError::RecordFailed {
+                        session_id: options.session.session_id.clone(),
+                        turn_number: options.turn_number,
+                        reason: format!(
+                            "Session view '{}' does not exist and could not be forked \
+                             from '{}': {} (refusing to record onto an implicitly-created \
+                             orphan view, which would duplicate existing content)",
+                            options.session.view_name, parent, error
+                        ),
+                    });
+                }
+            }
+
+            repo.align_to_view(&options.session.view_name)
+                .map_err(|error| AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: format!(
+                        "Failed to align to session view '{}' after forking it: {}",
+                        options.session.view_name, error
+                    ),
+                })
+        }
+        Err(error) => Err(AgentError::RecordFailed {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+            reason: format!("Failed to align current view before record: {}", error),
+        }),
+    }
+}
+
 /// Record an agent turn as an Atomic change.
 ///
 /// This is the function that bridges the agent world into the VCS world.
@@ -148,6 +203,36 @@ pub fn record_turn(
             reason: format!("Failed to open repository (readonly): {}", e),
         }
     })?;
+
+    // Preserve the read-only fast path for normal turns, but repair a missing
+    // non-sandbox session view before status tries to read through it. The
+    // former write-phase repair was unreachable in this case because status
+    // failed first with ViewNotFound.
+    let session_view_missing = !repo.is_sandbox()
+        && matches!(
+            repo.get_view_info(&options.session.view_name),
+            Err(atomic_repository::RepositoryError::ViewNotFound { .. })
+        );
+    if session_view_missing {
+        drop(repo);
+        let mut repair_repo =
+            atomic_repository::Repository::open_existing(repo_root).map_err(|error| {
+                AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: format!("Failed to open repository for view repair: {}", error),
+                }
+            })?;
+        align_or_repair_session_view(&mut repair_repo, options)?;
+        drop(repair_repo);
+        repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|error| {
+            AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!("Failed to reopen repository after view repair: {}", error),
+            }
+        })?;
+    }
 
     // `status()` reads current_view, while `record()` writes to session.view_name.
     // Align the read-only handle before the first status check; this keeps the
@@ -217,72 +302,7 @@ pub fn record_turn(
     if repo.is_sandbox() {
         repo.set_current_view_in_memory(&options.session.view_name);
     } else {
-        // A missing session view here is NOT the normal first-turn
-        // case (that path creates the view during `apply_after_record`, well
-        // after we already aligned successfully once). If we reach this
-        // branch it means the SessionStart fork that should have created
-        // `options.session.view_name` either never ran or failed silently,
-        // leaving `record()` to fall back to whatever view happened to be
-        // `current_view` — frequently `Shared` or an unrelated sibling view.
-        // Recording onto that wrong view duplicates every file already
-        // present there once the two views are later merged, because the
-        // diff is computed against the wrong parent state.
-        //
-        // Instead of silently recording onto the wrong view, fork the
-        // session view here, just-in-time, from its intended parent (or the
-        // current view as a last resort) so the diff is computed against
-        // the correct baseline.
-        match repo.align_to_view(&options.session.view_name) {
-            Ok(()) => {}
-            Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
-                let parent = options
-                    .session
-                    .parent_view()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| repo.current_view().to_string());
-
-                match repo.create_view_from(&options.session.view_name, &parent) {
-                    Ok(()) => {
-                        log::warn!(
-                            "session view '{}' was missing at record time (SessionStart fork \
-                             likely skipped or failed); forked it from '{}' just-in-time",
-                            options.session.view_name,
-                            parent,
-                        );
-                    }
-                    Err(atomic_repository::RepositoryError::ViewAlreadyExists { .. }) => {}
-                    Err(e) => {
-                        return Err(AgentError::RecordFailed {
-                            session_id: options.session.session_id.clone(),
-                            turn_number: options.turn_number,
-                            reason: format!(
-                                "Session view '{}' does not exist and could not be forked \
-                                 from '{}': {} (refusing to record onto an implicitly-created \
-                                 orphan view, which would duplicate existing content)",
-                                options.session.view_name, parent, e
-                            ),
-                        });
-                    }
-                }
-
-                repo.align_to_view(&options.session.view_name)
-                    .map_err(|e| AgentError::RecordFailed {
-                        session_id: options.session.session_id.clone(),
-                        turn_number: options.turn_number,
-                        reason: format!(
-                            "Failed to align to session view '{}' after forking it: {}",
-                            options.session.view_name, e
-                        ),
-                    })?;
-            }
-            Err(e) => {
-                return Err(AgentError::RecordFailed {
-                    session_id: options.session.session_id.clone(),
-                    turn_number: options.turn_number,
-                    reason: format!("Failed to align current view before record: {}", e),
-                });
-            }
-        }
+        align_or_repair_session_view(&mut repo, options)?;
     }
 
     if !untracked_paths.is_empty() {

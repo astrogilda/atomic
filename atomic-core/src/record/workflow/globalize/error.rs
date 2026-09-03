@@ -37,6 +37,33 @@ pub enum GlobalizeError {
         path: String,
     },
 
+    /// A persisted parent path resolves to an inode that is not a directory.
+    #[error("Parent path is not a directory: {parent} (child: {path})")]
+    ParentNotDirectory {
+        /// The child path being globalized.
+        path: String,
+        /// The invalid parent path.
+        parent: String,
+    },
+
+    /// Persisted parent metadata is incomplete or does not match the graph.
+    #[error("Invalid parent metadata for {parent} (child: {path}): {reason}")]
+    InvalidParentMetadata {
+        /// The child path being globalized.
+        path: String,
+        /// The parent path whose metadata is invalid.
+        parent: String,
+        /// The failed invariant.
+        reason: &'static str,
+    },
+
+    /// A registered graph position references a change with no external hash.
+    #[error("Change node {node_id} has no external hash")]
+    MissingExternalHash {
+        /// The repository-local change identifier.
+        node_id: NodeId,
+    },
+
     /// Cannot find the graph node containing a specific position.
     ///
     /// This occurs when trying to find context for an insertion point

@@ -60,6 +60,15 @@ pub trait GraphTxnT {
         Ok(Vec::new())
     }
 
+    /// Return whether a change is visible through this graph view.
+    ///
+    /// Raw transactions expose the complete ambient graph, so the default is
+    /// `true`. Filtered graph adapters override this to enforce their view's
+    /// validated change closure during structural metadata resolution.
+    fn is_change_visible(&self, _id: NodeId) -> bool {
+        true
+    }
+
     /// Initialize an adjacency iterator for a span.
     ///
     /// Returns an iterator over edges from the given span that have flags

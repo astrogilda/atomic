@@ -633,15 +633,17 @@ impl Repository {
                 }
                 Some(state) => {
                     let mut projected_path = state.desired_path.clone();
-                    if projected_path.is_none() && state.deleted && !is_directory {
-                        if crate::repository::status::is_file_alive_via_retrieval(
+                    if projected_path.is_none()
+                        && state.deleted
+                        && !is_directory
+                        && crate::repository::status::is_file_alive_via_retrieval(
                             txn, inode, position, visibility,
-                        )? {
-                            projected_path = state
-                                .last_present_path
-                                .clone()
-                                .or_else(|| current_path.clone());
-                        }
+                        )?
+                    {
+                        projected_path = state
+                            .last_present_path
+                            .clone()
+                            .or_else(|| current_path.clone());
                     }
 
                     if let Some(path) = projected_path {

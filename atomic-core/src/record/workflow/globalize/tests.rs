@@ -214,6 +214,15 @@ mod tests {
         assert_eq!(extract_parent(""), "");
     }
 
+    #[test]
+    fn test_ancestor_directories_are_parent_first() {
+        assert_eq!(
+            ancestor_directories("src/domain/model.rs"),
+            vec!["src".to_string(), "src/domain".to_string()]
+        );
+        assert!(ancestor_directories("Cargo.toml").is_empty());
+    }
+
     // Position Conversion Tests
 
     #[test]

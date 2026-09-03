@@ -580,7 +580,7 @@ impl Repository {
                     else {
                         continue;
                     };
-                    if !pos.change.is_root() && !filter.contains(&pos.change) {
+                    if !pos.change.is_root() && !filter.contains(pos.change) {
                         continue; // not visible on this view
                     }
                     if crate::repository::status::is_file_alive_via_retrieval(

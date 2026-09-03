@@ -15,6 +15,7 @@ mod init_tests;
 mod integration_tests;
 mod materialize_fail_closed_tests;
 mod merge_property_tests;
+mod nested_parent_tests;
 mod record_duplication_tests;
 mod record_tests;
 mod rename_tests;
