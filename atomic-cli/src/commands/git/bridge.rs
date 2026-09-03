@@ -16,6 +16,9 @@ use atomic_repository::{
     graph_visibility_closure, InsertOptions, Repository, RepositoryError, StatusOptions,
 };
 
+use super::observation::{
+    observe_head, BridgeCheckpointObservation, HeadObservation, ObservationError,
+};
 use super::Import;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -538,6 +541,19 @@ fn current_heads(repo: &Repository, git: &GitRepository) -> CliResult<BridgeSnap
     })
 }
 
+pub(crate) fn read_checkpoint_observation(
+    root: &Path,
+) -> CliResult<Option<BridgeCheckpointObservation>> {
+    read_workspace_metadata(root).map(|checkpoint| {
+        checkpoint.map(|checkpoint| BridgeCheckpointObservation {
+            view: checkpoint.view,
+            atomic_state: checkpoint.atomic_state,
+            git_head: checkpoint.git_head,
+            git_tree: checkpoint.git_tree,
+        })
+    })
+}
+
 fn read_workspace_metadata(root: &Path) -> CliResult<Option<WorkspaceMetadata>> {
     let path = root.join(".atomic/bridge/workspace.json");
     let bytes = match fs::read(&path) {
@@ -570,15 +586,21 @@ fn open_git(root: &Path) -> CliResult<GitRepository> {
 }
 
 fn current_attached_git_branch(git: &GitRepository) -> CliResult<String> {
-    let head = git
-        .head()
-        .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
-    if !head.is_branch() {
-        return Err(git_error("Git HEAD must be attached to a local branch"));
+    match observe_head(git).map_err(observation_error)? {
+        HeadObservation::Attached { symref, .. } => symref
+            .strip_prefix("refs/heads/")
+            .map(str::to_string)
+            .ok_or_else(|| git_error(format!("Git HEAD symref '{symref}' is not a local branch"))),
+        HeadObservation::Detached { .. } => {
+            Err(git_error("Git HEAD must be attached to a local branch"))
+        }
+        HeadObservation::Unborn { symref } => {
+            Err(git_error(format!("Git HEAD is unborn at '{symref}'")))
+        }
+        HeadObservation::MissingTarget { symref } => Err(git_error(format!(
+            "Git HEAD target '{symref}' does not exist"
+        ))),
     }
-    head.shorthand()
-        .map(str::to_string)
-        .ok_or_else(|| git_error("Git branch name is not valid UTF-8"))
 }
 
 fn require_clean_git_worktree(git: &GitRepository) -> CliResult<()> {
@@ -1001,6 +1023,10 @@ fn write_workspace_metadata(root: &Path, snapshot: &BridgeSnapshot) -> CliResult
         return Err(git_error(format!("cannot write bridge metadata: {error}")));
     }
     Ok(())
+}
+
+fn observation_error(error: ObservationError) -> CliError {
+    git_error(error.to_string())
 }
 
 fn git_error(message: impl Into<String>) -> CliError {

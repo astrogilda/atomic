@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Builder, Database, ReadableTable};
+use redb::{Builder, Database, ReadTransaction, ReadableTable};
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
@@ -34,6 +34,29 @@ use super::write::WriteTxn;
 /// Return `max_id + 1`, or error if the ID space is exhausted.
 fn next_id(max_id: u64) -> PristineResult<u64> {
     max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
+}
+
+fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
+    let mut max_id = 0u64;
+
+    for result in read_txn.open_table(INODES)?.iter()? {
+        let (inode, _) = result?;
+        max_id = max_id.max(inode.value());
+    }
+    for result in read_txn.open_table(TREE)?.iter()? {
+        let (_, inode) = result?;
+        max_id = max_id.max(inode.value());
+    }
+    for result in read_txn.open_table(REV_TREE)?.iter()? {
+        let (inode, _) = result?;
+        max_id = max_id.max(inode.value());
+    }
+    for result in read_txn.open_table(DIRECTORIES)?.iter()? {
+        let (inode, _) = result?;
+        max_id = max_id.max(inode.value());
+    }
+
+    next_id(max_id)
 }
 
 /// The pristine database handle
@@ -162,15 +185,7 @@ impl Pristine {
             AtomicU64::new(next_id(max_id)?)
         };
 
-        let next_inode = {
-            let table = read_txn.open_table(INODES)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (k, _) = result?;
-                max_id = max_id.max(k.value());
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
+        let next_inode = AtomicU64::new(next_inode_id(&read_txn)?);
 
         Ok(Self {
             db,
@@ -260,15 +275,7 @@ impl Pristine {
             AtomicU64::new(next_id(max_id)?)
         };
 
-        let next_inode = {
-            let table = read_txn.open_table(INODES)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (k, _) = result?;
-                max_id = max_id.max(k.value());
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
+        let next_inode = AtomicU64::new(next_inode_id(&read_txn)?);
 
         Ok(Self {
             db,
@@ -319,6 +326,7 @@ impl Pristine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pristine::{MutTxnT, TreeTxnT};
     use tempfile::tempdir;
 
     #[test]
@@ -355,6 +363,27 @@ mod tests {
             // Since we didn't actually write any changes, counter resets
             assert_eq!(pristine.peek_next_node_id(), 1);
         }
+    }
+
+    #[test]
+    fn test_reopen_allocates_after_unbound_tree_inodes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+
+        {
+            let pristine = Pristine::open(&db_path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            let staged = txn.alloc_inode().unwrap();
+            assert_eq!(staged.get(), 1);
+            txn.put_tree("staged.txt", staged).unwrap();
+            assert_eq!(txn.inode_position(staged).unwrap(), None);
+            txn.commit().unwrap();
+        }
+
+        let reopened = Pristine::open(&db_path).unwrap();
+        let mut txn = reopened.write_txn().unwrap();
+        assert_eq!(txn.alloc_inode().unwrap().get(), 2);
+        txn.abort().unwrap();
     }
 
     #[test]

@@ -286,21 +286,16 @@ impl Import {
         view_name: &str,
         repair_index: bool,
     ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
-        use atomic_repository::HistoryOptions;
-
         let mut shas = HashSet::new();
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
-        // Query the explicit target instead of the current view. Agent drafts
-        // intentionally hide inherited changes from their default log, so
-        // scanning the current draft makes already-imported parent commits look
-        // new and duplicates them onto the Git branch view.
-        let options = HistoryOptions::default()
-            .view(view_name)
-            .include_inherited(true);
+        // Query the target's effective root-to-leaf history. The low-level log
+        // iterator enumerates only the leaf view even when inherited filtering
+        // is disabled; using it here makes parent commits look new on drafts and
+        // synthesizes duplicate root FileAdd operations during incremental import.
         let entries = repo
-            .log(options)
+            .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
         for entry in entries {
             states.insert(entry.state);

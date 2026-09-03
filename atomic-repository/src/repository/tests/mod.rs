@@ -23,6 +23,7 @@ mod shadow_lock_tests;
 mod status_tests;
 
 mod tracking_tests;
+mod tree_projection_tests;
 mod verify_tests;
 mod view_tests;
 

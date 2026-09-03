@@ -206,7 +206,8 @@ fn nested_record_fails_closed_when_parent_inode_position_is_missing() {
         )
         .unwrap_err();
     assert!(
-        error.to_string().contains("no graph position"),
+        error.to_string().contains("no graph position")
+            || error.to_string().contains("has no inode"),
         "unexpected error: {error}"
     );
 

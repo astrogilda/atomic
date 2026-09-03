@@ -99,7 +99,8 @@
 //!     modified:   src/lib.rs
 //! ```
 
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -107,6 +108,12 @@ use atomic_core::types::Base32;
 use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
 use atomic_repository::Repository;
 
+use crate::commands::git::bridge::read_checkpoint_observation;
+use crate::commands::git::observation::{
+    classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
+    GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
+    RefTargetObservation,
+};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -137,6 +144,7 @@ use crate::output::{
 ///
 /// 1. **Long format** (default): Human-readable output with colors and hints
 /// 2. **Short format** (`-s`): Machine-readable, similar to `git status -s`
+/// 3. **Forensic format** (`--no-reconcile`): Read-only Atomic/Git checkpoint evidence
 ///
 /// # Path Filtering
 ///
@@ -193,8 +201,15 @@ pub struct Status {
     ///
     /// This is useful after `git import` where file mtimes are reset,
     /// invalidating the cached entries.
-    #[arg(long = "reindex")]
+    #[arg(long = "reindex", conflicts_with = "no_reconcile")]
     pub reindex: bool,
+
+    /// Print read-only Git/Atomic checkpoint evidence without reconciliation.
+    ///
+    /// This forensic mode does not run ordinary file status, reindex, import,
+    /// materialization, or any bridge reconciliation path.
+    #[arg(long = "no-reconcile", conflicts_with = "reindex")]
+    pub no_reconcile: bool,
 }
 
 impl Status {
@@ -206,6 +221,7 @@ impl Status {
             no_untracked: false,
             debug_ignore: false,
             reindex: false,
+            no_reconcile: false,
         }
     }
 
@@ -492,6 +508,10 @@ impl Command for Status {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
+        if self.no_reconcile {
+            return print_forensic_status(&repo_root);
+        }
+
         // Reindex first if requested (needs read-write access)
         if self.reindex {
             let rw_repo =
@@ -539,6 +559,272 @@ impl Command for Status {
         } else {
             self.print_long_format(&status)
         }
+    }
+}
+
+fn print_forensic_status(repo_root: &Path) -> CliResult<()> {
+    let repo =
+        Repository::open_readonly(repo_root).map_err(|error| CliError::InvalidRepository {
+            reason: error.to_string(),
+        })?;
+    let view = repo.current_view().to_string();
+    let atomic = AtomicAnchorObservation {
+        state: repo
+            .get_view_info(&view)
+            .map_err(CliError::from)?
+            .state
+            .to_string(),
+        view,
+    };
+    let checkpoint = read_checkpoint_observation(repo_root)?;
+    let git = observe_git(repo_root).map_err(|error| CliError::GitError {
+        message: error.to_string(),
+    })?;
+    let eligibility = classify_provisional_checkpoint(
+        &git,
+        &atomic,
+        checkpoint.as_ref(),
+        &ManifestEquivalence::NotComputed,
+    );
+
+    print!(
+        "{}",
+        build_forensic_report(repo_root, &atomic, checkpoint.as_ref(), &git, &eligibility)
+    );
+    Ok(())
+}
+
+fn build_forensic_report(
+    repo_root: &Path,
+    atomic: &AtomicAnchorObservation,
+    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    git: &GitObservation,
+    eligibility: &ProvisionalCheckpointEligibility,
+) -> String {
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "Forensic status (read-only; reconciliation disabled)"
+    );
+    let _ = writeln!(report, "Atomic root: {}", repo_root.display());
+    let _ = writeln!(report, "Atomic view: {}", atomic.view);
+    let _ = writeln!(report, "Atomic state: {}", atomic.state);
+
+    match checkpoint {
+        Some(checkpoint) => {
+            let _ = writeln!(report, "Bridge checkpoint: present");
+            let _ = writeln!(report, "  view: {}", checkpoint.view);
+            let _ = writeln!(report, "  atomic state: {}", checkpoint.atomic_state);
+            let _ = writeln!(report, "  Git HEAD: {}", checkpoint.git_head);
+            let _ = writeln!(report, "  Git tree: {}", checkpoint.git_tree);
+        }
+        None => {
+            let _ = writeln!(report, "Bridge checkpoint: absent");
+        }
+    }
+
+    match git {
+        GitObservation::NoGit { root } => {
+            let _ = writeln!(report, "Git: not present");
+            let _ = writeln!(report, "  inspected root: {}", root.display());
+        }
+        GitObservation::Repository(repository) => {
+            let _ = writeln!(report, "Git: present");
+            let _ = writeln!(
+                report,
+                "  worktree root: {}",
+                repository
+                    .paths
+                    .worktree_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "none (bare)".to_string())
+            );
+            let _ = writeln!(
+                report,
+                "  worktree Git dir: {}",
+                repository.paths.worktree_git_dir.display()
+            );
+            let _ = writeln!(
+                report,
+                "  common dir: {}",
+                repository.paths.common_dir.display()
+            );
+            let _ = writeln!(
+                report,
+                "  index path: {}",
+                repository.paths.index_path.display()
+            );
+            match &repository.head {
+                crate::commands::git::observation::HeadObservation::Attached { symref, oid } => {
+                    let _ = writeln!(report, "  HEAD: attached");
+                    let _ = writeln!(report, "    symref: {symref}");
+                    let _ = writeln!(report, "    OID: {oid}");
+                }
+                crate::commands::git::observation::HeadObservation::Detached { oid } => {
+                    let _ = writeln!(report, "  HEAD: detached");
+                    let _ = writeln!(report, "    symref: none");
+                    let _ = writeln!(report, "    OID: {oid}");
+                }
+                crate::commands::git::observation::HeadObservation::Unborn { symref } => {
+                    let _ = writeln!(report, "  HEAD: unborn");
+                    let _ = writeln!(report, "    symref: {symref}");
+                    let _ = writeln!(report, "    OID: none");
+                }
+                crate::commands::git::observation::HeadObservation::MissingTarget { symref } => {
+                    let _ = writeln!(report, "  HEAD: symbolic target missing");
+                    let _ = writeln!(report, "    symref: {symref}");
+                    let _ = writeln!(report, "    OID: none");
+                }
+            }
+            let _ = writeln!(
+                report,
+                "  HEAD tree: {}",
+                repository
+                    .head_tree_oid
+                    .map(|oid| oid.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+
+            let _ = writeln!(report, "  index:");
+            let _ = writeln!(report, "    exists: {}", repository.index.exists);
+            let _ = writeln!(report, "    version: {}", repository.index.version);
+            let _ = writeln!(
+                report,
+                "    canonical index digest (not a Git tree OID): {}",
+                repository.index.canonical_digest.0
+            );
+            let _ = writeln!(
+                report,
+                "    exact index tree OID: {}",
+                repository
+                    .index
+                    .tree_oid
+                    .map(|oid| oid.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string())
+            );
+            let _ = writeln!(
+                report,
+                "    index tree availability: {:?}",
+                repository.index.tree_availability
+            );
+            match &repository.index.head_equivalence {
+                IndexHeadEquivalence::Equal { head_tree } => {
+                    let _ = writeln!(report, "    HEAD equivalence: equal to {head_tree}");
+                }
+                IndexHeadEquivalence::Different {
+                    head_tree,
+                    missing_from_index,
+                    added_to_index,
+                    changed,
+                } => {
+                    let _ = writeln!(report, "    HEAD equivalence: differs from {head_tree}");
+                    write_raw_path_list(&mut report, "missing from index", missing_from_index);
+                    write_raw_path_list(&mut report, "added to index", added_to_index);
+                    write_raw_path_list(&mut report, "changed", changed);
+                }
+                IndexHeadEquivalence::NotApplicable => {
+                    let _ = writeln!(report, "    HEAD equivalence: not applicable");
+                }
+            }
+            let _ = writeln!(report, "    entries: {}", repository.index.entries.len());
+            for entry in &repository.index.entries {
+                let _ = writeln!(
+                    report,
+                    "      stage={} mode={:06o} oid={} flags=0x{:04x} extended=0x{:04x} path={}",
+                    entry.stage,
+                    entry.mode,
+                    entry.oid,
+                    entry.flags,
+                    entry.flags_extended,
+                    display_git_bytes(&entry.path)
+                );
+            }
+
+            let _ = writeln!(report, "  locks:");
+            let _ = writeln!(
+                report,
+                "    index: {} ({:?})",
+                repository.locks.index_lock.path.display(),
+                repository.locks.index_lock.kind
+            );
+            let _ = writeln!(
+                report,
+                "    ref locks: {}",
+                repository.locks.ref_locks.len()
+            );
+            for path in &repository.locks.ref_locks {
+                let _ = writeln!(report, "      {}", path.display());
+            }
+
+            let _ = writeln!(
+                report,
+                "  Git operation state: {}",
+                repository.operation.repository_state
+            );
+            for marker in &repository.operation.markers {
+                let _ = writeln!(
+                    report,
+                    "    {}: {:?} ({})",
+                    marker.marker.as_str(),
+                    marker.kind,
+                    marker.path.display()
+                );
+            }
+
+            let _ = writeln!(
+                report,
+                "  refs: {} (digest {})",
+                repository.refs.len(),
+                repository.refs_digest.0
+            );
+            for reference in &repository.refs {
+                let target = match &reference.target {
+                    RefTargetObservation::Direct(oid) => oid.to_string(),
+                    RefTargetObservation::Symbolic(target) => {
+                        format!("symref {}", display_git_bytes(target))
+                    }
+                    RefTargetObservation::Unresolved => "unresolved".to_string(),
+                };
+                let _ = writeln!(
+                    report,
+                    "    {} -> {}",
+                    display_git_bytes(&reference.name),
+                    target
+                );
+            }
+        }
+    }
+
+    match eligibility {
+        ProvisionalCheckpointEligibility::Eligible(checkpoint) => {
+            let _ = writeln!(
+                report,
+                "Checkpoint classification: eligible ({:?})",
+                checkpoint.source
+            );
+            let _ = writeln!(
+                report,
+                "  HEAD/index/refs observation may be used as a provisional checkpoint"
+            );
+        }
+        ProvisionalCheckpointEligibility::Unanchored(reason) => {
+            let _ = writeln!(report, "Checkpoint classification: Unanchored");
+            let _ = writeln!(report, "  reason: {reason}");
+            let _ = writeln!(report, "  typed reason: {reason:?}");
+        }
+    }
+    let _ = writeln!(
+        report,
+        "Ordinary Atomic file status, reconciliation, and mutation were not run."
+    );
+    report
+}
+
+fn write_raw_path_list(report: &mut String, label: &str, paths: &[Vec<u8>]) {
+    let _ = writeln!(report, "      {label}: {}", paths.len());
+    for path in paths {
+        let _ = writeln!(report, "        {}", display_git_bytes(path));
     }
 }
 

@@ -200,6 +200,24 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
         conflicted.iter().any(|p| p == "new.txt"),
         "status should report new.txt as Conflicted, got {conflicted:?}"
     );
+
+    // The legacy primary/reverse-only representation must survive a switch
+    // round-trip without collapsing either visible claimant.
+    repo.switch_view("feature").unwrap();
+    std::fs::remove_file(&new_file).unwrap();
+    repo.materialize().unwrap();
+    let feature_replay = std::fs::read_to_string(&new_file).unwrap();
+    assert!(feature_replay.contains(">>>>>>>"));
+    assert!(feature_replay.contains("from-feature"));
+    assert!(feature_replay.contains("from-base"));
+
+    repo.switch_view("dev").unwrap();
+    std::fs::remove_file(&new_file).unwrap();
+    repo.materialize().unwrap();
+    let replayed = std::fs::read_to_string(&new_file).unwrap();
+    assert!(replayed.contains(">>>>>>>"));
+    assert!(replayed.contains("from-feature"));
+    assert!(replayed.contains("from-base"));
 }
 
 /// Guard against false positives: an ordinary single-create file (only one

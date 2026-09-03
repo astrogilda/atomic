@@ -169,16 +169,19 @@ fn switch_preflight_rejects_graph_error_before_pointer_or_file_mutation() {
                 .apply_after_record(true),
         )
         .unwrap();
-    repo.switch_view("dev").unwrap();
-    assert!(!target_path.exists());
-
-    let (change_id, bad_inode, bad_position, dev_view_id) = {
+    let (change_id, bad_inode, bad_position) = {
         let txn = repo.pristine.read_txn().unwrap();
         let change_id = txn.get_internal(target_outcome.hash()).unwrap().unwrap();
         let bad_inode = txn.get_inode(BAD_PATH).unwrap().unwrap();
         let bad_position = txn.inode_position(bad_inode).unwrap().unwrap();
-        let dev_view_id = txn.get_view("dev").unwrap().unwrap().id;
-        (change_id, bad_inode, bad_position, dev_view_id)
+        (change_id, bad_inode, bad_position)
+    };
+
+    repo.switch_view("dev").unwrap();
+    assert!(!target_path.exists());
+    let dev_view_id = {
+        let txn = repo.pristine.read_txn().unwrap();
+        txn.get_view("dev").unwrap().unwrap().id
     };
 
     std::fs::write(&source_path, GOOD_SENTINEL).unwrap();

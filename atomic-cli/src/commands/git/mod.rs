@@ -57,6 +57,7 @@
 pub mod bridge;
 pub mod hooks;
 pub mod import;
+pub(crate) mod observation;
 pub mod parallel;
 pub mod push;
 pub(crate) mod shadow;

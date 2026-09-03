@@ -946,11 +946,13 @@ The bridge does **not** rely on a filesystem or Git watcher to stay in sync. Cor
 
 Phases are dependency-ordered workstreams, not independently deployable promises. A phase may ship behind feature flags when all prerequisites below are complete; the safety properties in §12 become active only at their named phase.
 
+> **Operational tracking:** [`RFC-ATOMIC-GIT-CAUSAL-BRIDGE-TODO.md`](RFC-ATOMIC-GIT-CAUSAL-BRIDGE-TODO.md) maps this plan to bounded work-unit IDs, completed Atomic intents, explicit blockers, definitions of done, and dependency waves. The primary next unit is **CB-N34** (directory delete/undelete and explicit empty-directory lifecycle); **CB-0B** and **CB-0D** may proceed in parallel. No later unit should be started directly from this prose plan without first allocating its tracked Atomic intent.
+
 | Phase | Prerequisites | Newly enabled behavior |
 |---|---|---|
 | N | none | repair native tree/lifecycle/materialization invariants (§3.12); required by Phases 3–13 |
 | 0 | none | detect/refuse stale baselines; WIP-ref preservation only |
-| 1 | 0 | persistent working copies, operations, effect receipts |
+| 1 | 0, N | persistent working copies, operations, effect receipts |
 | 2 | 1 | complete baseline-relative snapshots and staged/remainder reassembly |
 | 3 | 1, N | graph attributes, origin/frontier persistence, existing SetId domain audit |
 | 4 | 2, 3, N | five-layer manifests, `ProjectTree`, filter-policy fingerprint |
@@ -966,20 +968,20 @@ Phases are dependency-ordered workstreams, not independently deployable promises
 
 ### Phase N — Native tree and materialization integrity
 
-This is native Atomic work and may ship in parallel with Phase 0, but Phases 3–13 cannot complete without it.
+This is native Atomic work and may ship in parallel with Phase 0, but Phases 1–13 cannot complete without it.
 
 **Tasks**
 1. **Complete (N1, 2026-09-03):** nested `FileAdd`/`DirAdd` globalization now emits parent-first directory anchors, connects same-change children through `add_inode.start`, resolves persisted parents through strict view-aware metadata, and records external parent changes as dependencies. Native record and Git graph-first import regressions cover three-level trees, sibling views, insert/unrecord/reinsert, close/reopen, materialization, content retrieval, incremental import, and corrupt-parent failure without partial history advancement.
-2. Introduce one operation-aware tree projection API used by record/import/insert/undelete/replay; derive `DIRECTORIES`/`DIR_EMPTY` occupancy centrally.
+2. **Complete (N2, `ATOM::continuouslee::68`):** one validated `TreeProjectionPlan` owns repository-side `TREE`/`REV_TREE`, inode-index, and directory-flag mutation for record, import, insert, undelete, tracking, and deferred replay; exact direct-child projection derives `DIR_EMPTY`. Legacy concurrent path claims remain an explicit compatibility boundary until `PATH_CLAIMS` lands.
 3. Correct `DirDel`; implement complete `FileUndel`/`DirUndel` metadata projection and normal record constructors.
 4. Classify explicit directories correctly and preserve explicit empty directories in native materialization.
-5. Add typed `MaterializedEntry`/content presence results across sequential, parallel, prefix, and content retrieval paths.
+5. **Complete (N5, `ATOM::continuouslee::61`):** typed `MaterializedEntry`/content presence distinguishes absent from present zero-byte content across sequential, parallel, selected, prefix, bridge, and content-retrieval paths.
 6. Add `PATH_CLAIMS`; restore strict `TREE`↔`REV_TREE` bijection; persist claimant identities and implement durable `SolveNameConflict`.
-7. Add `ViewMembershipSet`/`GraphVisibilityClosure`; replace every graph traversal filter with the canonical dependency-expanded builder; repair/fail on unindexed dependencies.
+7. **Complete (N7, `ATOM::continuouslee::62`):** `ViewMembershipSet` and `GraphVisibilityClosure` separate direct membership from dependency-expanded traversal, and production graph readers use the canonical fail-closed builder.
 8. Add native rename-plus-edit recording preserving inode identity. Permission/symlink/gitlink work is delivered with the attribute-register portion of Phase 3 but tested here as an end-to-end native invariant.
 9. Add integrity/repair command checks for all derived indexes and projection caches.
 
-**Recommended next:** task 2 — the central operation-aware tree projection and directory-occupancy API. Phase 1 remains blocked until the remaining Phase N prerequisites are complete.
+**Recommended next:** [CB-N34](RFC-ATOMIC-GIT-CAUSAL-BRIDGE-TODO.md#ready-queue) — correct `DirDel`, add complete file/directory undelete projection, and preserve explicit empty directories. CB-0B and CB-0D may proceed in parallel. Phase 1 remains blocked until Phase 0 and the remaining Phase N prerequisites are complete.
 
 **Acceptance**
 - Nested add, move, delete, undelete, and reinsert produce the same graph/path projection after close/reopen and across sibling views; nested names are connected to actual parent inode anchors, never `ROOT`.
@@ -995,12 +997,12 @@ This is native Atomic work and may ship in parallel with Phase 0, but Phases 3�
 ### Phase 0 — Safety guard, drift diagnostics, WIP recovery
 
 **Tasks**
-1. Read-only Git observer: HEAD symref/oid, index tree, `index.lock`, sequence markers, stage>0 entries, refs.
-2. Bootstrap a provisional checkpoint from the current Git HEAD when Atomic and Git manifests match; otherwise record `Unanchored`.
+1. **Complete (0A, `ATOM::continuouslee::69`):** strictly read-only Git observation covers attached/detached/unborn/missing-target HEAD, exact in-memory index tree OID where representable, every index stage, locks, sequence markers, refs, linked-worktree administrative paths, and explicit no-Git state.
+2. **Partial (0A foundation):** pure provisional-checkpoint eligibility and typed `Unanchored` classification are implemented; durable bootstrap persistence remains part of the later shared guard/checkpoint flow.
 3. Shared stale-baseline guard in status, diff, record, add, materialize, view switch, agent turn-end.
 4. On drift: refuse ordinary interpretation with a precise diagnostic (states, refs, manifest roots, remediation command).
 5. WIP recovery refs (§6.4) written before refusing; agent turn-end stores edits as a WIP ref and returns `Incomplete` rather than losing them.
-6. `atomic status --no-reconcile`.
+6. **Complete (0A, `ATOM::continuouslee::69`):** `atomic status --no-reconcile` prints forensic Atomic/Git/checkpoint evidence without ordinary status classification, reconciliation, or mutation.
 7. Install `post-checkout` advisory hook and event journal.
 
 **Acceptance**
