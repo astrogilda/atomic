@@ -415,9 +415,13 @@ impl Stash {
         include_untracked: bool,
         keep: bool,
     ) -> CliResult<()> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+
         // Check for uncommitted changes
         let status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(CliError::Repository)?;
 
         if status.is_clean() {
@@ -425,8 +429,10 @@ impl Stash {
             return Ok(());
         }
 
-        // Get current view for metadata
-        let source_view = repo.current_view().to_string();
+        // Use the persistent working-copy record as the source of truth.
+        let source_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         // Generate stash message
         let stash_message = message
@@ -536,7 +542,8 @@ impl Stash {
 
         // Restore working copy to clean state (unless --keep)
         if !keep && !self.keep {
-            repo.materialize().map_err(CliError::Repository)?;
+            repo.materialize(working_copy)
+                .map_err(CliError::Repository)?;
             print_success("Working copy restored to clean state");
         }
 

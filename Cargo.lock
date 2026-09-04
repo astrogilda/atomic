@@ -247,6 +247,7 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror 1.0.69",
+ "ulid",
  "xxhash-rust",
  "zstd",
 ]

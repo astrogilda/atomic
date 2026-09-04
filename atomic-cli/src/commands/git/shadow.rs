@@ -143,10 +143,15 @@ pub(crate) fn sync_git_head_to_view(
     if !shadow_sync_active(&git_repo) {
         return Ok(ShadowSwitchSync::SkippedInactive);
     }
-    if repo.current_view() != view {
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
+    if desired_view != view {
         return Err(git_error(format!(
-            "cannot synchronize Git shadow for view '{view}': current Atomic view is '{}'",
-            repo.current_view()
+            "cannot synchronize Git shadow for view '{view}': current Atomic view is '{desired_view}'"
         )));
     }
 
@@ -445,11 +450,15 @@ pub(crate) fn stage_and_validate_tree(
     view: &str,
     allow_conflict_markers: bool,
 ) -> CliResult<git2::Oid> {
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
     if !allow_conflict_markers {
         if let Some((path, line)) = repo
-            .first_working_copy_conflict_marker()
+            .first_working_copy_conflict_marker(working_copy)
             .map_err(CliError::Repository)?
         {
             if !std::io::stderr().is_terminal() {

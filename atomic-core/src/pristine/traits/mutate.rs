@@ -3,7 +3,7 @@
 //! `MutTxnT` extends all read traits with write operations for modifying
 //! the repository graph, file tree, views, and CRDT tables.
 
-use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge, WorkingCopyId};
 
 use crate::pristine::error::PristineError;
 
@@ -32,7 +32,9 @@ use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 ///
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
-pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PathClaimMutTxnT {
+pub trait MutTxnT:
+    ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PathClaimMutTxnT + super::WorkingCopyMutTxnT
+{
     // ── Change Registration ─────────────────────────────────────
 
     /// Register a new internal ID for an external hash.
@@ -218,6 +220,37 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PathClaimMutTx
 
     /// Remove cached file index entry.
     fn del_file_index(&mut self, path: &str) -> Result<(), PristineError>;
+
+    /// Store filesystem metadata in the namespace of one working copy.
+    fn put_working_copy_file_index(
+        &mut self,
+        working_copy: WorkingCopyId,
+        path: &str,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        file_size: u64,
+        content_hash: &Hash,
+    ) -> Result<(), PristineError> {
+        self.put_file_index(
+            &super::tree::working_copy_file_index_key(working_copy, path),
+            mtime_secs,
+            mtime_nanos,
+            file_size,
+            content_hash,
+        )
+    }
+
+    /// Remove filesystem metadata from one working copy's namespace.
+    fn del_working_copy_file_index(
+        &mut self,
+        working_copy: WorkingCopyId,
+        path: &str,
+    ) -> Result<(), PristineError> {
+        self.del_file_index(&super::tree::working_copy_file_index_key(
+            working_copy,
+            path,
+        ))
+    }
 
     /// Map an inode to a graph position (creates inode↔position mappings).
     fn put_inode(&mut self, inode: Inode, pos: Position<NodeId>) -> Result<(), PristineError>;

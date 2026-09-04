@@ -527,8 +527,12 @@ impl TurnOrchestrator {
             Err(_) => return true, // can't check — assume changes
         };
 
+        let working_copy = match repo.require_working_copy_id() {
+            Ok(working_copy) => working_copy,
+            Err(_) => return true, // can't validate identity — assume changes
+        };
         let opts = atomic_repository::status::StatusOptions::fast().with_untracked(true);
-        match repo.status(opts) {
+        match repo.status(working_copy, opts) {
             Ok(status) => !status.is_clean() || status.has_untracked(),
             Err(_) => true, // can't check — assume changes
         }

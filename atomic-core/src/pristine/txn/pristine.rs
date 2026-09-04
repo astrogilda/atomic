@@ -154,6 +154,7 @@ impl Pristine {
 
             // View tables
             write_txn.open_table(VIEWS)?;
+            write_txn.open_table(WORKING_COPIES)?;
             write_txn.open_table(VIEW_CHANGES)?;
             write_txn.open_table(REV_VIEW_CHANGES)?;
             write_txn.open_table(CONFLICTS)?;
@@ -399,7 +400,7 @@ mod tests {
     use super::*;
     use crate::pristine::{
         MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, PathClaimMutTxnT,
-        PathClaimTxnT, TreeTxnT, PATH_CLAIM_SCHEMA_VERSION,
+        PathClaimTxnT, TreeTxnT, WorkingCopyTxnT, PATH_CLAIM_SCHEMA_VERSION,
     };
     use tempfile::tempdir;
 
@@ -418,6 +419,55 @@ mod tests {
         // Should be able to create transactions
         let _read = pristine.read_txn().unwrap();
         let _write = pristine.write_txn().unwrap();
+    }
+
+    #[test]
+    fn normal_open_adds_working_copy_storage_to_legacy_schema() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                write_txn.open_table(EXTERNAL).unwrap();
+                write_txn.open_table(VIEWS).unwrap();
+                write_txn.open_table(INODES).unwrap();
+                write_txn.open_table(REV_INODES).unwrap();
+                write_txn.open_table(TREE).unwrap();
+                write_txn.open_table(REV_TREE).unwrap();
+                write_txn.open_table(DIRECTORIES).unwrap();
+                write_txn.open_table(CONFLICTS).unwrap();
+                write_txn.open_multimap_table(INODE_GRAPH).unwrap();
+                write_txn.open_multimap_table(PATH_CLAIMS).unwrap();
+                let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
+                metadata
+                    .insert(PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION)
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        {
+            let pristine = Pristine::open_readonly(&db_path).unwrap();
+            let txn = pristine.read_txn().unwrap();
+            assert!(matches!(
+                txn.list_working_copies(),
+                Err(PristineError::WorkingCopySchemaUnavailable)
+            ));
+        }
+
+        {
+            let pristine = Pristine::open(&db_path).unwrap();
+            let txn = pristine.read_txn().unwrap();
+            assert!(txn.list_working_copies().unwrap().is_empty());
+        }
+
+        {
+            let pristine = Pristine::open_readonly(&db_path).unwrap();
+            let txn = pristine.read_txn().unwrap();
+            assert!(txn.list_working_copies().unwrap().is_empty());
+        }
     }
 
     #[test]

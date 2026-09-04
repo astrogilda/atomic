@@ -502,8 +502,12 @@ async fn test_turn_end_records_untracked_only_files() {
     );
 
     let repo = Repository::open(dir.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     let status = repo
-        .status(atomic_repository::status::StatusOptions::default())
+        .status(
+            working_copy,
+            atomic_repository::status::StatusOptions::default(),
+        )
         .unwrap();
     assert_eq!(status.untracked_count(), 0);
     assert!(
@@ -542,15 +546,18 @@ async fn test_session_attestation_covers_only_agent_recorded_changes() {
     // when the session forks. The bug we're guarding against is that
     // this baseline used to get attributed to the agent.
     let repo_for_baseline = Repository::open(dir.path()).unwrap();
+    let working_copy = repo_for_baseline.require_working_copy_id().unwrap();
     fs::write(dir.path().join("baseline.txt"), "baseline content\n").unwrap();
     repo_for_baseline
         .add(
+            working_copy,
             "baseline.txt",
             atomic_repository::tracking::TrackingOptions::default(),
         )
         .expect("track baseline.txt");
     let baseline_outcome = repo_for_baseline
         .record(
+            working_copy,
             ChangeHeader::new("baseline change"),
             atomic_repository::record::RecordOptions::new().with_all(true),
         )

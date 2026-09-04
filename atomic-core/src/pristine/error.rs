@@ -175,6 +175,25 @@ pub enum PristineError {
         parent_id: u64,
     },
 
+    /// Persistent working-copy storage has not been initialized.
+    WorkingCopySchemaUnavailable,
+
+    /// A working-copy ID or canonical location is already bound elsewhere.
+    WorkingCopyIdentityConflict {
+        /// ID requested by the caller.
+        requested_id: String,
+        /// Existing ID that owns the conflicting identity or location.
+        existing_id: String,
+    },
+
+    /// A view cannot be deleted while working copies select it.
+    ViewHasWorkingCopies {
+        /// Human-readable view name.
+        name: String,
+        /// Working-copy IDs whose desired view points here.
+        working_copy_ids: Vec<String>,
+    },
+
     /// Change not found by its internal ID
     ///
     /// The NodeId doesn't correspond to any registered change.
@@ -333,6 +352,35 @@ impl fmt::Display for PristineError {
                 f,
                 "view '{}' ({}) references missing parent view {}; repair the view hierarchy before resolving visibility",
                 view_name, view_id, parent_id
+            ),
+            Self::WorkingCopySchemaUnavailable => write!(
+                f,
+                "working-copy storage is unavailable; reopen the repository normally with write access to initialize the WORKING_COPIES table"
+            ),
+            Self::WorkingCopyIdentityConflict {
+                requested_id,
+                existing_id,
+            } if requested_id == existing_id => write!(
+                f,
+                "working-copy identity conflict: ID '{}' is already bound to a different canonical location",
+                requested_id
+            ),
+            Self::WorkingCopyIdentityConflict {
+                requested_id,
+                existing_id,
+            } => write!(
+                f,
+                "working-copy identity conflict: canonical location is already bound to ID '{}', not requested ID '{}'",
+                existing_id, requested_id
+            ),
+            Self::ViewHasWorkingCopies {
+                name,
+                working_copy_ids,
+            } => write!(
+                f,
+                "cannot delete view '{}': selected by working copies: {}",
+                name,
+                working_copy_ids.join(", ")
             ),
             Self::IdSpaceExhausted => write!(f, "internal ID space exhausted (u64::MAX reached)"),
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
@@ -519,6 +567,32 @@ mod tests {
                 &["feature", "3", "missing parent", "99", "repair"],
             ),
             (
+                PristineError::WorkingCopySchemaUnavailable,
+                &["working-copy storage", "WORKING_COPIES", "write access"],
+            ),
+            (
+                PristineError::WorkingCopyIdentityConflict {
+                    requested_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    existing_id: "01BX5ZZKBKACTAV9WEVGEMMVRZ".into(),
+                },
+                &[
+                    "working-copy identity conflict",
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+                ],
+            ),
+            (
+                PristineError::ViewHasWorkingCopies {
+                    name: "feature".into(),
+                    working_copy_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".into()],
+                },
+                &[
+                    "cannot delete view",
+                    "feature",
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                ],
+            ),
+            (
                 PristineError::ChangeNotFound { id: 42 },
                 &["change not found", "42"],
             ),
@@ -617,6 +691,15 @@ mod tests {
                 view_id: 1,
                 view_name: "x".into(),
                 parent_id: 2,
+            },
+            PristineError::WorkingCopySchemaUnavailable,
+            PristineError::WorkingCopyIdentityConflict {
+                requested_id: "x".into(),
+                existing_id: "y".into(),
+            },
+            PristineError::ViewHasWorkingCopies {
+                name: "x".into(),
+                working_copy_ids: vec!["y".into()],
             },
             PristineError::ChangeNotFound { id: 1 },
             PristineError::UnindexedChangeDependencies { change_id: 1 },

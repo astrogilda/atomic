@@ -69,8 +69,10 @@ impl Repository {
 
     pub fn first_working_copy_conflict_marker(
         &self,
+        working_copy: WorkingCopyId,
     ) -> Result<Option<(String, u32)>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+        self.validate_working_copy(working_copy)?;
+        let status = self.status(working_copy, StatusOptions::default())?;
         for entry in status.entries() {
             let is_directory = entry.details().map(|d| d == "directory").unwrap_or(false);
             if is_directory {
@@ -265,6 +267,7 @@ fn prepare_name_conflict_output<C: atomic_core::change::ChangeStore>(
 impl Repository {
     fn remove_absent_entries(
         &self,
+        working_copy: WorkingCopyId,
         entries: &[MaterializedEntry],
         only_paths: Option<&std::collections::HashSet<String>>,
         prefix: Option<&str>,
@@ -304,7 +307,7 @@ impl Repository {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(RepositoryError::Io(error)),
             }
-            self.del_file_index(entry.path())?;
+            self.delete_working_copy_file_index(working_copy, entry.path())?;
         }
 
         let mut directories: Vec<_> = entries
@@ -336,7 +339,7 @@ impl Repository {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(RepositoryError::Io(error)),
             }
-            self.del_file_index(entry.path())?;
+            self.delete_working_copy_file_index(working_copy, entry.path())?;
         }
 
         Ok(removed_files)
@@ -497,10 +500,10 @@ impl Repository {
             .collect())
     }
 
-    /// Materialize the working copy to match the current view's state.
+    /// Materialize the working copy to match its authoritative desired view.
     ///
     /// This synchronizes the working copy files with the repository graph
-    /// state for the current view. Files are created, updated, or deleted
+    /// state recorded for the supplied working-copy identity. Files are created, updated, or deleted
     /// to match what's recorded in the view.
     ///
     /// Since all edges are stored in the global GRAPH table, this uses the
@@ -525,19 +528,23 @@ impl Repository {
     /// ```rust,ignore
     /// let repo = Repository::open(".")?;
     ///
-    /// // Reset working copy to current view's state
-    /// let result = repo.materialize()?;
+    /// // Reset working copy to its desired view's state
+    /// let result = repo.materialize(working_copy)?;
     /// println!("Materialized {} files", result.files_written);
     ///
     /// if result.has_conflicts() {
     ///     println!("Warning: {} conflicts detected", result.conflict_count());
     /// }
     /// ```
-    pub fn materialize(&self) -> Result<MaterializeResult, RepositoryError> {
+    pub fn materialize(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         // Use the parallel path — buffers content in memory, processes files
         // concurrently via rayon, writes each file in a single fs::write call,
         // and computes content hashes in-memory (no read-back pass).
-        self.materialize_parallel(None)
+        self.materialize_parallel(working_copy, None)
     }
 
     /// Sequential materialize fallback.
@@ -545,11 +552,15 @@ impl Repository {
     /// Processes files one at a time through the streaming writer path.
     /// Used when the parallel path is not suitable (e.g., memory-constrained
     /// environments).
-    pub fn materialize_sequential(&self) -> Result<MaterializeResult, RepositoryError> {
+    pub fn materialize_sequential(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         // PATH_CLAIMS conflict rendering is batch-validated before filesystem
         // effects. Reuse that single implementation so sequential and parallel
         // entry points cannot disagree about a claimant.
-        self.materialize_parallel(None)
+        self.materialize_parallel(working_copy, None)
     }
 
     /// Materialize only specific files to the working copy.
@@ -563,17 +574,21 @@ impl Repository {
     /// from disk.
     pub fn materialize_paths(
         &self,
+        working_copy: WorkingCopyId,
         paths: std::collections::HashSet<String>,
     ) -> Result<MaterializeResult, RepositoryError> {
-        self.materialize_parallel(Some(paths))
+        self.validate_working_copy(working_copy)?;
+        self.materialize_parallel(working_copy, Some(paths))
     }
 
     /// Sequentially materialize a specific set of paths.
     pub fn materialize_paths_sequential(
         &self,
+        working_copy: WorkingCopyId,
         paths: std::collections::HashSet<String>,
     ) -> Result<MaterializeResult, RepositoryError> {
-        self.materialize_parallel(Some(paths))
+        self.validate_working_copy(working_copy)?;
+        self.materialize_parallel(working_copy, Some(paths))
     }
 
     /// Materialize the working copy using parallel file processing.
@@ -588,51 +603,80 @@ impl Repository {
     /// never converted into successful skips.
     pub fn materialize_parallel(
         &self,
+        working_copy: WorkingCopyId,
         only_paths: Option<std::collections::HashSet<String>>,
     ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let view_name = self.desired_view_name(working_copy)?;
+        let full_materialization = only_paths.is_none();
         let (visibility, view_id) = {
             let txn = self
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let view = txn
-                .get_view(&self.current_view)
+                .get_view(&view_name)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
                 .ok_or_else(|| RepositoryError::ViewNotFound {
-                    name: self.current_view.clone(),
+                    name: view_name.clone(),
                 })?;
             (graph_visibility_closure(&txn, &view)?, view.id)
         };
-        self.materialize_parallel_with_visibility(only_paths, visibility, view_id)
+        let result = self.materialize_parallel_with_visibility(
+            working_copy,
+            only_paths,
+            visibility,
+            view_id,
+        )?;
+        if full_materialization {
+            self.mark_working_copy_materialized(working_copy, &view_name)?;
+        }
+        Ok(result)
     }
 
     pub(super) fn materialize_parallel_with_visibility(
         &self,
+        working_copy: WorkingCopyId,
         only_paths: Option<std::collections::HashSet<String>>,
         visibility: GraphVisibilityClosure,
         view_id: u64,
     ) -> Result<MaterializeResult, RepositoryError> {
-        self.materialize_parallel_with_visibility_mode(only_paths, visibility, view_id, true)
+        self.materialize_parallel_with_visibility_mode(
+            working_copy,
+            only_paths,
+            visibility,
+            view_id,
+            true,
+        )
     }
 
     /// Validate every target render before a switch performs external effects.
     pub(super) fn validate_materialization_with_visibility(
         &self,
+        working_copy: WorkingCopyId,
         only_paths: Option<std::collections::HashSet<String>>,
         visibility: GraphVisibilityClosure,
         view_id: u64,
     ) -> Result<(), RepositoryError> {
-        self.materialize_parallel_with_visibility_mode(only_paths, visibility, view_id, false)
-            .map(|_| ())
+        self.materialize_parallel_with_visibility_mode(
+            working_copy,
+            only_paths,
+            visibility,
+            view_id,
+            false,
+        )
+        .map(|_| ())
     }
 
     fn materialize_parallel_with_visibility_mode(
         &self,
+        working_copy: WorkingCopyId,
         only_paths: Option<std::collections::HashSet<String>>,
         visibility: GraphVisibilityClosure,
         view_id: u64,
         execute: bool,
     ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         use atomic_core::output::repo::OutputItem;
         use atomic_core::output::RetrieveOptions;
         use rayon::prelude::*;
@@ -768,7 +812,7 @@ impl Repository {
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let entries = idx_txn
-                .iter_file_index()
+                .iter_working_copy_file_index(working_copy)
                 .map_err(|error| RepositoryError::Database(error.to_string()))?;
             entries
                 .into_iter()
@@ -1153,10 +1197,10 @@ impl Repository {
         drop(txn);
 
         if !index_entries.is_empty() {
-            self.update_file_index(&index_entries)?;
+            self.update_working_copy_file_index(working_copy, &index_entries)?;
         }
         result.files_deleted +=
-            self.remove_absent_entries(&absent_entries, only_paths.as_ref(), None)?;
+            self.remove_absent_entries(working_copy, &absent_entries, only_paths.as_ref(), None)?;
         self.persist_view_conflicts(
             view_id,
             &path_to_inode,
@@ -1168,6 +1212,43 @@ impl Repository {
         Ok(result)
     }
 
+    fn update_working_copy_file_index(
+        &self,
+        working_copy: WorkingCopyId,
+        entries: &[(String, i64, u32, u64, Hash)],
+    ) -> Result<(), RepositoryError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        for (path, secs, nanos, size, hash) in entries {
+            txn.put_working_copy_file_index(working_copy, path, *secs, *nanos, *size, hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(())
+    }
+
+    fn delete_working_copy_file_index(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &str,
+    ) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        txn.del_working_copy_file_index(working_copy, path)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(())
+    }
+
     /// Update FILE_INDEX for paths that must be present after materialization.
     ///
     /// Callers pass the lifecycle-present subset, so a missing path is an error;
@@ -1175,8 +1256,10 @@ impl Repository {
     #[allow(dead_code)]
     fn populate_file_index_for_paths(
         &self,
+        working_copy: WorkingCopyId,
         paths: &std::collections::HashSet<String>,
     ) -> Result<(), RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         use std::time::SystemTime;
 
         let mut ordered_paths: Vec<&String> = paths.iter().collect();
@@ -1226,7 +1309,7 @@ impl Repository {
             ));
         }
 
-        self.update_file_index(&entries)
+        self.update_working_copy_file_index(working_copy, &entries)
     }
 
     /// Materialize the working copy for a specific prefix only.
@@ -1236,21 +1319,28 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - The validated physical working-copy identity
     /// * `prefix` - Path prefix to materialize (e.g., "src/")
     ///
     /// # Returns
     ///
     /// Statistics about the materialize operation.
-    pub fn materialize_prefix(&self, prefix: &str) -> Result<MaterializeResult, RepositoryError> {
+    pub fn materialize_prefix(
+        &self,
+        working_copy: WorkingCopyId,
+        prefix: &str,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let view_name = self.desired_view_name(working_copy)?;
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let view = txn
-            .get_view(&self.current_view)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
+                name: view_name.clone(),
             })?;
         let full_visibility = graph_visibility_closure(&txn, &view)?;
         let visibility = super::name_resolution::path_claim_visibility_for_view(
@@ -1277,7 +1367,7 @@ impl Repository {
             }
         }
         drop(txn);
-        self.materialize_parallel(Some(paths))
+        self.materialize_parallel(working_copy, Some(paths))
     }
 }
 

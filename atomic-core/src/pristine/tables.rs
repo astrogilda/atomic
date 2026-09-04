@@ -77,6 +77,14 @@ pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
 /// in what order, not forks of the underlying data.
 pub const VIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
 
+/// Persistent working-copy records keyed by canonical 16-byte ULID.
+///
+/// Values use the explicitly versioned canonical codec exposed by
+/// `pristine::WorkingCopyRecord`. The variable-width value type permits later
+/// record versions without changing the redb table schema.
+pub const WORKING_COPIES: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("working_copies");
+
 /// View change log: (view_id, sequence) → change_id
 ///
 /// Key: 16 bytes encoding (view_id: u64, sequence: u64)

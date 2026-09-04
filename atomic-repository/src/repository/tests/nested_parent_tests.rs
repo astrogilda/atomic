@@ -9,6 +9,7 @@ use atomic_core::types::{ChangePosition, Hash, Position};
 
 fn record_all(repo: &Repository, message: &str) -> crate::record::RecordOutcome {
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         ChangeHeader::new(message),
         RecordOptions::new()
             .with_all(true)
@@ -125,7 +126,9 @@ fn nested_record_uses_inode_anchors_dependencies_and_survives_reopen() {
     );
 
     std::fs::remove_dir_all(temp_dir.path().join("src")).unwrap();
-    reopened.materialize().unwrap();
+    reopened
+        .materialize(reopened.require_working_copy_id().unwrap())
+        .unwrap();
     assert_eq!(std::fs::read(model_path).unwrap(), b"pub struct Model;\n");
     assert_eq!(
         std::fs::read(service_path).unwrap(),

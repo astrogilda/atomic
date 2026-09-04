@@ -895,7 +895,10 @@ mod tests {
         let mut repository = atomic_repository::Repository::open_existing(root).unwrap();
         let parent = repository.current_view().to_string();
         repository.create_view_from("agent-view", &parent).unwrap();
-        repository.set_current_view("agent-view").unwrap();
+        let working_copy = repository.require_working_copy_id().unwrap();
+        repository
+            .set_current_view(working_copy, "agent-view")
+            .unwrap();
         drop(repository);
 
         let mut managed = Some(managed_lifecycle(root));

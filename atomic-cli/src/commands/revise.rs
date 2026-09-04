@@ -519,6 +519,9 @@ impl Revise {
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<Hash> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
         let stack_name = repo.current_view();
         let stack_info = repo
             .get_view_info(stack_name)
@@ -609,7 +612,7 @@ impl Revise {
         }
 
         // Record the revised change
-        let outcome = repo.record(header, options).map_err(|e| {
+        let outcome = repo.record(working_copy, header, options).map_err(|e| {
             // If recording fails, we should try to restore the state
             print_warning(&format!(
                 "Recording failed: {}. Attempting to restore...",
@@ -743,6 +746,9 @@ impl Command for Revise {
         // Find and open repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Resolve the reference
         let (sequence, entry) = self.resolve_reference(&repo)?;
@@ -755,7 +761,7 @@ impl Command for Revise {
         // Check for uncommitted changes if not in reword mode
         if !self.reword {
             let status = repo
-                .status(StatusOptions::default())
+                .status(working_copy, StatusOptions::default())
                 .map_err(CliError::Repository)?;
 
             if status.is_clean() && self.message.is_none() {

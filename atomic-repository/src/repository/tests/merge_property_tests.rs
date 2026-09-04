@@ -31,6 +31,7 @@ const SEED: u64 = 0x0005_EEDA_70C0_FFEE;
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         header,
         RecordOptions::new()
             .with_all(true)

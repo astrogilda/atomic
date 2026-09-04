@@ -28,8 +28,18 @@ impl Repository {
     /// | 1,000 files | ~1s | <50ms |
     /// | 43,000 files | ~150s | <3s |
     /// | 80,000 files | ~150s | <5s |
-    pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
-        self.status_inner(options, UntrackedScanPolicy::Always, true, false)
+    pub fn status(
+        &self,
+        working_copy: WorkingCopyId,
+        options: StatusOptions,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status_inner(
+            working_copy,
+            options,
+            UntrackedScanPolicy::Always,
+            true,
+            false,
+        )
     }
 
     /// Compute status for recording without scanning unrelated untracked files.
@@ -40,6 +50,7 @@ impl Repository {
     /// also unnecessary because rename matching reads candidates on demand.
     pub(crate) fn status_for_record(
         &self,
+        working_copy: WorkingCopyId,
         options: StatusOptions,
         detect_raw_renames: bool,
         include_all_untracked: bool,
@@ -51,11 +62,12 @@ impl Repository {
         } else {
             UntrackedScanPolicy::Never
         };
-        self.status_inner(options, policy, false, true)
+        self.status_inner(working_copy, options, policy, false, true)
     }
 
     fn status_inner(
         &self,
+        working_copy: WorkingCopyId,
         options: StatusOptions,
         untracked_policy: UntrackedScanPolicy,
         hash_untracked: bool,
@@ -63,6 +75,7 @@ impl Repository {
     ) -> Result<RepositoryStatus, RepositoryError> {
         use std::time::SystemTime;
 
+        let view_name = self.desired_view_name(working_copy)?;
         let overall_start = std::time::Instant::now();
 
         let txn = self
@@ -71,10 +84,10 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let view = txn
-            .get_view(&self.current_view)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
+                name: view_name.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
@@ -97,7 +110,7 @@ impl Repository {
             .map(|record| record.path)
             .collect();
 
-        let mut status = RepositoryStatus::new(self.current_view.clone(), Some(view.state));
+        let mut status = RepositoryStatus::new(view_name, Some(view.state));
 
         let phase1_ms = overall_start.elapsed().as_millis();
         log::debug!("status: view filter setup took {}ms", phase1_ms);
@@ -227,7 +240,7 @@ impl Repository {
         // (nanoseconds each).
         let index_start = std::time::Instant::now();
         let file_index_entries = txn
-            .iter_file_index()
+            .iter_working_copy_file_index(working_copy)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let file_index: HashMap<String, (i64, u32, u64, Hash)> = file_index_entries
             .into_iter()
@@ -577,42 +590,37 @@ impl Repository {
         // Surface persisted conflict state (written by the last materialize
         // on this view) so a conflicted working tree is never reported clean.
         // A Conflicted entry supersedes any Modified entry for the same path.
-        if let Some(view) = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            let conflicts = txn
-                .iter_conflicts(view.id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for (inode, records) in conflicts {
-                let Some(first) = records.first() else {
-                    continue;
-                };
-                let path = PathBuf::from(&first.path);
-                // Honesty invariant: only report Conflicted while the file on
-                // disk still carries markers. Once the user resolves them the
-                // file falls back to normal Modified detection and becomes
-                // recordable again (which then clears the stale entry).
-                let abs_path = self.root.join(&path);
-                let still_conflicted = std::fs::read(&abs_path)
-                    .ok()
-                    .and_then(|c| super::materialize::first_conflict_marker_line(&c))
-                    .is_some();
-                if !still_conflicted {
-                    continue;
-                }
-                let detail = if records.len() > 1 {
-                    format!("{} ({} conflicts)", first.summary(), records.len())
-                } else {
-                    first.summary()
-                };
-                let mut entry = FileStatusEntry::new(path, FileStatus::Conflicted);
-                entry.set_inode(atomic_core::types::Inode::new(inode));
-                entry.set_details(detail);
-                // Conflicted supersedes any prior (e.g. Modified) entry so the
-                // file is reported exactly once.
-                status.add_or_replace_entry(entry);
+        let conflicts = txn
+            .iter_conflicts(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for (inode, records) in conflicts {
+            let Some(first) = records.first() else {
+                continue;
+            };
+            let path = PathBuf::from(&first.path);
+            // Honesty invariant: only report Conflicted while the file on
+            // disk still carries markers. Once the user resolves them the
+            // file falls back to normal Modified detection and becomes
+            // recordable again (which then clears the stale entry).
+            let abs_path = self.root.join(&path);
+            let still_conflicted = std::fs::read(&abs_path)
+                .ok()
+                .and_then(|c| super::materialize::first_conflict_marker_line(&c))
+                .is_some();
+            if !still_conflicted {
+                continue;
             }
+            let detail = if records.len() > 1 {
+                format!("{} ({} conflicts)", first.summary(), records.len())
+            } else {
+                first.summary()
+            };
+            let mut entry = FileStatusEntry::new(path, FileStatus::Conflicted);
+            entry.set_inode(atomic_core::types::Inode::new(inode));
+            entry.set_details(detail);
+            // Conflicted supersedes any prior (e.g. Modified) entry so the
+            // file is reported exactly once.
+            status.add_or_replace_entry(entry);
         }
 
         let untracked_ms = untracked_start.elapsed().as_millis();
@@ -652,13 +660,15 @@ impl Repository {
     #[allow(clippy::type_complexity)]
     pub fn list_conflicts(
         &self,
+        working_copy: WorkingCopyId,
     ) -> Result<Vec<(String, Vec<atomic_core::pristine::StoredConflict>)>, RepositoryError> {
+        let view_name = self.desired_view_name(working_copy)?;
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let view = match txn
-            .get_view(&self.current_view)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             Some(v) => v,
@@ -735,11 +745,14 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let status = repo.status_quick()?;
+    /// let status = repo.status_quick(working_copy)?;
     /// println!("Modified: {}", status.modified_count());
     /// ```
-    pub fn status_quick(&self) -> Result<RepositoryStatus, RepositoryError> {
-        self.status(StatusOptions::fast())
+    pub fn status_quick(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status(working_copy, StatusOptions::fast())
     }
 
     /// Status showing only tracked files (no untracked).
@@ -747,34 +760,49 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let status = repo.status_tracked()?;
+    /// let status = repo.status_tracked(working_copy)?;
     /// // Only shows modified, deleted, added - no untracked
     /// ```
-    pub fn status_tracked(&self) -> Result<RepositoryStatus, RepositoryError> {
-        self.status(StatusOptions::tracked_only())
+    pub fn status_tracked(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status(working_copy, StatusOptions::tracked_only())
     }
 
     /// Check if the working copy is clean (no modifications).
-    pub fn is_working_copy_clean(&self) -> Result<bool, RepositoryError> {
-        let status = self.status(StatusOptions::fast())?;
+    pub fn is_working_copy_clean(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<bool, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::fast())?;
         Ok(status.is_clean())
     }
 
     /// Get only modified files.
-    pub fn modified_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn modified_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.modified().map(|e| e.path().to_path_buf()).collect())
     }
 
     /// Get only untracked files.
-    pub fn untracked_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn untracked_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.untracked().map(|e| e.path().to_path_buf()).collect())
     }
 
     /// Get only deleted files.
-    pub fn deleted_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn deleted_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.deleted().map(|e| e.path().to_path_buf()).collect())
     }
 }

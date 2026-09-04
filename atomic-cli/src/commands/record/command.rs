@@ -66,6 +66,9 @@ impl Command for Record {
 
         // Build record options
         let options = self.build_options()?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Repository::record owns --all inclusion so rename classification runs
         // before any untracked destination could be staged as a fresh inode.
@@ -79,7 +82,7 @@ impl Command for Record {
         // defaulted to accusing Atomic of a bug. `FileTooLarge` reached users
         // that way. Keeping the match exhaustive makes the compiler demand a
         // classification decision for each variant added from here on.
-        let outcome = repo.record(header, options).map_err(|e| {
+        let outcome = repo.record(working_copy, header, options).map_err(|e| {
             use atomic_repository::record::RecordError as RE;
             match e {
                 RE::NothingToRecord | RE::NoFilesMatched => CliError::NothingToRecord,

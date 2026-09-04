@@ -1238,7 +1238,12 @@ mod tests {
         // Track everything on disk. `add` itself only consults `.atomicignore`,
         // so node_modules still lands in the tree — enrichment must be the
         // layer that filters it out.
-        repo.add(".", TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            ".",
+            TrackingOptions::default(),
+        )
+        .unwrap();
 
         repo.kg_enrich_files().unwrap();
 
@@ -1281,8 +1286,11 @@ mod tests {
 
         let repo = Repository::init(root).unwrap();
         repo.init_kg().unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("init").build(),
             RecordOptions::new().enrich_kg(false),
         )
@@ -1317,8 +1325,11 @@ mod tests {
 
         let repo = Repository::init(root).unwrap();
         repo.init_kg().unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("init").build(),
             RecordOptions::new().with_all(true),
         )
@@ -1331,8 +1342,10 @@ mod tests {
         // rebuild: record() (enrich_kg defaults on) refreshes the index for the
         // change's paths.
         std::fs::write(root.join("src/b.ts"), b"const betamarker = 2;\n").unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("add b").build(),
             RecordOptions::new().with_all(true),
         )

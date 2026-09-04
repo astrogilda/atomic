@@ -31,7 +31,7 @@ next.
 ### Primary next
 
 - [ ] **READY — CB-1A: Persistent working-copy identity and API boundary**  
-  Intent: pending · Priority: high · Prerequisites: Phase N, CB-0C (done)  
+  Intent: `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` · Priority: high · Prerequisites: Phase N, CB-0C (done)
   Add durable `WorkingCopyId` records for ordinary and linked Git worktrees, require explicit identity at working-copy-aware repository boundaries, and make `.atomic/current_view` a derived compatibility artifact.
 
 ### Parallel safety workstream
@@ -146,7 +146,7 @@ execution.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] READY | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | pending |
+| [ ] IN PROGRESS | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` |
 | [ ] BLOCKED | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | pending |
 | [ ] BLOCKED | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
 

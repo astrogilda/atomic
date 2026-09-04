@@ -8,6 +8,7 @@ use atomic_core::pristine::{directory_flags, TreeTxnT};
 
 fn record_all(repo: &Repository, message: &str) -> RecordOutcome {
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         ChangeHeader::new(message),
         RecordOptions::new()
             .with_all(true)

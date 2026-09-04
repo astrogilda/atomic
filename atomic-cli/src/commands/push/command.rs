@@ -357,11 +357,17 @@ impl Push {
 
     /// Get the local view name to push from.
     ///
-    /// Returns the explicitly specified view or the repository's current view.
-    fn get_local_view(&self, repo: &Repository) -> String {
-        self.from_view
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string())
+    /// Returns the explicitly specified view or the working copy's desired view.
+    fn get_local_view(&self, repo: &Repository) -> CliResult<String> {
+        if let Some(view) = &self.from_view {
+            return Ok(view.clone());
+        }
+
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        repo.desired_view_name(working_copy)
+            .map_err(CliError::Repository)
     }
 
     /// Get the remote view name to declare the leaf view under.
@@ -494,7 +500,7 @@ impl Push {
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views: the leaf we push, and its name on the remote.
-        let local_view = self.get_local_view(&repo);
+        let local_view = self.get_local_view(&repo)?;
         let remote_view = self.get_remote_view(&local_view);
 
         // Print header

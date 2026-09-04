@@ -8,9 +8,12 @@ use atomic_repository::{RecordOptions, Repository, TrackingOptions};
 fn doctor_check_is_read_only_and_native_repair_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     std::fs::write(temp.path().join("f.txt"), b"content\n").unwrap();
-    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "f.txt", TrackingOptions::default())
+        .unwrap();
     repo.record(
+        working_copy,
         ChangeHeader::new("base"),
         RecordOptions::new()
             .with_all(true)
@@ -64,9 +67,12 @@ fn doctor_check_is_read_only_and_native_repair_is_idempotent() {
 fn doctor_check_does_not_recreate_a_missing_change_store() {
     let temp = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     std::fs::write(temp.path().join("f.txt"), b"content\n").unwrap();
-    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "f.txt", TrackingOptions::default())
+        .unwrap();
     repo.record(
+        working_copy,
         ChangeHeader::new("base"),
         RecordOptions::new()
             .with_all(true)
@@ -108,9 +114,12 @@ fn doctor_check_does_not_recreate_a_missing_change_store() {
 fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
     let temp = tempfile::tempdir().unwrap();
     let mut repo = Repository::init(temp.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     std::fs::write(temp.path().join("base.txt"), b"base\n").unwrap();
-    repo.add("base.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "base.txt", TrackingOptions::default())
+        .unwrap();
     repo.record(
+        working_copy,
         ChangeHeader::new("base"),
         RecordOptions::new()
             .with_all(true)
@@ -119,10 +128,12 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
     )
     .unwrap();
     repo.create_view_from("feature", "dev").unwrap();
-    repo.switch_view("feature").unwrap();
+    repo.switch_view(working_copy, "feature").unwrap();
     std::fs::write(temp.path().join("feature.txt"), b"feature\n").unwrap();
-    repo.add("feature.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "feature.txt", TrackingOptions::default())
+        .unwrap();
     repo.record(
+        working_copy,
         ChangeHeader::new("feature"),
         RecordOptions::new()
             .with_all(true)
@@ -168,10 +179,13 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
 fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
     let temp = tempfile::tempdir().unwrap();
     let repo = Repository::init(temp.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     std::fs::write(temp.path().join("f.txt"), b"content\n").unwrap();
-    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "f.txt", TrackingOptions::default())
+        .unwrap();
     let outcome = repo
         .record(
+            working_copy,
             ChangeHeader::new("base"),
             RecordOptions::new()
                 .with_all(true)

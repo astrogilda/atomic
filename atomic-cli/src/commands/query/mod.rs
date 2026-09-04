@@ -1558,9 +1558,12 @@ mod enrich_tests {
         repo.init_kg().unwrap();
 
         std::fs::write(temp.path().join("lesson.txt"), "durable fact\n").unwrap();
-        repo.add("lesson.txt", Default::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "lesson.txt", Default::default())
+            .unwrap();
         let outcome = repo
             .record(
+                working_copy,
                 ChangeHeader::builder()
                     .message("Agent-authored change")
                     .build(),

@@ -40,7 +40,7 @@ fn assert_injected_destination_error(error: &RepositoryError, change_id: NodeId)
 }
 
 fn assert_full_materialize_is_fail_closed(
-    materialize: impl FnOnce(&Repository) -> Result<MaterializeResult, RepositoryError>,
+    materialize: impl FnOnce(&TestRepository) -> Result<MaterializeResult, RepositoryError>,
 ) {
     let (temp, repo) = create_temp_repo();
     let good = temp.path().join(GOOD_PATH);
@@ -131,7 +131,7 @@ fn assert_full_materialize_is_fail_closed(
 
 #[test]
 fn sequential_full_materialize_preserves_working_copy_and_caches_on_graph_error() {
-    assert_full_materialize_is_fail_closed(Repository::materialize_sequential);
+    assert_full_materialize_is_fail_closed(|repo| repo.materialize_sequential());
 }
 
 #[test]

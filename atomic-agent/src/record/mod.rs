@@ -24,7 +24,7 @@
 //!     ├──▶ Build RecordOptions (all: true, view, provenance)
 //!     │
 //!     ▼
-//! repo.record(header, options)  ← repo diffs working copy vs pristine
+//! repo.record(working_copy, header, options)  ← repo diffs working copy vs pristine
 //!     │
 //!     ▼
 //! RecordOutcome { change, hash, stats }
@@ -114,9 +114,20 @@ fn build_turn_header(
 fn align_or_repair_session_view(
     repo: &mut atomic_repository::Repository,
     options: &TurnRecordOptions<'_>,
-) -> AgentResult<()> {
-    match repo.align_to_view(&options.session.view_name) {
-        Ok(()) => Ok(()),
+) -> AgentResult<atomic_core::WorkingCopyId> {
+    let working_copy =
+        repo.require_working_copy_id()
+            .map_err(|error| AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!(
+                    "Failed to resolve working-copy identity before aligning session view: {}",
+                    error
+                ),
+            })?;
+
+    match repo.align_to_view(working_copy, &options.session.view_name) {
+        Ok(()) => Ok(working_copy),
         Err(atomic_repository::RepositoryError::ViewNotFound { .. }) => {
             let parent = options
                 .session
@@ -148,7 +159,7 @@ fn align_or_repair_session_view(
                 }
             }
 
-            repo.align_to_view(&options.session.view_name)
+            repo.align_to_view(working_copy, &options.session.view_name)
                 .map_err(|error| AgentError::RecordFailed {
                     session_id: options.session.session_id.clone(),
                     turn_number: options.turn_number,
@@ -156,7 +167,8 @@ fn align_or_repair_session_view(
                         "Failed to align to session view '{}' after forking it: {}",
                         options.session.view_name, error
                     ),
-                })
+                })?;
+            Ok(working_copy)
         }
         Err(error) => Err(AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
@@ -204,23 +216,24 @@ pub fn record_turn(
         }
     })?;
 
-    // Preserve the read-only fast path for normal turns, but repair a missing
-    // non-sandbox session view before status tries to read through it. The
-    // former write-phase repair was unreachable in this case because status
-    // failed first with ViewNotFound.
-    let session_view_missing = !repo.is_sandbox()
-        && matches!(
-            repo.get_view_info(&options.session.view_name),
-            Err(atomic_repository::RepositoryError::ViewNotFound { .. })
-        );
-    if session_view_missing {
+    // Preserve the read-only fast path when the persisted desired view already
+    // matches the session. Non-sandbox recording intentionally targets the
+    // session view, so repair or align it before status. A provisioned sandbox's
+    // persistent working-copy record is authoritative and is never repointed here.
+    let session_view_needs_alignment = !repo.is_sandbox()
+        && (repo.current_view() != options.session.view_name
+            || matches!(
+                repo.get_view_info(&options.session.view_name),
+                Err(atomic_repository::RepositoryError::ViewNotFound { .. })
+            ));
+    if session_view_needs_alignment {
         drop(repo);
         let mut repair_repo =
             atomic_repository::Repository::open_existing(repo_root).map_err(|error| {
                 AgentError::RecordFailed {
                     session_id: options.session.session_id.clone(),
                     turn_number: options.turn_number,
-                    reason: format!("Failed to open repository for view repair: {}", error),
+                    reason: format!("Failed to open repository for view alignment: {}", error),
                 }
             })?;
         align_or_repair_session_view(&mut repair_repo, options)?;
@@ -229,15 +242,24 @@ pub fn record_turn(
             AgentError::RecordFailed {
                 session_id: options.session.session_id.clone(),
                 turn_number: options.turn_number,
-                reason: format!("Failed to reopen repository after view repair: {}", error),
+                reason: format!(
+                    "Failed to reopen repository after view alignment: {}",
+                    error
+                ),
             }
         })?;
     }
 
-    // `status()` reads current_view, while `record()` writes to session.view_name.
-    // Align the read-only handle before the first status check; this keeps the
-    // no-lock fast path and prevents direct callers from seeing false EmptyTurn.
-    repo.set_current_view_in_memory(&options.session.view_name);
+    let working_copy =
+        repo.require_working_copy_id()
+            .map_err(|error| AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!(
+                    "Failed to resolve working-copy identity for status: {}",
+                    error
+                ),
+            })?;
 
     // Step 2: Status — find out what the agent changed.
     // Include untracked files because agent turns commonly create new source,
@@ -245,7 +267,10 @@ pub fn record_turn(
     // turn produces an Atomic change with provenance instead of leaving files
     // untracked in the working copy.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast().with_untracked(true))
+        .status(
+            working_copy,
+            atomic_repository::status::StatusOptions::fast().with_untracked(true),
+        )
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
@@ -293,17 +318,23 @@ pub fn record_turn(
         }
     })?;
 
-    // Keep the write handle on the same view for post-add status and record.
-    // First turns may target a view that record/apply will create; other failures
-    // mean we cannot trust the detection/apply alignment.
-    //
-    // Sandboxes share the canonical .atomic: align_to_view would persist
-    // current_view and switch the real user's tree (same hazard as #99).
-    if repo.is_sandbox() {
-        repo.set_current_view_in_memory(&options.session.view_name);
+    // Re-resolve the identity for this newly opened handle. Non-sandbox turns
+    // intentionally target the session view, so verify that desired-view
+    // alignment again. Sandboxes retain the desired view registered by
+    // provision_sandbox and must not be repointed by the record hook.
+    let working_copy = if repo.is_sandbox() {
+        repo.require_working_copy_id()
+            .map_err(|error| AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: format!(
+                    "Failed to resolve sandbox working-copy identity for recording: {}",
+                    error
+                ),
+            })?
     } else {
-        align_or_repair_session_view(&mut repo, options)?;
-    }
+        align_or_repair_session_view(&mut repo, options)?
+    };
 
     if !untracked_paths.is_empty() {
         log::info!(
@@ -313,14 +344,14 @@ pub fn record_turn(
         );
 
         let untracked_refs: Vec<&str> = untracked_paths.iter().map(String::as_str).collect();
-        if let Err(e) = repo.add_batch(&untracked_refs) {
+        if let Err(e) = repo.add_batch(working_copy, &untracked_refs) {
             log::warn!(
                 "Failed to add untracked files as a batch: {} (falling back to per-file add)",
                 e
             );
             let tracking_options = atomic_repository::tracking::TrackingOptions::default();
             for path in &untracked_paths {
-                if let Err(e) = repo.add(path, tracking_options.clone()) {
+                if let Err(e) = repo.add(working_copy, path, tracking_options.clone()) {
                     log::warn!("Failed to add '{}': {} (skipping)", path, e);
                 }
             }
@@ -332,7 +363,10 @@ pub fn record_turn(
     // after add they become Added entries and are recordable.
     // No untracked walk needed — we already added untracked files above.
     let status = repo
-        .status(atomic_repository::status::StatusOptions::fast().with_untracked(false))
+        .status(
+            working_copy,
+            atomic_repository::status::StatusOptions::fast().with_untracked(false),
+        )
         .map_err(|e| AgentError::RecordFailed {
             session_id: options.session.session_id.clone(),
             turn_number: options.turn_number,
@@ -389,7 +423,7 @@ pub fn record_turn(
         .provenance(vec![provenance_entry])
         .metadata_bytes(envelope_bytes);
 
-    let mut outcome = match repo.record(header, record_options) {
+    let mut outcome = match repo.record(working_copy, header, record_options) {
         Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
             return Err(AgentError::EmptyTurn {

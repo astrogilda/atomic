@@ -61,29 +61,51 @@ impl TurnOrchestrator {
         // recorded each turn on `stop` leave a clean working copy here, so
         // `record_turn` returns `EmptyTurn` and this is a no-op for them.
         {
-            // Ensure the working copy is on the session's agent view before
-            // recording. session-start aligns to it, but that can drift back to
-            // the parent view by session end (observed with Cursor's CLI), which
-            // makes `record_turn` see a view mismatch and record nothing. Align
-            // explicitly so the agent's uncommitted files are recorded on the
-            // agent view. Best-effort — non-fatal if it can't switch.
-            // Doubles as the "is there a worktree to protect?" answer for the
-            // failed-flush guard below, which is why it is captured rather
-            // than discarded. See there.
+            // Ensure a non-sandbox working copy still desires the session's
+            // agent view before recording. session-start aligns it, but that can
+            // drift back to the parent view by session end (observed with
+            // Cursor's CLI). A provisioned sandbox's persisted desired view is
+            // authoritative, so adopt it instead of overwriting it.
+            //
+            // This also answers "is there a worktree to protect?" for the
+            // failed-flush guard below, which is why it is captured rather than
+            // discarded. See there.
             let has_worktree = match atomic_repository::Repository::open_existing(&self.repo_root) {
                 Ok(mut repo) => {
-                    if repo.current_view() != session.view_name {
-                        if let Err(e) = repo.align_to_view(&session.view_name) {
+                    if repo.is_sandbox() {
+                        let desired_view = repo.current_view().to_string();
+                        if desired_view != session.view_name {
                             log::warn!(
-                                "SessionEnd: could not align to agent view '{}': {} (non-fatal)",
+                                "SessionEnd: sandbox desired view '{}' differs from session view '{}'; adopting the persisted sandbox view",
+                                desired_view,
+                                session.view_name,
+                            );
+                            session.view_name = desired_view;
+                        }
+                    } else if repo.current_view() != session.view_name {
+                        let working_copy = repo.require_working_copy_id();
+                        match working_copy {
+                            Ok(working_copy) => {
+                                if let Err(e) =
+                                    repo.align_to_view(working_copy, &session.view_name)
+                                {
+                                    log::warn!(
+                                        "SessionEnd: could not align to agent view '{}': {} (non-fatal)",
+                                        session.view_name,
+                                        e,
+                                    );
+                                } else {
+                                    log::info!(
+                                        "SessionEnd: aligned working copy to agent view '{}' before flush",
+                                        session.view_name,
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "SessionEnd: could not resolve working-copy identity before aligning to agent view '{}': {} (non-fatal)",
                                 session.view_name,
                                 e,
-                            );
-                        } else {
-                            log::info!(
-                                "SessionEnd: aligned working copy to agent view '{}' before flush",
-                                session.view_name,
-                            );
+                            ),
                         }
                     }
                     true

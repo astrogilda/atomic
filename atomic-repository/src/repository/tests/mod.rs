@@ -2,6 +2,9 @@ use super::*;
 use crate::InsertOptions;
 use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::types::Base32;
+use atomic_core::WorkingCopyId;
+use std::ops::{Deref, DerefMut};
+use std::path::Path;
 
 use tempfile::TempDir;
 
@@ -29,13 +32,224 @@ mod tracking_tests;
 mod tree_projection_tests;
 mod verify_tests;
 mod view_tests;
+mod working_copy_identity_tests;
 
 // ── Shared Helpers ──────────────────────────────────────────────────────
 
-pub(super) fn create_temp_repo() -> (TempDir, Repository) {
+/// Test capability that binds a repository handle to its persistent working-copy ID.
+///
+/// Production APIs remain compile-time explicit; tests that use the shared fixture
+/// carry the capability in this wrapper instead of repeatedly rediscovering it.
+pub(super) struct TestRepository {
+    repo: Repository,
+    working_copy: WorkingCopyId,
+}
+
+#[allow(dead_code)]
+impl TestRepository {
+    fn new(repo: Repository) -> Self {
+        let working_copy = repo.require_working_copy_id().unwrap();
+        Self { repo, working_copy }
+    }
+
+    pub fn working_copy(&self) -> WorkingCopyId {
+        self.working_copy
+    }
+
+    pub fn add<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: TrackingOptions,
+    ) -> Result<TrackingStats, RepositoryError> {
+        self.repo.add(self.working_copy, path, options)
+    }
+
+    pub fn add_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+        self.repo.add_batch(self.working_copy, paths)
+    }
+
+    pub fn add_directory<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: TrackingOptions,
+    ) -> Result<TrackingStats, RepositoryError> {
+        self.repo.add_directory(self.working_copy, path, options)
+    }
+
+    pub fn remove<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: TrackingOptions,
+    ) -> Result<TrackingStats, RepositoryError> {
+        self.repo.remove(self.working_copy, path, options)
+    }
+
+    pub fn remove_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+        self.repo.remove_batch(self.working_copy, paths)
+    }
+
+    pub fn move_file<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        from: P,
+        to: Q,
+    ) -> Result<Inode, RepositoryError> {
+        self.repo.move_file(self.working_copy, from, to)
+    }
+
+    pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
+        self.repo.status(self.working_copy, options)
+    }
+
+    pub fn list_conflicts(
+        &self,
+    ) -> Result<Vec<(String, Vec<atomic_core::pristine::StoredConflict>)>, RepositoryError> {
+        self.repo.list_conflicts(self.working_copy)
+    }
+
+    pub fn status_quick(&self) -> Result<RepositoryStatus, RepositoryError> {
+        self.repo.status_quick(self.working_copy)
+    }
+
+    pub fn status_tracked(&self) -> Result<RepositoryStatus, RepositoryError> {
+        self.repo.status_tracked(self.working_copy)
+    }
+
+    pub fn is_working_copy_clean(&self) -> Result<bool, RepositoryError> {
+        self.repo.is_working_copy_clean(self.working_copy)
+    }
+
+    pub fn modified_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
+        self.repo.modified_files(self.working_copy)
+    }
+
+    pub fn untracked_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
+        self.repo.untracked_files(self.working_copy)
+    }
+
+    pub fn deleted_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
+        self.repo.deleted_files(self.working_copy)
+    }
+
+    pub fn record(
+        &self,
+        header: ChangeHeader,
+        options: RecordOptions,
+    ) -> Result<RecordOutcome, RecordError> {
+        self.repo.record(self.working_copy, header, options)
+    }
+
+    pub fn record_with_message(
+        &self,
+        message: impl Into<String>,
+        options: RecordOptions,
+    ) -> Result<RecordOutcome, RecordError> {
+        self.repo
+            .record_with_message(self.working_copy, message, options)
+    }
+
+    pub fn record_all(&self, message: impl Into<String>) -> Result<RecordOutcome, RecordError> {
+        self.repo.record_all(self.working_copy, message)
+    }
+
+    pub fn materialize(&self) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.materialize(self.working_copy)
+    }
+
+    pub fn materialize_sequential(&self) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.materialize_sequential(self.working_copy)
+    }
+
+    pub fn materialize_paths(
+        &self,
+        paths: std::collections::HashSet<String>,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.materialize_paths(self.working_copy, paths)
+    }
+
+    pub fn materialize_paths_sequential(
+        &self,
+        paths: std::collections::HashSet<String>,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.repo
+            .materialize_paths_sequential(self.working_copy, paths)
+    }
+
+    pub fn materialize_parallel(
+        &self,
+        paths: Option<std::collections::HashSet<String>>,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.materialize_parallel(self.working_copy, paths)
+    }
+
+    pub fn materialize_prefix(&self, prefix: &str) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.materialize_prefix(self.working_copy, prefix)
+    }
+
+    pub fn switch_view(&mut self, view: &str) -> Result<MaterializeResult, RepositoryError> {
+        self.repo.switch_view(self.working_copy, view)
+    }
+
+    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+        self.repo.set_current_view(self.working_copy, view)
+    }
+
+    pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+        self.repo.align_to_view(self.working_copy, view)
+    }
+
+    pub fn split_view(&mut self, options: SplitOptions) -> Result<SplitOutcome, RepositoryError> {
+        self.repo.split_view(self.working_copy, options)
+    }
+
+    pub fn verify_working_copy(&self) -> Result<VerifyReport, RepositoryError> {
+        self.repo.verify_working_copy(self.working_copy)
+    }
+
+    pub fn first_working_copy_conflict_marker(
+        &self,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
+        self.repo
+            .first_working_copy_conflict_marker(self.working_copy)
+    }
+
+    pub fn reindex_working_copy(&self) -> Result<usize, RepositoryError> {
+        self.repo.reindex_working_copy(self.working_copy)
+    }
+
+    pub fn del_file_index(&self, path: &str) -> Result<(), RepositoryError> {
+        self.repo.del_file_index(self.working_copy, path)
+    }
+
+    pub fn del_file_index_batch(&self, paths: &[&str]) -> Result<(), RepositoryError> {
+        self.repo.del_file_index_batch(self.working_copy, paths)
+    }
+
+    pub fn update_file_index(
+        &self,
+        files: &[(String, i64, u32, u64, Hash)],
+    ) -> Result<(), RepositoryError> {
+        self.repo.update_file_index(self.working_copy, files)
+    }
+}
+
+impl Deref for TestRepository {
+    type Target = Repository;
+
+    fn deref(&self) -> &Self::Target {
+        &self.repo
+    }
+}
+
+impl DerefMut for TestRepository {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.repo
+    }
+}
+
+pub(super) fn create_temp_repo() -> (TempDir, TestRepository) {
     let temp_dir = TempDir::new().unwrap();
     let repo = Repository::init(temp_dir.path()).unwrap();
-    (temp_dir, repo)
+    (temp_dir, TestRepository::new(repo))
 }
 
 /// Create a simple test change with the given message.

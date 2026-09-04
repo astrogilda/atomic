@@ -24,7 +24,7 @@ use crate::pristine::path_claim::tree_bijection_error;
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
     FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, StoredConflict, TreeTxnT,
-    ViewScope, ViewState, ViewTxnT,
+    ViewScope, ViewState, ViewTxnT, WorkingCopyTxnT,
 };
 
 use super::helpers::{
@@ -904,6 +904,7 @@ mod tree;
 mod triples;
 mod vault;
 mod view;
+mod working_copy;
 
 #[cfg(test)]
 mod tests;
@@ -1422,6 +1423,19 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             return Err(PristineError::ViewHasChildren {
                 name: view.name.clone(),
                 children: child_names,
+            });
+        }
+
+        let mut working_copy_ids = WorkingCopyTxnT::list_working_copies(self)?
+            .into_iter()
+            .filter(|record| record.desired_view == view.id)
+            .map(|record| record.id.to_string())
+            .collect::<Vec<_>>();
+        if !working_copy_ids.is_empty() {
+            working_copy_ids.sort();
+            return Err(PristineError::ViewHasWorkingCopies {
+                name: view.name.clone(),
+                working_copy_ids,
             });
         }
 

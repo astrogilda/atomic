@@ -172,12 +172,14 @@ pub use path_claim::{
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
-    CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata,
-    GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT,
-    MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, PathClaimMutTxnT, PathClaimTxnT,
-    StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
-    VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState,
-    ViewTxnT,
+    decode_working_copy_record, encode_working_copy_record, CrdtTxnT, EmbeddingsMutTxnT,
+    EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GitShaIndexMutTxnT, GitShaIndexTxnT,
+    GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes,
+    NativeDerivedIndexesMutTxnT, PathClaimMutTxnT, PathClaimTxnT, StoredConflict,
+    StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
+    VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
+    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
+    WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

@@ -33,6 +33,9 @@ redb.workspace = true
 # Time
 chrono.workspace = true
 
+# IDs
+ulid.workspace = true
+
 # Utilities
 thiserror.workspace = true
 anyhow.workspace = true

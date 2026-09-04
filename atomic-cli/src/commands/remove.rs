@@ -235,6 +235,9 @@ impl Command for Remove {
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         let options = self.to_tracking_options();
         let action = self.format_action();
@@ -266,7 +269,7 @@ impl Command for Remove {
             }
 
             // Remove from tracking
-            match repo.remove(&normalized, options.clone()) {
+            match repo.remove(working_copy, &normalized, options.clone()) {
                 Ok(stats) => {
                     total_removed += stats.files_removed;
 

@@ -16,6 +16,7 @@ use std::collections::HashSet;
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         header,
         RecordOptions::new()
             .with_all(true)
@@ -62,7 +63,7 @@ fn describe_op(op: &GraphOp<Option<Hash>>) -> String {
 
 /// Build: base 5-line file on dev, whole-file delete recorded on feature.
 /// Returns (tempdir, repo, delete-change hash, op descriptions).
-fn record_whole_file_delete() -> (TempDir, Repository, Hash, Vec<String>) {
+fn record_whole_file_delete() -> (TempDir, TestRepository, Hash, Vec<String>) {
     let (temp, mut repo) = create_temp_repo();
     let file = temp.path().join("f.txt");
 
@@ -226,7 +227,7 @@ enum MaterializeMode {
     Prefix,
 }
 
-fn materialize_path(repo: &Repository, path: &str, mode: MaterializeMode) -> MaterializeResult {
+fn materialize_path(repo: &TestRepository, path: &str, mode: MaterializeMode) -> MaterializeResult {
     match mode {
         MaterializeMode::Parallel => repo.materialize().unwrap(),
         MaterializeMode::Sequential => repo.materialize_sequential().unwrap(),

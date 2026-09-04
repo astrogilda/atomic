@@ -274,9 +274,12 @@ impl Command for Diff {
         }
 
         // Get status to find modified files
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let status_options = StatusOptions::default();
         let status = repo
-            .status(status_options)
+            .status(working_copy, status_options)
             .map_err(|e| CliError::Internal(e.into()))?;
 
         // Collect files to diff

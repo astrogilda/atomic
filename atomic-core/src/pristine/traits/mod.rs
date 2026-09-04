@@ -34,6 +34,7 @@ mod triples;
 mod vault;
 mod vertex_ext;
 mod view;
+mod working_copy;
 
 #[cfg(test)]
 mod tests;
@@ -52,4 +53,8 @@ pub use vertex_ext::VertexExt;
 pub use view::{
     GraphVisibilityClosure, StoredConflict, StoredConflictKind, ViewMembershipSet, ViewScope,
     ViewState, ViewTxnT,
+};
+pub use working_copy::{
+    decode_working_copy_record, encode_working_copy_record, WorkingCopyMutTxnT, WorkingCopyRecord,
+    WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE, WORKING_COPY_RECORD_VERSION,
 };

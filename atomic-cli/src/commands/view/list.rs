@@ -238,7 +238,12 @@ impl Command for List {
 
         // Get list of views
         let views = repo.list_views().map_err(CliError::Repository)?;
-        let current = repo.current_view();
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let current = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         if views.is_empty() {
             println!(
@@ -478,7 +483,8 @@ mod tests {
         {
             let mut repo = Repository::init(repo_path).unwrap();
             repo.create_view("feature").unwrap();
-            repo.align_to_view("feature").unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.align_to_view(working_copy, "feature").unwrap();
         }
 
         // Change to the repo directory

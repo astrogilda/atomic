@@ -37,6 +37,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - The validated physical working-copy identity
     /// * `header` - The change header (message, author, etc.)
     /// * `options` - Options controlling recording behavior
     ///
@@ -64,14 +65,33 @@ impl Repository {
     ///     .author(Author::new("Alice", Some("alice@example.com")))
     ///     .build();
     ///
-    /// let result = repo.record(header, RecordOptions::default())?;
+    /// let result = repo.record(working_copy, header, RecordOptions::default())?;
     /// println!("Created change: {}", result.hash().to_base32());
     /// ```
     pub fn record(
         &self,
+        working_copy: WorkingCopyId,
         header: ChangeHeader,
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
+        self.validate_working_copy(working_copy)
+            .map_err(RecordError::Repository)?;
+        let desired_view = self
+            .desired_view_name(working_copy)
+            .map_err(RecordError::Repository)?;
+        let effective_view = options
+            .get_view()
+            .map(str::to_owned)
+            .unwrap_or_else(|| desired_view.clone());
+        if effective_view != desired_view {
+            return Err(RecordError::Repository(RepositoryError::InvalidOperation {
+                message: format!(
+                    "record view '{}' does not match working copy {} desired view '{}'",
+                    effective_view, working_copy, desired_view
+                ),
+            }));
+        }
+
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         use atomic_core::output::{FileSystem, Memory};
         use atomic_core::record::workflow::{
@@ -92,6 +112,7 @@ impl Repository {
         }
         let status = self
             .status_for_record(
+                working_copy,
                 status_options,
                 options.get_detect_raw_renames(),
                 options.get_include_untracked(),
@@ -172,13 +193,12 @@ impl Repository {
             .pristine
             .read_txn()
             .map_err(|e| RecordError::Database(e.to_string()))?;
-        let view_name_for_filter = options.get_view().unwrap_or(&self.current_view);
         let view = shared_txn
-            .get_view(view_name_for_filter)
+            .get_view(&effective_view)
             .map_err(|e| RecordError::Database(e.to_string()))?
             .ok_or_else(|| {
                 RecordError::Repository(RepositoryError::ViewNotFound {
-                    name: view_name_for_filter.to_string(),
+                    name: effective_view.clone(),
                 })
             })?;
         let shared_graph_visibility =
@@ -221,6 +241,7 @@ impl Repository {
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
         let move_planning = plan_file_moves(
+            working_copy,
             &shared_txn,
             &shared_cached_txn,
             &self.change_store,
@@ -295,7 +316,7 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
-        let working_copy = FileSystem::from_root(&self.root);
+        let filesystem_working_copy = FileSystem::from_root(&self.root);
         for planned in planned_moves {
             let (trunk, branches) =
                 existing_crdt_identity(&shared_txn, planned.inode, &shared_graph_visibility)?;
@@ -303,7 +324,7 @@ impl Repository {
                 .with_inode(planned.inode)
                 .with_position(planned.claimant);
             let recorded = record_moved_file(
-                &working_copy,
+                &filesystem_working_copy,
                 &detected,
                 &planned.old_content,
                 None,
@@ -840,7 +861,7 @@ impl Repository {
                     atomic_core::record::workflow::DetectedFile::modified(path.as_str());
                 detected.inode = Some(file_inode);
                 detected.position = Some(file_position);
-                let working_copy = FileSystem::from_root(&self.root);
+                let filesystem_working_copy = FileSystem::from_root(&self.root);
                 let file_options = if had_fork_structure {
                     if conflicted_paths.contains(path.as_str()) {
                         // The fork is a surfaced conflict this record is
@@ -866,7 +887,7 @@ impl Repository {
                     core_options.clone()
                 };
                 match record_modified_file(
-                    &working_copy,
+                    &filesystem_working_copy,
                     &detected,
                     &old_content,
                     crdt_old_content.as_deref(),
@@ -1076,14 +1097,13 @@ impl Repository {
         // the TREE and INODES entries for FileAdd hunks, which is necessary
         // for the file to be recognized as tracked with graph content.
         if options.get_apply_after_record() && outcome.was_saved() {
-            let apply_opts = match options.get_view() {
-                Some(view) => InsertOptions::default().view(view),
-                None => InsertOptions::default(),
-            };
+            let apply_opts = InsertOptions::default().view(&effective_view);
             let apply_t0 = std::time::Instant::now();
             match self.write_recorded(&outcome, apply_opts) {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
+                    self.refresh_working_copy_desired_state(working_copy)
+                        .map_err(RecordError::Repository)?;
 
                     // Update file index for all recorded/added files.
                     // This snapshots the filesystem metadata + content hash AFTER
@@ -1106,7 +1126,8 @@ impl Repository {
                                 let content_hash = std::fs::read(&abs_path)
                                     .map(|bytes| Hash::of(&bytes))
                                     .unwrap_or(Hash::ZERO);
-                                let _ = idx_txn.put_file_index(
+                                let _ = idx_txn.put_working_copy_file_index(
+                                    working_copy,
                                     clean_path,
                                     duration.as_secs() as i64,
                                     duration.subsec_nanos(),
@@ -1137,7 +1158,8 @@ impl Repository {
                                 let content_hash = std::fs::read(&abs_path)
                                     .map(|bytes| Hash::of(&bytes))
                                     .unwrap_or(Hash::ZERO);
-                                let _ = idx_txn.put_file_index(
+                                let _ = idx_txn.put_working_copy_file_index(
+                                    working_copy,
                                     clean_path,
                                     duration.as_secs() as i64,
                                     duration.subsec_nanos(),
@@ -1150,16 +1172,15 @@ impl Repository {
                         // Remove FILE_INDEX entries for deleted and moved-from
                         // paths so stale source metadata cannot survive a rename.
                         for path_str in outcome.deleted_files() {
-                            let _ = idx_txn.del_file_index(path_str);
+                            let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
                         }
                         for path_str in &move_source_paths {
-                            let _ = idx_txn.del_file_index(path_str);
+                            let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
                         }
 
                         // Clear persisted conflict state for recorded files:
                         // recording without markers IS the resolution.
-                        let record_view =
-                            options.get_view().unwrap_or(&self.current_view).to_string();
+                        let record_view = effective_view.clone();
                         if let Ok(Some(view)) = idx_txn.get_view(&record_view) {
                             for path_str in outcome.recorded_files() {
                                 let clean_path =
@@ -1242,21 +1263,25 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - The validated physical working-copy identity
     /// * `message` - The change message
     /// * `options` - Recording options
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let result = repo.record_with_message("Fix bug", RecordOptions::default())?;
+    /// let result = repo.record_with_message(working_copy, "Fix bug", RecordOptions::default())?;
     /// ```
     pub fn record_with_message(
         &self,
+        working_copy: WorkingCopyId,
         message: impl Into<String>,
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
+        self.validate_working_copy(working_copy)
+            .map_err(RecordError::Repository)?;
         let header = ChangeHeader::builder().message(message).build();
-        self.record(header, options)
+        self.record(working_copy, header, options)
     }
 
     /// Fast path for external importers (e.g. git-import) that already have
@@ -1265,6 +1290,7 @@ impl Repository {
     /// Returns `(Change, Hash)`.
     pub fn assemble_and_hash(
         &self,
+        view_name: &str,
         header: ChangeHeader,
         recorded_files: &[atomic_core::record::workflow::RecordedFile],
     ) -> Result<(Change, Hash), RecordError> {
@@ -1279,11 +1305,11 @@ impl Repository {
             .map_err(|e| RecordError::Database(e.to_string()))?;
 
         let view = txn
-            .get_view(&self.current_view)
+            .get_view(view_name)
             .map_err(|e| RecordError::Database(e.to_string()))?
             .ok_or_else(|| {
                 RecordError::Repository(RepositoryError::ViewNotFound {
-                    name: self.current_view.clone(),
+                    name: view_name.to_string(),
                 })
             })?;
         let visibility = graph_visibility_closure(&txn, &view).map_err(RecordError::Repository)?;
@@ -1375,21 +1401,29 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - The validated physical working-copy identity
     /// * `message` - The change message
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let result = repo.record_all("Update all files")?;
+    /// let result = repo.record_all(working_copy, "Update all files")?;
     /// ```
-    pub fn record_all(&self, message: impl Into<String>) -> Result<RecordOutcome, RecordError> {
+    pub fn record_all(
+        &self,
+        working_copy: WorkingCopyId,
+        message: impl Into<String>,
+    ) -> Result<RecordOutcome, RecordError> {
+        self.validate_working_copy(working_copy)
+            .map_err(RecordError::Repository)?;
         let options = RecordOptions::new().with_all(true);
-        self.record_with_message(message, options)
+        self.record_with_message(working_copy, message, options)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn plan_file_moves(
+    _working_copy: WorkingCopyId,
     txn: &atomic_core::pristine::ReadTxn,
     cached: &CachedGraphTxn<'_>,
     store: &ChangeStore,

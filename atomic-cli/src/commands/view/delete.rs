@@ -121,8 +121,14 @@ impl Command for Delete {
             other => CliError::Repository(other),
         })?;
 
-        // Check if trying to delete the current view
-        if repo.current_view() == name {
+        // Check if trying to delete the working copy's desired view
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
+        if desired_view == name.as_str() {
             return Err(CliError::CannotDeleteCurrentView {
                 name: name.to_string(),
             });

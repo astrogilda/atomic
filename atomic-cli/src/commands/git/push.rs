@@ -86,14 +86,19 @@ impl Command for Push {
         // Find and open the Atomic repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Open the Git repository
         let git_repo = GitRepository::discover(&repo_root).map_err(|_| CliError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
         })?;
 
-        // Get current view name for trailers
-        let current_view = repo.current_view().to_string();
+        // Get the physical working copy's desired view name for trailers.
+        let current_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         // Serialize the shadow-commit pipeline (SPEC §4.3): acquire the
         // repo-scoped lock OUTERMOST, before any staging or git mutation. If

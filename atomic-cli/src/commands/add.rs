@@ -261,8 +261,11 @@ impl Add {
 
     /// Collect all untracked files in the repository.
     fn collect_untracked_files(&self, repo: &Repository) -> CliResult<Vec<PathBuf>> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
         Ok(status.untracked().map(|e| e.path().to_path_buf()).collect())
@@ -275,6 +278,10 @@ impl Add {
         path: &str,
         options: &TrackingOptions,
     ) -> CliResult<TrackingStats> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
+
         // Convert to PathBuf for the repository API
         let path_buf = PathBuf::from(path);
 
@@ -300,7 +307,7 @@ impl Add {
 
             // Use the dedicated directory tracking method
             return repo
-                .add_directory(&path_buf, options.clone())
+                .add_directory(working_copy, &path_buf, options.clone())
                 .map_err(|e| match e {
                     atomic_repository::RepositoryError::PathOutsideRepository { path } => {
                         CliError::PathOutsideRepository { path }
@@ -316,18 +323,19 @@ impl Add {
         }
 
         // Perform the standard add operation
-        repo.add(&path_buf, options.clone()).map_err(|e| match e {
-            atomic_repository::RepositoryError::PathOutsideRepository { path } => {
-                CliError::PathOutsideRepository { path }
-            }
-            atomic_repository::RepositoryError::FileAlreadyTracked { path } => {
-                CliError::FileAlreadyTracked { path }
-            }
-            atomic_repository::RepositoryError::PathIgnored { path } => {
-                CliError::PathIgnored { path }
-            }
-            other => CliError::Internal(other.into()),
-        })
+        repo.add(working_copy, &path_buf, options.clone())
+            .map_err(|e| match e {
+                atomic_repository::RepositoryError::PathOutsideRepository { path } => {
+                    CliError::PathOutsideRepository { path }
+                }
+                atomic_repository::RepositoryError::FileAlreadyTracked { path } => {
+                    CliError::FileAlreadyTracked { path }
+                }
+                atomic_repository::RepositoryError::PathIgnored { path } => {
+                    CliError::PathIgnored { path }
+                }
+                other => CliError::Internal(other.into()),
+            })
     }
 
     /// Print the results of adding files.
@@ -945,7 +953,9 @@ mod tests {
 
             // Create and add a file
             std::fs::write(repo_path.join("test.txt"), "Hello").unwrap();
-            repo.add("test.txt", TrackingOptions::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", TrackingOptions::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();

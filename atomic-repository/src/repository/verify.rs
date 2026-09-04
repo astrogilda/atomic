@@ -102,19 +102,24 @@ impl Repository {
     /// See the module docs for the two checks performed. Returns a
     /// [`VerifyReport`]; `report.is_healthy()` is `true` when no problems were
     /// found.
-    pub fn verify_working_copy(&self) -> Result<VerifyReport, RepositoryError> {
+    pub fn verify_working_copy(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<VerifyReport, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let desired_view = self.desired_view_name(working_copy)?;
         let mut report = VerifyReport::default();
 
         // One status pass classifies every path (Modified/Added/Deleted/
         // Conflicted/Untracked). Clean files are not emitted, so we treat
         // "absent from this map" as clean.
-        let status = self.status(StatusOptions::default())?;
+        let status = self.status(working_copy, StatusOptions::default())?;
         let mut status_by_path: HashMap<String, FileStatus> = HashMap::new();
         for e in status.entries() {
             status_by_path.insert(e.path().to_string_lossy().to_string(), e.status());
         }
 
-        let listed_conflicts = self.list_conflicts()?;
+        let listed_conflicts = self.list_conflicts(working_copy)?;
         let conflicted: std::collections::HashSet<String> = listed_conflicts
             .iter()
             .map(|(path, _)| path.clone())
@@ -131,7 +136,7 @@ impl Repository {
         report.conflicted_files = conflicted.len();
 
         // Files visible (tracked + recorded) on the current view.
-        let visible = self.visible_file_paths(&self.current_view)?;
+        let visible = self.visible_file_paths(&desired_view)?;
 
         for path in &visible {
             let st = status_by_path.get(path).copied();
@@ -151,7 +156,7 @@ impl Repository {
                 _ => {
                     let abs = self.root.join(path);
                     let disk = std::fs::read(&abs).ok();
-                    let graph = self.get_file_content_on_view(path, &self.current_view)?;
+                    let graph = self.get_file_content_on_view(path, &desired_view)?;
                     if let (Some(disk), Some(graph)) = (disk.as_ref(), graph.as_ref()) {
                         report.clean_files_checked += 1;
                         if disk != graph {

@@ -1,6 +1,8 @@
 //! Error types for repository operations
 
 use std::path::PathBuf;
+
+use atomic_core::WorkingCopyId;
 use thiserror::Error;
 
 use crate::remote::RemoteError;
@@ -58,6 +60,36 @@ pub enum RepositoryError {
     /// Working copy has uncommitted changes
     #[error("Working copy has uncommitted changes")]
     UncommittedChanges,
+
+    /// Persistent working-copy identity must be initialized by a writable open.
+    #[error(
+        "working-copy identity at '{}' requires writable migration: {reason}; rerun with a command that opens the repository for writing",
+        path.display()
+    )]
+    WorkingCopyMigrationRequired { path: PathBuf, reason: String },
+
+    /// A nonempty working-copy identity is corrupt and must not be replaced implicitly.
+    #[error("malformed working-copy identity at '{}': {reason}", path.display())]
+    MalformedWorkingCopyIdentity { path: PathBuf, reason: String },
+
+    /// The requested operation requires a registered physical working copy.
+    #[error("this repository handle has no registered physical working copy")]
+    WorkingCopyRequired,
+
+    /// No persistent record exists for the requested working-copy identity.
+    #[error("working-copy record not found: {id}")]
+    WorkingCopyRecordNotFound { id: WorkingCopyId },
+
+    /// The supplied identity does not identify this repository handle's working directory.
+    #[error("working-copy identity mismatch: requested {requested}, this directory uses {actual}")]
+    WorkingCopyIdentityMismatch {
+        requested: WorkingCopyId,
+        actual: WorkingCopyId,
+    },
+
+    /// The persistent identity is bound to a different canonical location.
+    #[error("working-copy identity {id} is bound to a different canonical location")]
+    WorkingCopyLocationMismatch { id: WorkingCopyId },
 
     /// File not found
     #[error("File not found: {path}")]
@@ -240,6 +272,8 @@ impl RepositoryError {
         matches!(
             self,
             RepositoryError::UncommittedChanges
+                | RepositoryError::WorkingCopyMigrationRequired { .. }
+                | RepositoryError::MalformedWorkingCopyIdentity { .. }
                 | RepositoryError::MergeConflict { .. }
                 | RepositoryError::FileNotTracked { .. }
                 | RepositoryError::MissingDependency { .. }

@@ -550,8 +550,14 @@ impl Command for Status {
                 Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {
                     reason: e.to_string(),
                 })?;
+            let working_copy =
+                rw_repo
+                    .require_working_copy_id()
+                    .map_err(|e| CliError::InvalidRepository {
+                        reason: e.to_string(),
+                    })?;
             let start = std::time::Instant::now();
-            match rw_repo.reindex_working_copy() {
+            match rw_repo.reindex_working_copy(working_copy) {
                 Ok(count) => {
                     print_info(&format!(
                         "Reindexed {} files in {:.1}s",
@@ -571,6 +577,11 @@ impl Command for Status {
             Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
                 reason: e.to_string(),
             })?;
+        let working_copy =
+            repo.require_working_copy_id()
+                .map_err(|e| CliError::InvalidRepository {
+                    reason: e.to_string(),
+                })?;
 
         // Debug ignore patterns if requested
         if self.debug_ignore {
@@ -582,7 +593,7 @@ impl Command for Status {
 
         // Compute status
         let status = repo
-            .status(options)
+            .status(working_copy, options)
             .map_err(|e| CliError::Internal(e.into()))?;
 
         // Print in appropriate format

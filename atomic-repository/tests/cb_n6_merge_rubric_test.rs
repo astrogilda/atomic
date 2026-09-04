@@ -5,13 +5,19 @@ use std::fs;
 use std::path::Path;
 
 use atomic_core::change::{ChangeHeader, GraphOp};
+use atomic_core::WorkingCopyId;
 use atomic_repository::{
     FileStatus, InsertOptions, RecordOptions, RecordOutcome, Repository, StatusOptions,
 };
 use tempfile::TempDir;
 
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
+
 fn record_all(repo: &Repository, message: &str) -> RecordOutcome {
     repo.record(
+        working_copy(repo),
         ChangeHeader::new(message),
         RecordOptions::new()
             .with_all(true)
@@ -22,7 +28,7 @@ fn record_all(repo: &Repository, message: &str) -> RecordOutcome {
 }
 
 fn conflicted_paths(repo: &Repository) -> BTreeSet<String> {
-    repo.status(StatusOptions::default())
+    repo.status(working_copy(repo), StatusOptions::default())
         .expect("status")
         .entries()
         .iter()
@@ -32,7 +38,7 @@ fn conflicted_paths(repo: &Repository) -> BTreeSet<String> {
 }
 
 fn listed_conflict_paths(repo: &Repository) -> BTreeSet<String> {
-    repo.list_conflicts()
+    repo.list_conflicts(working_copy(repo))
         .expect("list conflicts")
         .into_iter()
         .map(|(path, _)| path)
@@ -102,50 +108,58 @@ fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
     let mut repo = Repository::init(root).expect("init");
 
     fs::write(root.join("seed.txt"), b"seed\n").expect("write seed");
-    repo.add("seed.txt", Default::default()).expect("add seed");
+    repo.add(working_copy(&repo), "seed.txt", Default::default())
+        .expect("add seed");
     record_all(&repo, "base");
     for view in ["left", "right", "merge-lr", "merge-rl"] {
         repo.create_view_from(view, "dev")
             .unwrap_or_else(|error| panic!("create view '{view}': {error}"));
     }
 
-    repo.switch_view("left").expect("switch left");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch left");
     fs::write(&same, b"from-left\n").expect("write left claim");
-    repo.add("same.txt", Default::default())
+    repo.add(working_copy(&repo), "same.txt", Default::default())
         .expect("add left claim");
     let left = record_all(&repo, "left creates same path");
 
-    repo.switch_view("right").expect("switch right");
+    repo.switch_view(working_copy(&repo), "right")
+        .expect("switch right");
     fs::write(&same, b"from-right\n").expect("write right claim");
-    repo.add("same.txt", Default::default())
+    repo.add(working_copy(&repo), "same.txt", Default::default())
         .expect("add right claim");
     let right = record_all(&repo, "right creates same path");
 
-    repo.switch_view("merge-lr").expect("switch merge-lr");
+    repo.switch_view(working_copy(&repo), "merge-lr")
+        .expect("switch merge-lr");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right");
-    repo.materialize_sequential()
+    repo.materialize_sequential(working_copy(&repo))
         .expect("sequential materialize");
     let sequential = assert_same_path_conflict(&repo, &same);
     remove_if_present(&same);
-    repo.materialize().expect("parallel materialize");
+    repo.materialize(working_copy(&repo))
+        .expect("parallel materialize");
     assert_eq!(
         fs::read(&same).expect("read parallel conflict"),
         sequential,
         "sequential and parallel conflict rendering must be byte-identical"
     );
 
-    repo.switch_view("merge-rl").expect("switch merge-rl");
+    repo.switch_view(working_copy(&repo), "merge-rl")
+        .expect("switch merge-rl");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right first");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left second");
-    repo.materialize().expect("materialize reverse order");
+    repo.materialize(working_copy(&repo))
+        .expect("materialize reverse order");
     assert_same_path_conflict(&repo, &same);
 
-    repo.switch_view("merge-lr").expect("return to merge-lr");
+    repo.switch_view(working_copy(&repo), "merge-lr")
+        .expect("return to merge-lr");
     repo.create_view_from("unresolved-sibling", "merge-lr")
         .expect("fork unresolved sibling");
 
@@ -178,13 +192,14 @@ fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
     assert!(resolution.change().dependencies().contains(left.hash()));
     assert!(resolution.change().dependencies().contains(right.hash()));
 
-    repo.materialize_sequential()
+    repo.materialize_sequential(working_copy(&repo))
         .expect("materialize resolution");
     assert_eq!(fs::read(&same).expect("read resolution"), b"from-left\n");
     assert!(!conflicted_paths(&repo).contains("same.txt"));
     assert!(!listed_conflict_paths(&repo).contains("same.txt"));
     remove_if_present(&same);
-    repo.materialize().expect("rematerialize resolution");
+    repo.materialize(working_copy(&repo))
+        .expect("rematerialize resolution");
     assert_eq!(
         fs::read(&same).expect("read rematerialized resolution"),
         b"from-left\n"
@@ -193,7 +208,9 @@ fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
     drop(repo);
 
     let reopened = Repository::open(root).expect("reopen repository");
-    reopened.materialize().expect("materialize after reopen");
+    reopened
+        .materialize(working_copy(&reopened))
+        .expect("materialize after reopen");
     assert_eq!(fs::read(&same).expect("read after reopen"), b"from-left\n");
     assert!(!conflicted_paths(&reopened).contains("same.txt"));
     assert!(!listed_conflict_paths(&reopened).contains("same.txt"));
@@ -207,7 +224,7 @@ fn a11_retains_both_names_independent_of_insert_order_and_reopen() {
     let mut repo = Repository::init(root).expect("init");
 
     fs::write(&original, b"shared\n").expect("write base");
-    repo.add("original.txt", Default::default())
+    repo.add(working_copy(&repo), "original.txt", Default::default())
         .expect("add base");
     record_all(&repo, "base");
     for view in ["left", "right", "merge-lr", "merge-rl"] {
@@ -215,47 +232,57 @@ fn a11_retains_both_names_independent_of_insert_order_and_reopen() {
             .unwrap_or_else(|error| panic!("create view '{view}': {error}"));
     }
 
-    repo.switch_view("left").expect("switch left");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch left");
     fs::rename(&original, root.join("left.txt")).expect("rename left");
     let left = record_all(&repo, "rename left");
 
-    repo.switch_view("right").expect("switch right");
+    repo.switch_view(working_copy(&repo), "right")
+        .expect("switch right");
     fs::rename(&original, root.join("right.txt")).expect("rename right");
     let right = record_all(&repo, "rename right");
 
-    repo.switch_view("merge-lr").expect("switch merge-lr");
+    repo.switch_view(working_copy(&repo), "merge-lr")
+        .expect("switch merge-lr");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right");
-    repo.materialize_sequential()
+    repo.materialize_sequential(working_copy(&repo))
         .expect("sequential materialize");
     let expected = assert_rename_conflict(&repo, root);
     remove_if_present(&root.join("left.txt"));
     remove_if_present(&root.join("right.txt"));
-    repo.materialize().expect("parallel materialize");
+    repo.materialize(working_copy(&repo))
+        .expect("parallel materialize");
     assert_eq!(assert_rename_conflict(&repo, root), expected);
 
-    repo.switch_view("merge-rl").expect("switch merge-rl");
+    repo.switch_view(working_copy(&repo), "merge-rl")
+        .expect("switch merge-rl");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right first");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left second");
-    repo.materialize().expect("materialize reverse order");
+    repo.materialize(working_copy(&repo))
+        .expect("materialize reverse order");
     assert_eq!(
         assert_rename_conflict(&repo, root),
         expected,
         "neither insertion order may choose or discard a name"
     );
 
-    repo.switch_view("left").expect("switch source view");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch source view");
     assert!(root.join("left.txt").is_file());
-    repo.switch_view("merge-lr").expect("switch merged view");
+    repo.switch_view(working_copy(&repo), "merge-lr")
+        .expect("switch merged view");
     assert_eq!(assert_rename_conflict(&repo, root), expected);
     drop(repo);
 
     let reopened = Repository::open(root).expect("reopen repository");
-    reopened.materialize().expect("materialize after reopen");
+    reopened
+        .materialize(working_copy(&reopened))
+        .expect("materialize after reopen");
     assert_eq!(assert_rename_conflict(&reopened, root), expected);
 }
 
@@ -267,31 +294,36 @@ fn a12_unresolved_sibling_recovers_both_claimants_after_other_view_resolves() {
     let mut repo = Repository::init(root).expect("init");
 
     fs::write(root.join("seed.txt"), b"seed\n").expect("write seed");
-    repo.add("seed.txt", Default::default()).expect("add seed");
+    repo.add(working_copy(&repo), "seed.txt", Default::default())
+        .expect("add seed");
     record_all(&repo, "base");
     for view in ["left", "right", "merge"] {
         repo.create_view_from(view, "dev")
             .unwrap_or_else(|error| panic!("create view '{view}': {error}"));
     }
 
-    repo.switch_view("left").expect("switch left");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch left");
     fs::write(&same, b"from-left\n").expect("write left claim");
-    repo.add("same.txt", Default::default())
+    repo.add(working_copy(&repo), "same.txt", Default::default())
         .expect("add left claim");
     let left = record_all(&repo, "left creates same path");
 
-    repo.switch_view("right").expect("switch right");
+    repo.switch_view(working_copy(&repo), "right")
+        .expect("switch right");
     fs::write(&same, b"from-right\n").expect("write right claim");
-    repo.add("same.txt", Default::default())
+    repo.add(working_copy(&repo), "same.txt", Default::default())
         .expect("add right claim");
     let right = record_all(&repo, "right creates same path");
 
-    repo.switch_view("merge").expect("switch merge");
+    repo.switch_view(working_copy(&repo), "merge")
+        .expect("switch merge");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right");
-    repo.materialize().expect("materialize conflict");
+    repo.materialize(working_copy(&repo))
+        .expect("materialize conflict");
     assert_same_path_conflict(&repo, &same);
     repo.create_view_from("unresolved-sibling", "merge")
         .expect("fork unresolved sibling");
@@ -304,9 +336,10 @@ fn a12_unresolved_sibling_recovers_both_claimants_after_other_view_resolves() {
         .iter()
         .any(|operation| matches!(operation, GraphOp::SolveNameConflict { .. })));
 
-    repo.switch_view("unresolved-sibling")
+    repo.switch_view(working_copy(&repo), "unresolved-sibling")
         .expect("switch unresolved sibling");
-    repo.materialize().expect("materialize unresolved sibling");
+    repo.materialize(working_copy(&repo))
+        .expect("materialize unresolved sibling");
     assert_same_path_conflict(&repo, &same);
 }
 
@@ -318,7 +351,7 @@ fn a11_source_view_removes_foreign_rename_after_visiting_merged_view() {
     let mut repo = Repository::init(root).expect("init");
 
     fs::write(&original, b"shared\n").expect("write base");
-    repo.add("original.txt", Default::default())
+    repo.add(working_copy(&repo), "original.txt", Default::default())
         .expect("add base");
     record_all(&repo, "base");
     for view in ["left", "right", "merge"] {
@@ -326,23 +359,29 @@ fn a11_source_view_removes_foreign_rename_after_visiting_merged_view() {
             .unwrap_or_else(|error| panic!("create view '{view}': {error}"));
     }
 
-    repo.switch_view("left").expect("switch left");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch left");
     fs::rename(&original, root.join("left.txt")).expect("rename left");
     let left = record_all(&repo, "rename left");
-    repo.switch_view("right").expect("switch right");
+    repo.switch_view(working_copy(&repo), "right")
+        .expect("switch right");
     fs::rename(&original, root.join("right.txt")).expect("rename right");
     let right = record_all(&repo, "rename right");
 
-    repo.switch_view("merge").expect("switch merge");
+    repo.switch_view(working_copy(&repo), "merge")
+        .expect("switch merge");
     repo.insert_change(left.hash(), InsertOptions::default())
         .expect("insert left");
     repo.insert_change(right.hash(), InsertOptions::default())
         .expect("insert right");
-    repo.materialize().expect("materialize merge");
+    repo.materialize(working_copy(&repo))
+        .expect("materialize merge");
     assert_rename_conflict(&repo, root);
 
-    repo.switch_view("left").expect("switch source view");
-    repo.materialize().expect("rematerialize source view");
+    repo.switch_view(working_copy(&repo), "left")
+        .expect("switch source view");
+    repo.materialize(working_copy(&repo))
+        .expect("rematerialize source view");
     assert!(root.join("left.txt").is_file());
     assert!(
         !root.join("right.txt").exists(),

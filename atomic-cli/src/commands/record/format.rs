@@ -124,8 +124,11 @@ impl Record {
 
     /// Display dry run preview.
     pub(super) fn display_dry_run(&self, repo: &Repository) -> CliResult<()> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
         let status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(CliError::Repository)?;
 
         let mut has_changes = false;

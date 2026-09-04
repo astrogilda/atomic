@@ -258,10 +258,18 @@ impl Restore {
         path: &Path,
         status: FileStatus,
     ) -> CliResult<RestoreOutcome> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+
         if status == FileStatus::Added {
             // Undo the `add`: stop tracking, but keep the file on disk.
-            repo.remove(path, TrackingOptions::default().with_recursive(false))
-                .map_err(CliError::Repository)?;
+            repo.remove(
+                working_copy,
+                path,
+                TrackingOptions::default().with_recursive(false),
+            )
+            .map_err(CliError::Repository)?;
             return Ok(RestoreOutcome::Untracked);
         }
 
@@ -356,12 +364,15 @@ impl Command for Restore {
         }
 
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Compute status once. Restore only touches tracked files, so we skip
         // the untracked scan, and we reuse this single status for both the
         // safety guard and the file list (no second tree walk).
         let status = repo
-            .status(Self::status_options())
+            .status(working_copy, Self::status_options())
             .map_err(CliError::Repository)?;
 
         let has_changes = !status.is_clean();
@@ -688,10 +699,12 @@ mod tests {
     #[test]
     fn test_restore_modified_restores_pristine_content() {
         let (_dir, repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
-        repo.record_all("init").unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
+        repo.record_all(working_copy, "init").unwrap();
 
         // Local edit that we want to discard.
         fs::write(root.join(path), b"local edit\n").unwrap();
@@ -708,10 +721,12 @@ mod tests {
     #[test]
     fn test_restore_deleted_restores_file_from_pristine() {
         let (_dir, repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
-        repo.record_all("init").unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
+        repo.record_all(working_copy, "init").unwrap();
 
         // Delete it on disk; restore should bring it back.
         fs::remove_file(root.join(path)).unwrap();
@@ -730,15 +745,19 @@ mod tests {
     #[test]
     fn test_restore_added_untracks_but_keeps_file_on_disk() {
         let (_dir, repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("new.txt");
         fs::write(root.join(path), b"brand new\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
         // Deliberately NOT recorded → status is `Added`.
 
         let cmd = Restore::new().with_files(vec!["new.txt".to_string()]);
 
         // Before: status reports it as a pending Added change.
-        let before = repo.status(Restore::status_options()).unwrap();
+        let before = repo
+            .status(working_copy, Restore::status_options())
+            .unwrap();
         let listed = cmd.files_to_restore(&before);
         assert!(listed
             .iter()
@@ -755,7 +774,9 @@ mod tests {
 
         // ...and status no longer reports a pending change for it, so the
         // status hint is no longer lying.
-        let after = repo.status(Restore::status_options()).unwrap();
+        let after = repo
+            .status(working_copy, Restore::status_options())
+            .unwrap();
         let still_listed = cmd.files_to_restore(&after);
         assert!(!still_listed.iter().any(|(p, _)| p.as_path() == path));
     }

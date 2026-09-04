@@ -1801,7 +1801,7 @@ impl Repository {
             );
         }
 
-        let affected_tree_paths = self.apply_tree_projection(
+        let _affected_tree_paths = self.apply_tree_projection(
             &mut txn,
             &tree_projection,
             view_name,
@@ -1829,22 +1829,6 @@ impl Repository {
             );
         } else {
             log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
-        }
-
-        if view_name == self.current_view {
-            // Remove the stale source of each applied FileMove. TREE was
-            // repointed old→new above, so materialize will write the new path
-            // but never deletes the old one. Only remove when the old path is
-            // truly untracked on this view now (guards an A12-style shared path).
-            for old_path in &affected_tree_paths {
-                if matches!(self.get_file_inode(old_path), Ok(None)) {
-                    let abs = self.root.join(old_path);
-                    if abs.is_file() {
-                        let _ = std::fs::remove_file(&abs);
-                    }
-                    let _ = self.del_file_index(old_path);
-                }
-            }
         }
 
         if trace_insert {

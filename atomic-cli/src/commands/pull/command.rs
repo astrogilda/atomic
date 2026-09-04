@@ -488,14 +488,20 @@ impl Pull {
     async fn run_async(&self, repo_root: PathBuf) -> CliResult<()> {
         // Open repository after the synchronous command boundary has guarded it.
         let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
-        // Determine views. The remote view defaults to the current view; the
-        // local view defaults to the remote view being pulled, so
+        // Determine views. The remote view defaults to the working copy's desired
+        // view; the local view defaults to the remote view being pulled, so
         // `atomic pull --from-view X` pulls into a local view named `X`.
-        let remote_view = self.get_remote_view(repo.current_view());
+        let remote_view = self.get_remote_view(&desired_view);
         let local_view = self.get_local_view(&remote_view);
 
         // Whether the local target view already exists. Creation is deferred
@@ -839,9 +845,9 @@ impl Pull {
         // files.
         let mut materialize_failed = false;
         if stats.has_applied() {
-            if local_view == repo.current_view() {
+            if local_view == desired_view {
                 let mat_spinner = create_spinner("Updating working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         finish_success(
                             &mat_spinner,

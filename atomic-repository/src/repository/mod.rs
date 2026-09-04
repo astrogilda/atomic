@@ -51,7 +51,7 @@ use atomic_core::pristine::{
     ViewTxnT,
 };
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
-use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position};
+use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position, WorkingCopyId};
 
 use crate::archive::{
     Archive, ArchiveEntry, ArchiveManifest, ArchiveOptions, ArchiveOutcome, DirectoryArchive,
@@ -90,6 +90,7 @@ mod semantic_materialize;
 mod split;
 mod switch;
 mod views;
+mod working_copy;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
@@ -305,10 +306,6 @@ default = "{}"
         );
         std::fs::write(&config_path, initial_config)?;
 
-        // Create working copy ID file
-        let wc_id_path = dot_dir.join("working_copy_id");
-        std::fs::write(&wc_id_path, "")?;
-
         // Initialize the pristine database (redb creates the file)
         let pristine = Arc::new(
             Pristine::open(dot_dir.join("pristine.redb"))
@@ -327,6 +324,11 @@ default = "{}"
         }
         ensure_workspace_dir(&dot_dir, view_name)?;
 
+        // Persist the working-copy record before publishing compatibility files.
+        let layout = working_copy::discover_layout(&root)?;
+        let (_working_copy_id, current_view) =
+            working_copy::migrate_identity(&pristine, &layout, view_name)?;
+
         // Initialize the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -334,16 +336,11 @@ default = "{}"
         let repository = Self {
             root,
             dot_dir,
-            current_view: view_name.to_string(),
+            current_view,
             pristine,
             change_store,
             is_sandbox: false,
         };
-
-        // Persist the current-view pointer so reopening resolves this view.
-        // `read_current_view` only falls back to `DEFAULT_STACK` ("dev") when
-        // the pointer file is absent, so a custom initial view must be written.
-        repository.write_current_view(view_name)?;
 
         Ok(repository)
     }
@@ -364,25 +361,34 @@ default = "{}"
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
-        let dot_dir = root.join(DOT_DIR);
 
-        // Read the current view and open the change store before the pristine:
-        // an existing database may require repository-level PATH_CLAIMS replay.
-        let current_view =
-            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        let mut layout = working_copy::discover_layout(path.as_ref())?;
+        working_copy::ensure_repository_pointer(&layout)?;
+        layout.pointer_needs_write = false;
+        let root = layout.working_root.clone();
+        let dot_dir = layout.common_dot_dir.clone();
+
+        // PATH_CLAIMS migration still needs a view name. Prefer an existing
+        // working-copy record; consult legacy compatibility files only when no
+        // record owns this canonical location yet.
+        let legacy_view =
+            Self::read_legacy_current_view(&layout.working_copy_dot_dir, &layout.common_dot_dir)?;
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let pristine_path = dot_dir.join("pristine.redb");
         let pristine =
             Pristine::open(&pristine_path).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let migration_view =
+            working_copy::registered_view_name(&pristine, &layout)?.unwrap_or(legacy_view);
         let pristine = migration::migrate_path_claims_if_required(
             &pristine_path,
             pristine,
             &change_store,
-            &current_view,
+            &migration_view,
         )?;
+        let (_working_copy_id, current_view) =
+            working_copy::migrate_identity(&pristine, &layout, &migration_view)?;
         let pristine = Arc::new(pristine);
 
         let mut repository = Self {
@@ -394,6 +400,16 @@ default = "{}"
             is_sandbox: false,
         };
         repository.recover_pending_deferred_tree_alignment()?;
+
+        // Deferred TREE recovery is legacy code and may rewrite the compatibility
+        // pointer. Reassert the persistent record as the sole authority.
+        let (_id, authoritative_view) =
+            working_copy::load_registered_identity(&repository.pristine, &layout)?;
+        repository.current_view = authoritative_view.clone();
+        working_copy::write_current_view_compatibility(
+            &layout.working_copy_dot_dir,
+            &authoritative_view,
+        )?;
         Ok(repository)
     }
 
@@ -410,16 +426,16 @@ default = "{}"
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
-        let dot_dir = root.join(DOT_DIR);
+        let layout = working_copy::discover_layout(path.as_ref())?;
+        let root = layout.working_root.clone();
+        let dot_dir = layout.common_dot_dir.clone();
 
         let pristine = Arc::new(
             Pristine::open_existing(dot_dir.join("pristine.redb"))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
-
-        let current_view =
-            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        let (_working_copy_id, current_view) =
+            working_copy::load_registered_identity(&pristine, &layout)?;
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -433,6 +449,9 @@ default = "{}"
             is_sandbox: false,
         };
         repository.recover_pending_deferred_tree_alignment()?;
+        let (_id, authoritative_view) =
+            working_copy::load_registered_identity(&repository.pristine, &layout)?;
+        repository.current_view = authoritative_view;
         Ok(repository)
     }
 
@@ -470,18 +489,18 @@ default = "{}"
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
-        let dot_dir = root.join(DOT_DIR);
+        let layout = working_copy::discover_layout(path.as_ref())?;
+        let root = layout.working_root.clone();
+        let dot_dir = layout.common_dot_dir.clone();
 
-        // Open the pristine database in read-only mode
+        // Open the pristine database in read-only mode. Identity validation below
+        // performs no repair and reports a typed migration-required error.
         let pristine = Arc::new(
             Pristine::open_readonly(dot_dir.join("pristine.redb"))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
-
-        // Read current view from config or use default
-        let current_view =
-            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        let (_working_copy_id, current_view) =
+            working_copy::load_registered_identity(&pristine, &layout)?;
 
         // Open the change store without creating missing paths.
         let change_store =
@@ -577,11 +596,15 @@ default = "{}"
         path: P,
         pristine: Arc<Pristine>,
     ) -> Result<Self, RepositoryError> {
-        let root = Self::find_root(path.as_ref())?;
-        let dot_dir = root.join(DOT_DIR);
-
-        let current_view =
-            Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
+        let mut layout = working_copy::discover_layout(path.as_ref())?;
+        working_copy::ensure_repository_pointer(&layout)?;
+        layout.pointer_needs_write = false;
+        let root = layout.working_root.clone();
+        let dot_dir = layout.common_dot_dir.clone();
+        let initial_view =
+            Self::read_legacy_current_view(&layout.working_copy_dot_dir, &layout.common_dot_dir)?;
+        let (_working_copy_id, current_view) =
+            working_copy::migrate_identity(&pristine, &layout, &initial_view)?;
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -595,6 +618,13 @@ default = "{}"
             is_sandbox: false,
         };
         repository.recover_pending_deferred_tree_alignment()?;
+        let (_id, authoritative_view) =
+            working_copy::load_registered_identity(&repository.pristine, &layout)?;
+        repository.current_view = authoritative_view.clone();
+        working_copy::write_current_view_compatibility(
+            &layout.working_copy_dot_dir,
+            &authoritative_view,
+        )?;
         Ok(repository)
     }
 
@@ -607,36 +637,7 @@ default = "{}"
     /// The search stops at the user's home directory to prevent accidentally
     /// treating the entire home directory as a repository.
     pub fn find_root(start: &Path) -> Result<PathBuf, RepositoryError> {
-        let mut current = if start.is_file() {
-            start.parent().map(Path::to_path_buf)
-        } else {
-            Some(start.to_path_buf())
-        };
-
-        // Get the home directory to use as a boundary
-        let home_dir = dirs::home_dir();
-
-        while let Some(dir) = current {
-            // Stop searching if we've reached the home directory
-            // We don't want ~/.atomic/ (config dir) to be treated as a repository
-            if let Some(ref home) = home_dir {
-                if dir == *home {
-                    break;
-                }
-            }
-
-            let dot_dir = dir.join(DOT_DIR);
-            // Check that .atomic/ exists AND contains pristine.redb
-            // This distinguishes a repository from a config directory
-            if dot_dir.is_dir() && dot_dir.join("pristine.redb").exists() {
-                return Ok(dir);
-            }
-            current = dir.parent().map(Path::to_path_buf);
-        }
-
-        Err(RepositoryError::NotFound {
-            path: start.display().to_string(),
-        })
+        working_copy::discover_layout(start).map(|layout| layout.working_root)
     }
 
     // ── Path accessors ──────────────────────────────────────────────────
@@ -660,9 +661,9 @@ default = "{}"
     /// `.atomic` onto the working root would miss the real graph entirely.
     pub fn canonical_dot_dir<P: AsRef<Path>>(path: P) -> Result<PathBuf, RepositoryError> {
         if let Some((_working, canonical, _view)) = sandbox::detect_sandbox(path.as_ref()) {
-            return Ok(Self::find_root(&canonical)?.join(DOT_DIR));
+            return Ok(working_copy::discover_layout(&canonical)?.common_dot_dir);
         }
-        Ok(Self::find_root(path.as_ref())?.join(DOT_DIR))
+        Ok(working_copy::discover_layout(path.as_ref())?.common_dot_dir)
     }
 
     /// Get the repository root path.
@@ -734,7 +735,11 @@ default = "{}"
     ///
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
-    pub fn set_current_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+    pub fn set_current_view(
+        &mut self,
+        working_copy: WorkingCopyId,
+        view: &str,
+    ) -> Result<(), RepositoryError> {
         // Verify the view exists in the pristine database
         {
             let txn = self
@@ -753,6 +758,7 @@ default = "{}"
             }
         }
 
+        self.update_working_copy_desired_view(working_copy, view)?;
         self.write_current_view(view)?;
         self.current_view = view.to_string();
         Ok(())
@@ -781,7 +787,11 @@ default = "{}"
     ///
     /// Returns an error if the view does not exist or the pointer file
     /// cannot be written.
-    pub fn align_to_view(&mut self, view: &str) -> Result<(), RepositoryError> {
+    pub fn align_to_view(
+        &mut self,
+        working_copy: WorkingCopyId,
+        view: &str,
+    ) -> Result<(), RepositoryError> {
         let visibility = {
             let txn = self
                 .pristine
@@ -795,6 +805,18 @@ default = "{}"
                 })?;
             graph_visibility_closure(&txn, &view_state)?
         };
+        self.update_working_copy_desired_view(working_copy, view)?;
+
+        // Linked Git worktrees have local compatibility metadata but share the
+        // canonical pristine. The legacy deferred-TREE journal is common-dir
+        // scoped, so do not let it consult or publish another working copy's
+        // pointer in this construction-only slice.
+        if self.working_copy_dot_dir() != self.dot_dir {
+            self.write_current_view(view)?;
+            self.current_view = view.to_string();
+            return Ok(());
+        }
+
         self.align_deferred_tree_and_publish_view(view, &visibility)
             .map(|_| ())
     }
@@ -818,41 +840,46 @@ default = "{}"
         &self.pristine
     }
 
-    /// Read the current view from the config file.
+    /// Read the legacy compatibility pointer. Persistent working-copy records
+    /// are authoritative for all ordinary opens; this helper remains for native
+    /// repair and deferred-TREE compatibility paths.
     fn read_current_view(dot_dir: &Path) -> Result<String, RepositoryError> {
-        let current_path = dot_dir.join("current_view");
-        if current_path.exists() {
-            let content = std::fs::read_to_string(&current_path)?;
-            Ok(content.trim().to_string())
-        } else {
-            // Fall back to legacy path for backward compatibility
-            let legacy_path = dot_dir.join("current_stack");
-            if legacy_path.exists() {
-                let content = std::fs::read_to_string(&legacy_path)?;
-                Ok(content.trim().to_string())
-            } else {
-                Ok(DEFAULT_STACK.to_string())
-            }
-        }
+        Ok(Self::read_current_view_if_present(dot_dir)?
+            .unwrap_or_else(|| DEFAULT_STACK.to_string()))
     }
 
-    /// Write the current view to disk.
-    fn write_current_view(&self, view: &str) -> Result<(), RepositoryError> {
-        use std::io::Write;
+    fn read_current_view_if_present(dot_dir: &Path) -> Result<Option<String>, RepositoryError> {
+        for name in ["current_view", "current_stack"] {
+            let path = dot_dir.join(name);
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                let value = content.trim();
+                if !value.is_empty() {
+                    return Ok(Some(value.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
 
-        let current_path = self.dot_dir.join("current_view");
-        let mut temp = tempfile::NamedTempFile::new_in(&self.dot_dir)?;
-        temp.as_file_mut().write_all(view.as_bytes())?;
-        temp.as_file_mut().write_all(b"\n")?;
-        temp.as_file().sync_all()?;
-        temp.persist(&current_path).map_err(|error| {
-            RepositoryError::Io(std::io::Error::other(format!(
-                "failed to persist current view: {}",
-                error
-            )))
-        })?;
-        self.sync_dot_dir()?;
-        Ok(())
+    fn read_legacy_current_view(
+        working_copy_dot_dir: &Path,
+        common_dot_dir: &Path,
+    ) -> Result<String, RepositoryError> {
+        if let Some(view) = Self::read_current_view_if_present(working_copy_dot_dir)? {
+            return Ok(view);
+        }
+        if working_copy_dot_dir != common_dot_dir {
+            if let Some(view) = Self::read_current_view_if_present(common_dot_dir)? {
+                return Ok(view);
+            }
+        }
+        Ok(DEFAULT_STACK.to_string())
+    }
+
+    /// Write the current view as a derived compatibility artifact.
+    fn write_current_view(&self, view: &str) -> Result<(), RepositoryError> {
+        working_copy::write_current_view_compatibility(&self.working_copy_dot_dir(), view)
     }
 
     /// Make prior atomic renames/removals in `.atomic` durable before a

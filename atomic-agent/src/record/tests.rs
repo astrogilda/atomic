@@ -1075,7 +1075,9 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
 
     {
         let repo = Repository::init(repo_root).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         repo.add(
+            working_copy,
             "main.go",
             atomic_repository::tracking::TrackingOptions::default(),
         )
@@ -1085,7 +1087,7 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
             .with_all(true)
             .save_to_store(true)
             .apply_after_record(true);
-        repo.record(header, options).unwrap();
+        repo.record(working_copy, header, options).unwrap();
     }
 
     // Session A: SessionStart properly forks its view from "dev" before any
@@ -1145,7 +1147,8 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
             .unwrap();
         repo.insert_from_view(CrossViewInsertOptions::new("session-b", "dev"))
             .unwrap();
-        repo.materialize().unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.materialize(working_copy).unwrap();
     }
 
     let repo = Repository::open_existing(repo_root).unwrap();

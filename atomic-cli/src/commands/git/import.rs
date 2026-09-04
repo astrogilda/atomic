@@ -35,6 +35,7 @@ use std::path::Path;
 use clap::Parser;
 use git2::{Repository as GitRepository, Sort};
 
+use atomic_core::types::WorkingCopyId;
 use atomic_repository::Repository;
 
 use super::parallel::{
@@ -657,7 +658,12 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?
         };
 
-        let original_view = repo.current_view().to_string();
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
+        let original_view = repo
+            .desired_view_name(working_copy)
+            .map_err(|e| CliError::Internal(e.into()))?;
         let preserve_current_view = repo_exists && self.incremental;
 
         if self.with_crdt {
@@ -701,7 +707,7 @@ impl Command for Import {
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&branch_name);
                 } else {
-                    repo.align_to_view(&branch_name)
+                    repo.align_to_view(working_copy, &branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
@@ -740,13 +746,13 @@ impl Command for Import {
             } else {
                 // Materialize the working copy from the graph
                 print_info("Materializing working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         print_info(&format!("Materialized {} files", result.files_written))
                     }
                     Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
                 }
-                reindex_working_copy(&repo);
+                reindex_working_copy(&repo, working_copy);
             }
 
             // Initialize .atomicignore + vault AFTER import + materialize.
@@ -757,6 +763,7 @@ impl Command for Import {
                     workdir,
                     self.kind.as_deref(),
                     self.no_vault,
+                    working_copy,
                 )?;
             }
 
@@ -807,7 +814,7 @@ impl Command for Import {
             } else {
                 // User-facing/new imports still publish the selected branch;
                 // materialization or reindexing below makes disk match it.
-                repo.align_to_view(&branch_name)
+                repo.align_to_view(working_copy, &branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
@@ -831,17 +838,17 @@ impl Command for Import {
                 ));
             } else if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
-                reindex_working_copy(&repo);
+                reindex_working_copy(&repo, working_copy);
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
                 print_info("Materializing working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         print_info(&format!("Materialized {} files", result.files_written))
                     }
                     Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
                 }
-                reindex_working_copy(&repo);
+                reindex_working_copy(&repo, working_copy);
             }
 
             // Initialize .atomicignore + vault AFTER import + materialize
@@ -851,6 +858,7 @@ impl Command for Import {
                     workdir,
                     self.kind.as_deref(),
                     self.no_vault,
+                    working_copy,
                 )?;
             }
 
@@ -904,7 +912,7 @@ impl Command for Import {
 /// authoritative Git checkout for the imported branch, so there is no reason
 /// to materialize the same content back out of Atomic. Indexing the tracked
 /// files makes the post-import `atomic status` baseline clean.
-fn reindex_working_copy(repo: &Repository) {
+fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     use atomic_core::types::Hash;
     use std::time::SystemTime;
 
@@ -932,7 +940,7 @@ fn reindex_working_copy(repo: &Repository) {
     }
 
     if !entries.is_empty() {
-        let _ = repo.update_file_index(&entries);
+        let _ = repo.update_file_index(working_copy, &entries);
     }
 }
 
@@ -948,6 +956,7 @@ fn init_atomicignore_and_vault(
     workdir: &std::path::Path,
     kind: Option<&str>,
     no_vault: bool,
+    working_copy: WorkingCopyId,
 ) -> CliResult<()> {
     // Step 1: .atomicignore
     {
@@ -971,6 +980,7 @@ fn init_atomicignore_and_vault(
         }
 
         let _ = repo.add(
+            working_copy,
             ".atomicignore",
             atomic_repository::TrackingOptions::default(),
         );
@@ -978,7 +988,7 @@ fn init_atomicignore_and_vault(
         let options = atomic_repository::RecordOptions::new()
             .add_path(".atomicignore")
             .detect_raw_renames(false);
-        match repo.record(header, options) {
+        match repo.record(working_copy, header, options) {
             Ok(_) => print_info("Recorded .atomicignore"),
             Err(atomic_repository::RecordError::NothingToRecord) => {}
             Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
@@ -995,17 +1005,24 @@ fn init_atomicignore_and_vault(
             print_info("Initialized vault at .vault/");
 
             // Add all vault files
-            fn add_dir_recursive(repo: &Repository, dir: &std::path::Path) {
+            fn add_dir_recursive(
+                repo: &Repository,
+                working_copy: WorkingCopyId,
+                dir: &std::path::Path,
+            ) {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            add_dir_recursive(repo, &path);
+                            add_dir_recursive(repo, working_copy, &path);
                         } else if path.is_file() {
                             if let Ok(rel) = path.strip_prefix(repo.root()) {
                                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                                let _ = repo
-                                    .add(&rel_str, atomic_repository::TrackingOptions::default());
+                                let _ = repo.add(
+                                    working_copy,
+                                    &rel_str,
+                                    atomic_repository::TrackingOptions::default(),
+                                );
                             }
                         }
                     }
@@ -1013,14 +1030,14 @@ fn init_atomicignore_and_vault(
             }
             let vault_dir = repo.vault_dir();
             if vault_dir.exists() {
-                add_dir_recursive(repo, &vault_dir);
+                add_dir_recursive(repo, working_copy, &vault_dir);
             }
 
             let header = atomic_core::change::ChangeHeader::new("Initialize vault");
             let options = atomic_repository::RecordOptions::new()
                 .add_path(".vault")
                 .detect_raw_renames(false);
-            match repo.record(header, options) {
+            match repo.record(working_copy, header, options) {
                 Ok(_) => print_info("Recorded vault defaults"),
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record vault files: {}", e),

@@ -525,11 +525,14 @@ impl Command for Init {
             }
             other => CliError::Repository(other),
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Create the initial view if it's different from the default
         if self.view != atomic_repository::DEFAULT_VIEW {
             repo.create_view(&self.view).map_err(CliError::Repository)?;
-            repo.align_to_view(&self.view)
+            repo.align_to_view(working_copy, &self.view)
                 .map_err(CliError::Repository)?;
         }
 
@@ -584,6 +587,7 @@ impl Command for Init {
 
             // Add and record .atomicignore
             let _ = repo.add(
+                working_copy,
                 ".atomicignore",
                 atomic_repository::TrackingOptions::default(),
             );
@@ -591,7 +595,7 @@ impl Command for Init {
             let options = atomic_repository::RecordOptions::new()
                 .add_path(".atomicignore")
                 .detect_raw_renames(false);
-            match repo.record(header, options) {
+            match repo.record(working_copy, header, options) {
                 Ok(_) => {}
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
@@ -616,7 +620,7 @@ impl Command for Init {
             let options = atomic_repository::RecordOptions::new()
                 .add_path(".vault")
                 .detect_raw_renames(false);
-            match repo.record(header, options) {
+            match repo.record(working_copy, header, options) {
                 Ok(outcome) => {
                     println!(
                         "Recorded vault defaults ({} files)",
@@ -643,6 +647,9 @@ impl Command for Init {
 
 /// Recursively add all files under a directory to Atomic tracking.
 fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliResult<()> {
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
     let entries = std::fs::read_dir(dir).map_err(CliError::Io)?;
     for entry in entries {
         let entry = entry.map_err(CliError::Io)?;
@@ -652,7 +659,11 @@ fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliRes
         } else if path.is_file() {
             if let Ok(rel) = path.strip_prefix(repo.root()) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                let _ = repo.add(&rel_str, atomic_repository::TrackingOptions::default());
+                let _ = repo.add(
+                    working_copy,
+                    &rel_str,
+                    atomic_repository::TrackingOptions::default(),
+                );
             }
         }
     }

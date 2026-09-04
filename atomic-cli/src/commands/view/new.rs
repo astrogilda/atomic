@@ -260,10 +260,16 @@ impl New {
         };
 
         // Resolve the parent view name → ID
-        let parent_name = self
-            .parent
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string());
+        let parent_name = match &self.parent {
+            Some(parent) => parent.clone(),
+            None => {
+                let working_copy = repo
+                    .require_working_copy_id()
+                    .map_err(CliError::Repository)?;
+                repo.desired_view_name(working_copy)
+                    .map_err(CliError::Repository)?
+            }
+        };
 
         let mut txn = repo
             .pristine()
@@ -301,7 +307,12 @@ impl New {
     /// Optionally switch to the new view and print hint.
     fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         if self.switch {
-            let result = repo.switch_view(name).map_err(CliError::Repository)?;
+            let working_copy = repo
+                .require_working_copy_id()
+                .map_err(CliError::Repository)?;
+            let result = repo
+                .switch_view(working_copy, name)
+                .map_err(CliError::Repository)?;
             print_success(&format!(
                 "Switched to view: {} ({} files updated)",
                 style_view(name),
@@ -406,6 +417,12 @@ impl Command for New {
             // No --from: create an empty Draft workspace parented on the
             // nearest Shared ancestor.  No changes are inherited — the
             // user inserts them explicitly.
+            let working_copy = repo
+                .require_working_copy_id()
+                .map_err(CliError::Repository)?;
+            let desired_view = repo
+                .desired_view_name(working_copy)
+                .map_err(CliError::Repository)?;
             repo.create_view(name).map_err(CliError::Repository)?;
 
             print_success(&format!(
@@ -413,8 +430,8 @@ impl Command for New {
                 style_view(name),
                 style_view(
                     &repo
-                        .nearest_shared_ancestor(repo.current_view())
-                        .unwrap_or_else(|_| repo.current_view().to_string())
+                        .nearest_shared_ancestor(&desired_view)
+                        .unwrap_or(desired_view)
                 ),
             ));
         }

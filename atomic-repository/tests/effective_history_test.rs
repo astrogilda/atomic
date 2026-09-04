@@ -13,11 +13,16 @@ use std::path::Path;
 use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewScope, ViewTxnT};
 use atomic_core::types::Hash;
+use atomic_core::WorkingCopyId;
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{
     graph_visibility_closure, MaterializedEntry, RecordOptions, Repository, StatusOptions,
 };
 use tempfile::TempDir;
+
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
 
 fn add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
     let path = repo_path.join(name);
@@ -25,7 +30,8 @@ fn add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
         fs::create_dir_all(parent).expect("create file parent");
     }
     fs::write(path, content).expect("write file");
-    repo.add(name, Default::default()).expect("add file");
+    repo.add(working_copy(repo), name, Default::default())
+        .expect("add file");
 }
 
 fn record(repo: &Repository, message: &str) -> Hash {
@@ -34,7 +40,7 @@ fn record(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("record")
         .hash()
 }
@@ -53,7 +59,8 @@ fn effective_history_includes_inherited_base_changes() {
 
     // Create a draft view parented on dev and switch to it.
     repo.create_view("feature").expect("create draft view");
-    repo.switch_view("feature").expect("switch to draft");
+    repo.switch_view(working_copy(&repo), "feature")
+        .expect("switch to draft");
 
     // Change B recorded on the draft.
     add_file(&repo, &repo_path, "b.txt", "B\n");
@@ -127,13 +134,15 @@ fn nested_draft_effective_history_and_content_include_all_parents() {
     let shared_view = repo.current_view().to_string();
     repo.create_view_from("parent", &shared_view)
         .expect("create parent draft");
-    repo.switch_view("parent").expect("switch to parent draft");
+    repo.switch_view(working_copy(&repo), "parent")
+        .expect("switch to parent draft");
     add_file(&repo, &repo_path, "parent.txt", "parent\n");
     let parent = record(&repo, "parent");
 
     repo.create_view_from("child", "parent")
         .expect("create nested child draft");
-    repo.switch_view("child").expect("switch to child draft");
+    repo.switch_view(working_copy(&repo), "child")
+        .expect("switch to child draft");
     add_file(&repo, &repo_path, "child.txt", "child\n");
     let child = record(&repo, "child");
 
@@ -204,7 +213,8 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
     // Build A → B → C on a sibling draft so the legacy view can directly
     // reference only C while retaining complete dependency metadata.
     repo.create_view("source").expect("create source view");
-    repo.switch_view("source").expect("switch source view");
+    repo.switch_view(working_copy(&repo), "source")
+        .expect("switch source view");
     add_file(&repo, &repo_path, "src/value.txt", "one\n");
     add_file(&repo, &repo_path, "outside.txt", "outside\n");
     let a = record(&repo, "A: add files");
@@ -246,7 +256,8 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
         assert_eq!(visibility.len(), 3);
     }
 
-    repo.set_current_view("legacy").unwrap();
+    repo.set_current_view(working_copy(&repo), "legacy")
+        .unwrap();
     assert_eq!(
         repo.visible_file_paths("legacy").unwrap(),
         HashSet::from(["src/value.txt".to_string(), "outside.txt".to_string()])
@@ -271,9 +282,9 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
         fs::write(repo_path.join("src/value.txt"), "stale\n").unwrap();
         fs::write(repo_path.join("outside.txt"), "stale outside\n").unwrap();
         if sequential {
-            repo.materialize_sequential().unwrap();
+            repo.materialize_sequential(working_copy(&repo)).unwrap();
         } else {
-            repo.materialize().unwrap();
+            repo.materialize(working_copy(&repo)).unwrap();
         }
         assert_eq!(
             fs::read(repo_path.join("src/value.txt")).unwrap(),
@@ -290,9 +301,10 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
         fs::write(repo_path.join("outside.txt"), "selected sentinel\n").unwrap();
         let paths = HashSet::from(["src/value.txt".to_string()]);
         if selected {
-            repo.materialize_paths_sequential(paths).unwrap();
+            repo.materialize_paths_sequential(working_copy(&repo), paths)
+                .unwrap();
         } else {
-            repo.materialize_paths(paths).unwrap();
+            repo.materialize_paths(working_copy(&repo), paths).unwrap();
         }
         assert_eq!(
             fs::read(repo_path.join("src/value.txt")).unwrap(),
@@ -306,7 +318,8 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
 
     fs::write(repo_path.join("src/value.txt"), "stale prefix\n").unwrap();
     fs::write(repo_path.join("outside.txt"), "prefix sentinel\n").unwrap();
-    repo.materialize_prefix("src/").unwrap();
+    repo.materialize_prefix(working_copy(&repo), "src/")
+        .unwrap();
     assert_eq!(
         fs::read(repo_path.join("src/value.txt")).unwrap(),
         b"three\n"
@@ -318,8 +331,11 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
 
     // Restore the full expected tree, then prove status and record old-content
     // retrieval share the same closure.
-    repo.materialize().unwrap();
-    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    repo.materialize(working_copy(&repo)).unwrap();
+    assert!(repo
+        .status(working_copy(&repo), StatusOptions::default())
+        .unwrap()
+        .is_clean());
     fs::write(repo_path.join("src/value.txt"), "four\n").unwrap();
     let d = record(&repo, "D: record from dependency-repaired baseline");
     assert_eq!(
@@ -338,12 +354,15 @@ fn omitted_direct_dependencies_are_visible_across_every_entry_point() {
         Some(b"two\n".to_vec()),
         "excluding a non-tip change must return its causal prefix, not re-add it"
     );
-    repo.materialize().unwrap();
+    repo.materialize(working_copy(&repo)).unwrap();
     assert_eq!(
         fs::read(repo_path.join("src/value.txt")).unwrap(),
         b"four\n"
     );
-    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    assert!(repo
+        .status(working_copy(&repo), StatusOptions::default())
+        .unwrap()
+        .is_clean());
 
     let effective: Vec<Hash> = repo
         .effective_history(Some("legacy"))
@@ -394,10 +413,12 @@ fn incomplete_dependency_index_fails_closed_before_traversal() {
     let guard = repo_path.join("guard.txt");
     fs::write(&guard, "must survive\n").unwrap();
     for error in [
-        repo.status(StatusOptions::default())
+        repo.status(working_copy(&repo), StatusOptions::default())
             .unwrap_err()
             .to_string(),
-        repo.materialize().unwrap_err().to_string(),
+        repo.materialize(working_copy(&repo))
+            .unwrap_err()
+            .to_string(),
         repo.get_file_content("guard.txt").unwrap_err().to_string(),
         repo.get_file_content_via_crdt("guard.txt")
             .unwrap_err()

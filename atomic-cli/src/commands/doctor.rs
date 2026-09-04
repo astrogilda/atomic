@@ -129,8 +129,11 @@ impl Command for Check {
         ));
 
         print_info("Verifying working-copy consistency against the graph...");
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| crate::error::CliError::Internal(e.into()))?;
         let report = repo
-            .verify_working_copy()
+            .verify_working_copy(working_copy)
             .map_err(|e| crate::error::CliError::Internal(e.into()))?;
 
         print_info(&format!(

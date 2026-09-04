@@ -6,6 +6,7 @@ use atomic_core::types::EdgeFlags;
 
 fn record_all(repo: &Repository, message: &str) -> RecordOutcome {
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         ChangeHeader::new(message),
         RecordOptions::new()
             .with_all(true)
@@ -199,7 +200,8 @@ fn directory_occupancy_survives_reopen_and_sibling_views() {
     drop(repo);
     let mut reopened = Repository::open(temp.path()).unwrap();
     assert!(directory_empty(&reopened, "box"));
-    reopened.switch_view("dev").unwrap();
+    let working_copy = reopened.require_working_copy_id().unwrap();
+    reopened.switch_view(working_copy, "dev").unwrap();
     assert!(directory_empty(&reopened, "box"));
 }
 

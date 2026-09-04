@@ -2409,6 +2409,9 @@ impl ParallelImporter {
         branch_name: &str,
         repo: &mut Repository,
     ) -> CliResult<ImportStats> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let mut stats = ImportStats::default();
 
         // Open git repo for this thread
@@ -2552,7 +2555,7 @@ impl ParallelImporter {
             let repo_root = repo.root().to_path_buf();
             for file in repo.list_tracked_files().unwrap_or_default() {
                 if !repo_root.join(&file.path).exists() {
-                    let _ = repo.del_file_index(&file.path.to_string_lossy());
+                    let _ = repo.del_file_index(working_copy, &file.path.to_string_lossy());
                 }
             }
             self.phase3_finalize(&stats)?;
@@ -2590,8 +2593,12 @@ impl ParallelImporter {
         for file in &tracked {
             let abs = repo_root.join(&file.path);
             if !abs.exists() {
-                let _ = repo.remove(&file.path, atomic_repository::TrackingOptions::forced());
-                let _ = repo.del_file_index(&file.path.to_string_lossy());
+                let _ = repo.remove(
+                    working_copy,
+                    &file.path,
+                    atomic_repository::TrackingOptions::forced(),
+                );
+                let _ = repo.del_file_index(working_copy, &file.path.to_string_lossy());
                 orphan_count += 1;
             }
         }
@@ -2604,7 +2611,7 @@ impl ParallelImporter {
 
         // Use status to find untracked files — it already handles
         // ignore rules and filesystem walking.
-        if let Ok(status) = repo.status(atomic_repository::StatusOptions::default()) {
+        if let Ok(status) = repo.status(working_copy, atomic_repository::StatusOptions::default()) {
             for entry in status.untracked() {
                 let path_str = entry.path().to_string_lossy().replace('\\', "/");
                 if self.path_ignored_for_import(&path_str) {
@@ -2612,7 +2619,11 @@ impl ParallelImporter {
                 }
 
                 // Add to tracking
-                let _ = repo.add(&path_str, atomic_repository::TrackingOptions::default());
+                let _ = repo.add(
+                    working_copy,
+                    &path_str,
+                    atomic_repository::TrackingOptions::default(),
+                );
 
                 // Collect FILE_INDEX entry
                 let abs = repo_root.join(entry.path());
@@ -2636,7 +2647,7 @@ impl ParallelImporter {
         }
 
         if !new_index_entries.is_empty() {
-            let _ = repo.update_file_index(&new_index_entries);
+            let _ = repo.update_file_index(working_copy, &new_index_entries);
         }
 
         if orphan_count > 0 || phantom_count > 0 {
@@ -2790,6 +2801,9 @@ impl ParallelImporter {
         commits: &[ParsedCommit],
         line_index: &mut ImportLineIndex,
     ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let mut stats = WriteStats::default();
         let mut imported_commits = Vec::new();
         let total = commits.len();
@@ -2896,7 +2910,7 @@ impl ParallelImporter {
         }
 
         if !index_entries.is_empty() {
-            let _ = repo.update_file_index(&index_entries);
+            let _ = repo.update_file_index(working_copy, &index_entries);
         }
 
         Ok((stats, imported_commits))
@@ -3054,6 +3068,9 @@ impl ParallelImporter {
             RecordedFile, RecordingOptions,
         };
 
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let commit_start = std::time::Instant::now();
 
         // Build change header
@@ -3172,7 +3189,7 @@ impl ParallelImporter {
             let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
             if !self.options.preserve_working_copy && !graph_deleted_paths.is_empty() {
                 let del_refs: Vec<&str> = graph_deleted_paths.iter().map(|s| s.as_str()).collect();
-                let _ = repo.del_file_index_batch(&del_refs);
+                let _ = repo.del_file_index_batch(working_copy, &del_refs);
             }
             return Ok(ImportedCommitInfo {
                 git_sha: parsed.git_sha.clone(),
@@ -3199,7 +3216,7 @@ impl ParallelImporter {
         }
         let step = std::time::Instant::now();
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
-            let _ = repo.add_batch(&added_paths);
+            let _ = repo.add_batch(working_copy, &added_paths);
         }
         let add_batch_ms = step.elapsed().as_millis();
 
@@ -3613,7 +3630,7 @@ impl ParallelImporter {
         if !self.options.preserve_working_copy && !deleted_paths.is_empty() {
             let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
-            let _ = repo.del_file_index_batch(&del_refs);
+            let _ = repo.del_file_index_batch(working_copy, &del_refs);
             let cleanup_ms = cleanup_start.elapsed().as_millis();
             trace_git_import(format!(
                 "write {} files={} recorded={} add_batch={}ms record={}ms assemble={}ms save={}ms apply={}ms direct_graph={}ms direct_crdt={}ms commit={}ms cleanup={}ms writer_total={}ms total={}ms",
@@ -4866,7 +4883,8 @@ mod tests {
 
         drop(reopened);
         let final_repo = Repository::open(temp.path()).unwrap();
-        final_repo.materialize().unwrap();
+        let working_copy = final_repo.require_working_copy_id().unwrap();
+        final_repo.materialize(working_copy).unwrap();
         assert_eq!(
             std::fs::read(temp.path().join("src/domain/model.rs")).unwrap(),
             b"git model\n"

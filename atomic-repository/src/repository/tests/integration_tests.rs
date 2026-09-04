@@ -1057,7 +1057,7 @@ fn shared_content_does_not_absorb_draft_edit_after_parent_update_roundtrip() {
     let tweak = b"app:\n  debug: true\ndatabase:\n  port: 5432\n";
     let shared_updated = b"app:\n  debug: false\ndatabase:\n  port: 5433\n";
     let tweak_updated = b"app:\n  debug: true\ndatabase:\n  port: 5433\n";
-    let record = |repo: &Repository, message: &str| {
+    let record = |repo: &TestRepository, message: &str| {
         repo.record(
             ChangeHeader::new(message),
             RecordOptions::new()
@@ -1117,13 +1117,13 @@ fn shared_content_does_not_absorb_draft_edit_after_parent_update_roundtrip() {
 #[test]
 fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
     let source_temp = TempDir::new().unwrap();
-    let source = Repository::init(source_temp.path()).unwrap();
+    let source = TestRepository::new(Repository::init(source_temp.path()).unwrap());
     let source_path = source_temp.path().join("config.yml");
     let base = b"app:\n  debug: false\ndatabase:\n  port: 5432\n";
     let draft = b"app:\n  debug: true\ndatabase:\n  port: 5432\n";
     let shared_updated = b"app:\n  debug: false\ndatabase:\n  port: 5433\n";
     let draft_updated = b"app:\n  debug: true\ndatabase:\n  port: 5433\n";
-    let record = |repo: &Repository, message: &str| {
+    let record = |repo: &TestRepository, message: &str| {
         repo.record(
             ChangeHeader::new(message),
             RecordOptions::new()
@@ -1141,7 +1141,7 @@ fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
     let base_change = record(&source, "imported base");
 
     let target_temp = TempDir::new().unwrap();
-    let mut target = Repository::init(target_temp.path()).unwrap();
+    let mut target = TestRepository::new(Repository::init(target_temp.path()).unwrap());
     target
         .write_import_graph_change(
             base_change.change().clone(),

@@ -178,12 +178,18 @@ impl Command for Switch {
             },
             other => CliError::Repository(other),
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         // A prior coordinated switch may have materialized this view but failed
         // before Git/checkpoint alignment. In an active shadow repo, retry the
         // projection even when Atomic already points at the requested view; do
         // not print a false success while Git evidence is still stale.
-        if repo.current_view() == name {
+        if desired_view == name.as_str() {
             let shadow_sync =
                 crate::commands::git::shadow::sync_git_head_to_view(&repo, &repo_root, name)?;
             if !shadow_sync.is_synchronized() {
@@ -199,7 +205,7 @@ impl Command for Switch {
         // Block switch if working copy has unrecorded changes
         if !self.force {
             let status = repo
-                .status(atomic_repository::StatusOptions::default())
+                .status(working_copy, atomic_repository::StatusOptions::default())
                 .map_err(CliError::Repository)?;
 
             if !status.is_clean() {
@@ -236,7 +242,7 @@ impl Command for Switch {
         // Switch to the view and update working copy
         let spinner = crate::output::create_spinner("Materializing files for view...");
 
-        let result = repo.switch_view(name).map_err(|e| match e {
+        let result = repo.switch_view(working_copy, name).map_err(|e| match e {
             atomic_repository::RepositoryError::ViewNotFound { name } => {
                 CliError::ViewNotFound { name }
             }
@@ -446,7 +452,9 @@ mod tests {
         std::fs::write(root.join("tracked.txt"), b"tracked\nparent advance\n").unwrap();
         {
             let repo = Repository::open(root).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
             repo.record(
+                working_copy,
                 atomic_core::change::ChangeHeader::new("advance shared parent"),
                 atomic_repository::RecordOptions::new(),
             )
@@ -488,11 +496,13 @@ mod tests {
             checkpoint.git_index_tree.as_deref(),
             Some(head_tree.as_str())
         );
-        assert!(Repository::open(root)
-            .unwrap()
-            .status(atomic_repository::StatusOptions::default())
+        let reopened = Repository::open(root).unwrap();
+        let working_copy = reopened.require_working_copy_id().unwrap();
+        assert!(reopened
+            .status(working_copy, atomic_repository::StatusOptions::default())
             .unwrap()
             .is_clean());
+        drop(reopened);
 
         // Revisiting a target whose tip already has the materialized tree must
         // reuse that tip rather than manufacturing another projection commit.
@@ -547,7 +557,9 @@ mod tests {
         .unwrap();
         {
             let repo = Repository::open(root).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
             repo.record(
+                working_copy,
                 atomic_core::change::ChangeHeader::new("record unresolved projection"),
                 atomic_repository::RecordOptions::new().allow_conflict_markers(true),
             )
@@ -584,7 +596,9 @@ mod tests {
         std::fs::write(root.join("tracked.txt"), b"resolved\n").unwrap();
         {
             let repo = Repository::open(root).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
             repo.record(
+                working_copy,
                 atomic_core::change::ChangeHeader::new("resolve projection"),
                 atomic_repository::RecordOptions::new(),
             )

@@ -630,10 +630,16 @@ impl Clone {
             return Ok(());
         }
 
-        // The scaffold may be the current view (init leaves it current),
-        // and the current view cannot be deleted — park on a temporary
+        // The scaffold may be the desired view (init leaves it current),
+        // and the desired view cannot be deleted — park on a temporary
         // root view first. It is removed again before clone finishes.
-        if repo.current_view() == manifest.name {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
+        if desired_view == manifest.name {
             if !repo
                 .view_exists(SCAFFOLD_PARK_VIEW)
                 .map_err(CliError::Repository)?
@@ -641,7 +647,7 @@ impl Clone {
                 repo.create_shared_view(SCAFFOLD_PARK_VIEW)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(SCAFFOLD_PARK_VIEW)
+            repo.align_to_view(working_copy, SCAFFOLD_PARK_VIEW)
                 .map_err(CliError::Repository)?;
         }
 
@@ -867,6 +873,9 @@ impl Clone {
             finish_error(&spinner, "Failed to initialize");
             CliError::Repository(e)
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
         finish_success(&spinner, "Repository initialized");
 
         // The requested view is NOT pre-created here: its manifest declares
@@ -930,7 +939,7 @@ impl Clone {
                 repo.create_shared_view(&self.view)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(&self.view)
+            repo.align_to_view(working_copy, &self.view)
                 .map_err(CliError::Repository)?;
 
             // Configure remote as "origin" even for empty repositories
@@ -1001,7 +1010,7 @@ impl Clone {
                 repo.create_shared_view(&self.view)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(&self.view)
+            repo.align_to_view(working_copy, &self.view)
                 .map_err(CliError::Repository)?;
 
             // Sidecars (provenance, attestations) still land in the store.
@@ -1065,7 +1074,7 @@ impl Clone {
 
             // Make the requested view current.
             if apply_errors.is_empty() {
-                if let Err(e) = repo.align_to_view(&self.view) {
+                if let Err(e) = repo.align_to_view(working_copy, &self.view) {
                     apply_errors.push(format!("align to view '{}': {}", self.view, e));
                 }
             }
@@ -1075,7 +1084,7 @@ impl Clone {
                     print_info("Preserving the existing Git working copy.");
                 } else {
                     // Output the working copy — reconstruct files from the graph
-                    match repo.materialize() {
+                    match repo.materialize(working_copy) {
                         Ok(output) => {
                             log::info!(
                                 "Output working copy: {} files, {} dirs",

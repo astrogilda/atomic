@@ -24,7 +24,7 @@ fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordE
         .with_all(true)
         .save_to_store(true)
         .apply_after_record(true);
-    repo.record(header, options)
+    repo.record(repo.require_working_copy_id().unwrap(), header, options)
 }
 
 /// A raw disk rename (new path untracked) records as one FileMove, reusing the
@@ -193,15 +193,19 @@ fn test_rename_back_records_exact_filemove_without_deleting_content() {
 
     drop(repo);
     let reopened = Repository::open(temp.path()).unwrap();
-    reopened.materialize().unwrap();
+    let working_copy = reopened.require_working_copy_id().unwrap();
+    reopened.materialize(working_copy).unwrap();
     assert_eq!(reopened.get_file_inode("old.txt").unwrap(), Some(inode));
     assert_eq!(std::fs::read(&old).unwrap(), content);
     assert!(!new.exists());
     assert!(reopened
-        .status(crate::status::StatusOptions::default())
+        .status(working_copy, crate::status::StatusOptions::default())
         .unwrap()
         .is_clean());
-    assert!(reopened.verify_working_copy().unwrap().is_healthy());
+    assert!(reopened
+        .verify_working_copy(working_copy)
+        .unwrap()
+        .is_healthy());
 }
 
 #[test]
@@ -282,17 +286,21 @@ fn test_exact_rename_into_new_nested_directories_is_parent_first_and_stable() {
 
     drop(repo);
     let reopened = Repository::open(temp.path()).unwrap();
-    reopened.materialize().unwrap();
+    let working_copy = reopened.require_working_copy_id().unwrap();
+    reopened.materialize(working_copy).unwrap();
     assert_eq!(std::fs::read(&nested).unwrap(), content);
     assert_eq!(
         reopened.get_file_inode("deep/nested/f.txt").unwrap(),
         Some(inode)
     );
     assert!(reopened
-        .status(crate::status::StatusOptions::default())
+        .status(working_copy, crate::status::StatusOptions::default())
         .unwrap()
         .is_clean());
-    assert!(reopened.verify_working_copy().unwrap().is_healthy());
+    assert!(reopened
+        .verify_working_copy(working_copy)
+        .unwrap()
+        .is_healthy());
 }
 
 /// `atomic mv` stages the original inode at the destination after moving the
@@ -441,10 +449,14 @@ fn test_authoritative_move_preserves_inode_across_large_rewrite_and_reopen() {
 
     drop(repo);
     let reopened = Repository::open(temp.path()).unwrap();
-    reopened.materialize().unwrap();
+    let working_copy = reopened.require_working_copy_id().unwrap();
+    reopened.materialize(working_copy).unwrap();
     assert_eq!(reopened.get_file_inode("after.txt").unwrap(), Some(inode));
     assert_eq!(std::fs::read(&new).unwrap(), new_content.as_bytes());
-    assert!(reopened.verify_working_copy().unwrap().is_healthy());
+    assert!(reopened
+        .verify_working_copy(working_copy)
+        .unwrap()
+        .is_healthy());
 }
 
 #[test]

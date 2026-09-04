@@ -9,7 +9,7 @@
 use clap::{Args, Subcommand};
 use clap_complete::engine::ArgValueCompleter;
 
-use atomic_core::types::{Base32, Hash};
+use atomic_core::types::{Base32, Hash, WorkingCopyId};
 use atomic_repository::{
     CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions, Repository,
 };
@@ -261,17 +261,19 @@ impl crate::commands::Command for Insert {
 /// Insert a single change by hash.
 fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliResult<()> {
     let hash = parse_change_hash(repo, change_str)?;
-    let is_current_view = args.view.is_none() || args.view.as_deref() == Some(repo.current_view());
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
+    let target_view = args.view.clone().unwrap_or_else(|| desired_view.clone());
+    let is_current_view = target_view == desired_view;
 
     let options = InsertOptions::default()
         .apply_deps(args.deps)
-        .allow_conflict(args.allow_conflicts);
-
-    let options = if let Some(ref view) = args.view {
-        options.view(view)
-    } else {
-        options
-    };
+        .allow_conflict(args.allow_conflicts)
+        .view(&target_view);
 
     output::print_info(&format!("Inserting change {}...", format_hash(&hash, true)));
 
@@ -290,16 +292,16 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
         outcome.has_conflicts,
     );
 
-    // Update working copy if we inserted into the current view
+    // Update working copy if we inserted into its desired view.
     if is_current_view && !outcome.stats.applied_hashes.is_empty() {
-        let output_result = repo.materialize().map_err(|e| {
+        let output_result = repo.materialize(working_copy).map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
-        print_conflict_summary(repo);
+        print_conflict_summary(repo, working_copy);
     }
 
     Ok(())
@@ -314,7 +316,12 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
 /// The working copy is intentionally NOT rematerialized: the target view is
 /// not checked out, so the current view's on-disk state is unchanged.
 fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
-    let source = repo.current_view().to_string();
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let source = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
     let source_info = repo
         .get_view_info(&source)
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
@@ -427,11 +434,14 @@ fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
 
 /// Insert all changes from another view (the `insert view` subcommand).
 fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
-    let to_view = args
-        .to_view
-        .clone()
-        .unwrap_or_else(|| repo.current_view().to_string());
-    let is_current_view = to_view == repo.current_view();
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
+    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
+    let is_current_view = to_view == desired_view;
 
     output::print_info(&format!(
         "Inserting changes from '{}' to '{}'...",
@@ -472,13 +482,14 @@ fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
         let output_result = if affected_paths.is_empty() {
             // No path info available (e.g. AddRoot-only changes) —
             // fall back to full materialize.
-            repo.materialize().map_err(|e| {
+            repo.materialize(working_copy).map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
             })?
         } else {
-            repo.materialize_paths(affected_paths).map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
-            })?
+            repo.materialize_paths(working_copy, affected_paths)
+                .map_err(|e| {
+                    CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+                })?
         };
 
         output::finish_success(
@@ -488,7 +499,7 @@ fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
-        print_conflict_summary(repo);
+        print_conflict_summary(repo, working_copy);
     }
 
     Ok(())
@@ -496,15 +507,18 @@ fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
 
 /// Insert changes up to a specific tag.
 fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
     let from_view = args
         .from_view
         .clone()
-        .unwrap_or_else(|| repo.current_view().to_string());
-    let to_view = args
-        .to_view
-        .clone()
-        .unwrap_or_else(|| repo.current_view().to_string());
-    let is_current_view = to_view == repo.current_view();
+        .unwrap_or_else(|| desired_view.clone());
+    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
+    let is_current_view = to_view == desired_view;
 
     output::print_info(&format!(
         "Inserting changes up to tag '{}' from '{}' to '{}'...",
@@ -541,13 +555,14 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
         }
 
         let output_result = if affected_paths.is_empty() {
-            repo.materialize().map_err(|e| {
+            repo.materialize(working_copy).map_err(|e| {
                 CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
             })?
         } else {
-            repo.materialize_paths(affected_paths).map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
-            })?
+            repo.materialize_paths(working_copy, affected_paths)
+                .map_err(|e| {
+                    CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
+                })?
         };
 
         output::finish_success(
@@ -557,7 +572,7 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
                 output_result.files_written, output_result.directories_created
             ),
         );
-        print_conflict_summary(repo);
+        print_conflict_summary(repo, working_copy);
     }
 
     Ok(())
@@ -565,11 +580,14 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
 
 /// Insert specific change(s) by hash (the `insert change` subcommand).
 fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
-    let to_view = args
-        .to_view
-        .clone()
-        .unwrap_or_else(|| repo.current_view().to_string());
-    let is_current_view = to_view == repo.current_view();
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
+    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
+    let is_current_view = to_view == desired_view;
 
     // Parse all change hashes
     let mut hashes = Vec::new();
@@ -592,16 +610,16 @@ fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
 
     print_cross_view_outcome(&outcome, false);
 
-    // Update working copy if we inserted into the current view
+    // Update working copy if we inserted into its desired view.
     if is_current_view && outcome.changes_applied > 0 {
-        let output_result = repo.materialize().map_err(|e| {
+        let output_result = repo.materialize(working_copy).map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to update working copy: {}", e))
         })?;
         output::print_success(&format!(
             "{} files updated, {} directories",
             output_result.files_written, output_result.directories_created
         ));
-        print_conflict_summary(repo);
+        print_conflict_summary(repo, working_copy);
     }
 
     Ok(())
@@ -609,10 +627,13 @@ fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
 
 /// Preview what would be inserted.
 fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
-    let to_view = args
-        .to_view
-        .clone()
-        .unwrap_or_else(|| repo.current_view().to_string());
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::Repository)?;
+    let to_view = args.to_view.clone().unwrap_or(desired_view);
 
     output::print_section("Insert Preview");
     println!();
@@ -727,8 +748,8 @@ fn print_insert_outcome(
 
 /// After materializing the current view, list any conflicted files inline so
 /// the user does not have to run a second command to find them.
-fn print_conflict_summary(repo: &Repository) {
-    let conflicts = match repo.list_conflicts() {
+fn print_conflict_summary(repo: &Repository, working_copy: WorkingCopyId) {
+    let conflicts = match repo.list_conflicts(working_copy) {
         Ok(c) => c,
         Err(_) => return,
     };

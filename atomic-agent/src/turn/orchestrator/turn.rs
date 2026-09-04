@@ -123,9 +123,9 @@ impl TurnOrchestrator {
     /// transitions the session back to Idle.
     ///
     /// The recording workflow lets the repository figure out what changed:
-    /// 1. `repo.status()` — find modified, deleted, and untracked files
-    /// 2. `repo.add()` — track any new files the agent created
-    /// 3. `repo.record(all: true)` — record everything that's dirty
+    /// 1. `repo.status(working_copy, ...)` — find modified, deleted, and untracked files
+    /// 2. `repo.add(working_copy, ...)` — track any new files the agent created
+    /// 3. `repo.record(working_copy, ...)` — record everything that's dirty
     ///
     /// This avoids the cross-process watcher state problem: each hook
     /// invocation is a separate process, so we can't carry in-memory

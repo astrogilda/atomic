@@ -27,13 +27,14 @@ use std::sync::Arc;
 
 use atomic_core::output::alive::RetrieveOptions;
 use atomic_core::pristine::{CachedGraphTxn, Pristine, ViewTxnT};
+
 use serde::{Deserialize, Serialize};
 
 use crate::changestore::{ChangeStore, DEFAULT_CACHE_CAPACITY};
 use crate::oci::{self, OciImageConfig};
 
 use super::content::retrieve_content_with_filter_fast;
-use super::{graph_visibility_closure, Repository, DOT_DIR};
+use super::{graph_visibility_closure, working_copy, Repository, DOT_DIR};
 use crate::RepositoryError;
 
 /// Options for [`Repository::stage`].
@@ -140,7 +141,7 @@ impl Repository {
     pub fn open_sandbox<P, Q>(
         working_root: P,
         canonical: Q,
-        view: &str,
+        _view: &str,
     ) -> Result<Self, RepositoryError>
     where
         P: AsRef<Path>,
@@ -156,11 +157,19 @@ impl Repository {
         );
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let layout = working_copy::layout_for_paths(
+            working_root.clone(),
+            dot_dir.clone(),
+            working_root.join(DOT_DIR),
+            false,
+        )?;
+        let (_working_copy_id, current_view) =
+            working_copy::load_registered_identity(&pristine, &layout)?;
 
         Ok(Self {
             root: working_root,
             dot_dir,
-            current_view: view.to_string(),
+            current_view,
             pristine,
             change_store,
             is_sandbox: true,
@@ -209,6 +218,14 @@ impl Repository {
         let bytes = serde_json::to_vec_pretty(&pointer)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         std::fs::write(dest.join(SANDBOX_POINTER), bytes)?;
+
+        let layout = working_copy::layout_for_paths(
+            dest.to_path_buf(),
+            self.dot_dir.clone(),
+            dest.join(DOT_DIR),
+            false,
+        )?;
+        working_copy::migrate_identity(&self.pristine, &layout, view)?;
 
         Ok(count)
     }
@@ -478,13 +495,20 @@ mod tests {
         }
         std::fs::write(&path, contents).unwrap();
 
-        repo.add(rel, TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            rel,
+            TrackingOptions::default(),
+        )
+        .unwrap();
         let header = ChangeHeader::new("add file");
         let options = RecordOptions::new()
             .with_all(true)
             .save_to_store(true)
             .apply_after_record(false);
-        let outcome = repo.record(header, options).unwrap();
+        let outcome = repo
+            .record(repo.require_working_copy_id().unwrap(), header, options)
+            .unwrap();
         repo.write_recorded(&outcome, InsertOptions::default())
             .unwrap();
 

@@ -20,13 +20,13 @@ fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordE
         .with_all(true)
         .save_to_store(true)
         .apply_after_record(true);
-    repo.record(header, options)
+    repo.record(repo.require_working_copy_id().unwrap(), header, options)
 }
 
 /// Build a repo where feature and dev insert different lines at the same
 /// position, then insert feature → dev and materialize on dev. Returns the
 /// on-disk path of the conflicted file.
-fn make_conflicted_repo() -> (TempDir, Repository, std::path::PathBuf) {
+fn make_conflicted_repo() -> (TempDir, TestRepository, std::path::PathBuf) {
     let (temp_dir, mut repo) = create_temp_repo();
     let file = temp_dir.path().join("f.txt");
 
@@ -54,7 +54,12 @@ fn make_conflicted_repo() -> (TempDir, Repository, std::path::PathBuf) {
 }
 
 fn conflicted_entry_paths(repo: &Repository) -> Vec<String> {
-    let status = repo.status(StatusOptions::default()).unwrap();
+    let status = repo
+        .status(
+            repo.require_working_copy_id().unwrap(),
+            StatusOptions::default(),
+        )
+        .unwrap();
     status
         .entries()
         .iter()
@@ -311,7 +316,9 @@ fn test_recorded_name_resolution_emits_real_solve_with_complete_dependencies() {
     assert_eq!(std::fs::read(&path).unwrap(), b"feature\n");
     drop(repo);
     let reopened = Repository::open(temp_dir.path()).unwrap();
-    reopened.materialize().unwrap();
+    reopened
+        .materialize(reopened.require_working_copy_id().unwrap())
+        .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"feature\n");
 }
 

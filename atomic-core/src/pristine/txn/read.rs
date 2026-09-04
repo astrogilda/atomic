@@ -13,7 +13,7 @@ use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
 use crate::types::{
     ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
-    SerializedGraphEdge,
+    SerializedGraphEdge, WorkingCopyId,
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
@@ -23,8 +23,9 @@ use crate::pristine::path_claim::{
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, PathClaimTxnT,
-    StoredConflict, TreeTxnT, ViewState, ViewTxnT,
+    decode_working_copy_record, FileIndexEntry, FileIndexMetadata, GraphTxnT,
+    GraphVisibilityClosure, PathClaimTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
+    WorkingCopyRecord, WorkingCopyTxnT,
 };
 
 use super::helpers::{
@@ -38,6 +39,23 @@ use super::helpers::{
 /// can be active simultaneously.
 pub struct ReadTxn {
     pub(crate) txn: ReadTransaction,
+}
+
+fn decode_working_copy_row(
+    key: &[u8; WorkingCopyId::SIZE],
+    bytes: &[u8],
+) -> PristineResult<WorkingCopyRecord> {
+    let key_id = WorkingCopyId::from_bytes(*key);
+    let record = decode_working_copy_record(bytes)?;
+    if record.id != key_id {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "WORKING_COPIES key {} contains record for {}",
+                key_id, record.id
+            ),
+        });
+    }
+    Ok(record)
 }
 
 impl ReadTxn {
@@ -512,6 +530,41 @@ impl ViewTxnT for ReadTxn {
         }
 
         Ok(Box::new(results.into_iter()))
+    }
+}
+
+// WorkingCopyTxnT Implementation
+
+impl WorkingCopyTxnT for ReadTxn {
+    fn get_working_copy(&self, id: WorkingCopyId) -> PristineResult<Option<WorkingCopyRecord>> {
+        let table = match self.txn.open_table(WORKING_COPIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::WorkingCopySchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let result = match table.get(id.as_bytes())? {
+            Some(value) => decode_working_copy_row(id.as_bytes(), value.value()).map(Some),
+            None => Ok(None),
+        };
+        result
+    }
+
+    fn list_working_copies(&self) -> PristineResult<Vec<WorkingCopyRecord>> {
+        let table = match self.txn.open_table(WORKING_COPIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::WorkingCopySchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut records = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            records.push(decode_working_copy_row(key.value(), value.value())?);
+        }
+        Ok(records)
     }
 }
 

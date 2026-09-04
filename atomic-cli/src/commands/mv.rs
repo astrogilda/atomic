@@ -212,6 +212,9 @@ impl Command for Move {
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Normalize paths
         let source = self.normalize_path(&repo_root, &self.source)?;
@@ -334,7 +337,7 @@ impl Command for Move {
                 error
             )));
         }
-        if let Err(error) = repo.move_file(&source, &destination) {
+        if let Err(error) = repo.move_file(working_copy, &source, &destination) {
             if let Err(rollback_error) = Self::restore_after_staging_failure(
                 &source_path,
                 &destination_path,

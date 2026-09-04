@@ -26,6 +26,7 @@ mod hash;
 mod node_id;
 mod position;
 mod set_id;
+mod working_copy_id;
 
 pub use edge_kind::{Edge, EdgeKind, ForwardEdge, ParentEdge, ParentEdgeKind};
 pub use graph_edge::{EdgeFlags, GraphEdge, SerializedGraphEdge};
@@ -34,6 +35,7 @@ pub use hash::{Hash, Hasher, Merkle};
 pub use node_id::{ChangePosition, Inode, NodeId, L64};
 pub use position::Position;
 pub use set_id::SetId;
+pub use working_copy_id::WorkingCopyId;
 
 /// Base32 encoding trait for human-readable identifiers
 pub trait Base32: Sized {

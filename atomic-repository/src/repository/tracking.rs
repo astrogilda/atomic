@@ -11,6 +11,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being inspected
     /// * `path` - Path to the file or directory (relative to repository root)
     /// * `options` - Options controlling the add operation
     ///
@@ -29,19 +30,21 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// // Add a single file
-    /// repo.add("src/main.rs", TrackingOptions::default())?;
+    /// repo.add(working_copy, "src/main.rs", TrackingOptions::default())?;
     ///
     /// // Add a directory recursively
-    /// repo.add("src/", TrackingOptions::default())?;
+    /// repo.add(working_copy, "src/", TrackingOptions::default())?;
     ///
     /// // Add without recursion
-    /// repo.add("src/", TrackingOptions::non_recursive())?;
+    /// repo.add(working_copy, "src/", TrackingOptions::non_recursive())?;
     /// ```
     pub fn add<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         path: P,
         options: TrackingOptions,
     ) -> Result<TrackingStats, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let path = path.as_ref();
         let mut stats = TrackingStats::new();
 
@@ -124,12 +127,18 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being updated
     /// * `paths` - Paths to add (relative to repository root)
     ///
     /// # Returns
     ///
     /// Number of files actually added (skips already-tracked files).
-    pub fn add_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+    pub fn add_batch(
+        &self,
+        working_copy: WorkingCopyId,
+        paths: &[&str],
+    ) -> Result<usize, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         if paths.is_empty() {
             return Ok(0);
         }
@@ -165,12 +174,18 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being updated
     /// * `paths` - Paths to remove (relative to repository root)
     ///
     /// # Returns
     ///
     /// Number of files actually removed.
-    pub fn remove_batch(&self, paths: &[&str]) -> Result<usize, RepositoryError> {
+    pub fn remove_batch(
+        &self,
+        working_copy: WorkingCopyId,
+        paths: &[&str],
+    ) -> Result<usize, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         if paths.is_empty() {
             return Ok(0);
         }
@@ -210,6 +225,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being inspected
     /// * `path` - Path to the directory to track
     /// * `options` - Options controlling the add operation
     ///
@@ -221,7 +237,11 @@ impl Repository {
     /// let repo = Repository::open(".")?;
     ///
     /// // Track an empty directory explicitly
-    /// repo.add_directory("src/empty_module/", TrackingOptions::default())?;
+    /// repo.add_directory(
+    ///     working_copy,
+    ///     "src/empty_module/",
+    ///     TrackingOptions::default(),
+    /// )?;
     ///
     /// // The directory will be recorded in the next change
     /// // No .keep file is needed
@@ -248,11 +268,13 @@ impl Repository {
     /// ```
     pub fn add_directory<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         path: P,
         options: TrackingOptions,
     ) -> Result<TrackingStats, RepositoryError> {
         use crate::tracking::add_directory_to_tree;
 
+        self.validate_working_copy(working_copy)?;
         let path = path.as_ref();
         let mut stats = TrackingStats::new();
 
@@ -324,6 +346,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being updated
     /// * `path` - Path to remove from tracking
     /// * `options` - Options controlling the remove operation
     ///
@@ -331,16 +354,18 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// // Remove a single file
-    /// repo.remove("old_file.txt", TrackingOptions::default())?;
+    /// repo.remove(working_copy, "old_file.txt", TrackingOptions::default())?;
     ///
     /// // Remove a directory recursively
-    /// repo.remove("old_dir/", TrackingOptions::default())?;
+    /// repo.remove(working_copy, "old_dir/", TrackingOptions::default())?;
     /// ```
     pub fn remove<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         path: P,
         options: TrackingOptions,
     ) -> Result<TrackingStats, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let path = path.as_ref();
         let mut stats = TrackingStats::new();
         let normalized = normalize_path(path);
@@ -409,6 +434,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy being updated
     /// * `from` - Current path of the file
     /// * `to` - New path for the file
     ///
@@ -419,13 +445,15 @@ impl Repository {
     /// std::fs::rename("old_name.rs", "new_name.rs")?;
     ///
     /// // Then update tracking
-    /// repo.move_file("old_name.rs", "new_name.rs")?;
+    /// repo.move_file(working_copy, "old_name.rs", "new_name.rs")?;
     /// ```
     pub fn move_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         from: P,
         to: Q,
     ) -> Result<Inode, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let from_normalized = normalize_path(from.as_ref());
         let to_normalized = normalize_path(to.as_ref());
 
@@ -523,14 +551,19 @@ impl Repository {
     ///
     /// Call this when a file is deleted (e.g., during git import cleanup)
     /// so that `status` doesn't show it as a stale entry.
-    pub fn del_file_index(&self, path: &str) -> Result<(), RepositoryError> {
+    pub fn del_file_index(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &str,
+    ) -> Result<(), RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let normalized = path.replace('\\', "/");
-        txn.del_file_index(&normalized)
+        txn.del_working_copy_file_index(working_copy, &normalized)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
@@ -546,8 +579,14 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy owning the index
     /// * `paths` - Paths to remove from the index
-    pub fn del_file_index_batch(&self, paths: &[&str]) -> Result<(), RepositoryError> {
+    pub fn del_file_index_batch(
+        &self,
+        working_copy: WorkingCopyId,
+        paths: &[&str],
+    ) -> Result<(), RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         if paths.is_empty() {
             return Ok(());
         }
@@ -559,7 +598,7 @@ impl Repository {
 
         for path in paths {
             let normalized = path.replace('\\', "/");
-            let _ = txn.del_file_index(&normalized);
+            let _ = txn.del_working_copy_file_index(working_copy, &normalized);
         }
 
         txn.commit()
@@ -577,12 +616,15 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Identity of the physical working copy owning the index
     /// * `files` - Slice of `(path, mtime_secs, mtime_nanos, file_size, content_hash)` tuples.
     ///   Paths should be repo-relative with forward slashes.
     pub fn update_file_index(
         &self,
+        working_copy: WorkingCopyId,
         files: &[(String, i64, u32, u64, Hash)],
     ) -> Result<(), RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         if files.is_empty() {
             return Ok(());
         }
@@ -593,7 +635,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         for (path, secs, nanos, size, hash) in files {
-            txn.put_file_index(path, *secs, *nanos, *size, hash)
+            txn.put_working_copy_file_index(working_copy, path, *secs, *nanos, *size, hash)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
@@ -617,9 +659,13 @@ impl Repository {
     /// # Returns
     ///
     /// The number of files indexed.
-    pub fn reindex_working_copy(&self) -> Result<usize, RepositoryError> {
+    pub fn reindex_working_copy(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<usize, RepositoryError> {
         use std::time::SystemTime;
 
+        self.validate_working_copy(working_copy)?;
         let tracked = self.list_tracked_files().unwrap_or_default();
         let repo_root = self.root.clone();
 
@@ -657,7 +703,7 @@ impl Repository {
 
         // Write in batches of 5000 to avoid holding the write txn too long
         for chunk in entries.chunks(5000) {
-            self.update_file_index(chunk)?;
+            self.update_file_index(working_copy, chunk)?;
         }
 
         Ok(count)

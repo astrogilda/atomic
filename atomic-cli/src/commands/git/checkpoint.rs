@@ -302,7 +302,12 @@ pub(crate) fn observe_current_atomic(
     let repo = Repository::open_readonly(root).map_err(|error| {
         CheckpointError::Atomic(format!("cannot open repository read-only: {error}"))
     })?;
-    let view = repo.current_view().to_string();
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(|error| CheckpointError::Atomic(error.to_string()))?;
+    let view = repo
+        .desired_view_name(working_copy)
+        .map_err(|error| CheckpointError::Atomic(error.to_string()))?;
     observe_atomic_on_handle(&repo, &view)
 }
 

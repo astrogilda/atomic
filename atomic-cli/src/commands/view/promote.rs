@@ -50,7 +50,13 @@ impl Command for Promote {
 
         let view_name = match &self.name {
             Some(name) => name.clone(),
-            None => repo.current_view().to_string(),
+            None => {
+                let working_copy = repo
+                    .require_working_copy_id()
+                    .map_err(CliError::Repository)?;
+                repo.desired_view_name(working_copy)
+                    .map_err(CliError::Repository)?
+            }
         };
 
         let info = repo

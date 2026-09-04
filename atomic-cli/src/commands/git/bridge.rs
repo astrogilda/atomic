@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use atomic_core::pristine::{GraphTxnT, ViewTxnT};
+use atomic_core::types::WorkingCopyId;
 use atomic_repository::{
     graph_visibility_closure, InsertOptions, Repository, RepositoryError, StatusOptions,
 };
@@ -125,8 +126,9 @@ fn classify_direction(
 fn reconcile() -> CliResult<()> {
     let root = find_repository_root()?;
     let repo = Repository::open(&root).map_err(CliError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
     let git = open_git(&root)?;
-    let current = current_heads(&repo, &git)?;
+    let current = current_heads(&repo, working_copy, &git)?;
     let current_git_branch = current_attached_git_branch(&git)?;
     let checkpoint = read_workspace_metadata(&root)?;
 
@@ -160,7 +162,7 @@ fn reconcile() -> CliResult<()> {
             import_git_to_atomic(&root)
         }
         ReconcileDirection::AtomicToGit => {
-            project_atomic_to_git(&root, &repo, &git, &current)?;
+            project_atomic_to_git(&root, &repo, working_copy, &git, &current)?;
             drop(git);
             drop(repo);
             let snapshot = verify_at(&root)?;
@@ -180,8 +182,9 @@ fn switch(target: &str) -> CliResult<()> {
         .ok_or_else(|| git_error("bridge switch requires an existing checkpoint; run 'atomic git bridge reconcile' first"))?;
     let target_state = {
         let repo = Repository::open(&root).map_err(CliError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
         let git = open_git(&root)?;
-        let current = current_heads(&repo, &git)?;
+        let current = current_heads(&repo, working_copy, &git)?;
         if current_attached_git_branch(&git)? != current.view
             || !checkpoint_matches_snapshot(&checkpoint, &current)
         {
@@ -204,6 +207,7 @@ fn switch(target: &str) -> CliResult<()> {
     // After collision-specific checks, require the full clean/equality invariant.
     verify_at(&root)?;
     let mut repo = Repository::open(&root).map_err(CliError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
 
     if std::env::var("ATOMIC_TEST_BRIDGE_FAIL_BEFORE_MATERIALIZE").as_deref() == Ok("1") {
         return Err(git_error(
@@ -216,9 +220,10 @@ fn switch(target: &str) -> CliResult<()> {
     // target exactly once, verify Atomic considers it clean, then project that
     // result into Git. The full RFC replaces this with a view-scoped manifest
     // so Git can be prepared before filesystem mutation.
-    repo.switch_view(target).map_err(CliError::from)?;
+    repo.switch_view(working_copy, target)
+        .map_err(CliError::from)?;
     let atomic_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy, StatusOptions::default())
         .map_err(CliError::from)?;
     if !atomic_status.is_clean() {
         return Err(git_error(
@@ -432,6 +437,7 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
     // creating a self-contained shared view instead of replaying Git history.
     if let Some(checkpoint) = read_workspace_metadata(root)? {
         let mut repo = Repository::open(root).map_err(CliError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
         let view_exists = repo.view_exists(&view).map_err(CliError::from)?;
         if git_head == checkpoint.git_head && !view_exists {
             // Validate and resolve the complete dependency closure before the
@@ -472,8 +478,10 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
                 repo.insert_change(&hash, InsertOptions::with_dependencies().view(&view))
                     .map_err(CliError::from)?;
             }
-            repo.align_to_view(&view).map_err(CliError::from)?;
-            repo.reindex_working_copy().map_err(CliError::from)?;
+            repo.align_to_view(working_copy, &view)
+                .map_err(CliError::from)?;
+            repo.reindex_working_copy(working_copy)
+                .map_err(CliError::from)?;
             drop(repo);
             let snapshot = verify_at(root)?;
             write_workspace_metadata(root, &snapshot)?;
@@ -497,8 +505,11 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
     // aligning deferred TREE metadata and rebuilding FILE_INDEX only; neither
     // operation writes source files.
     let mut repo = Repository::open(root).map_err(CliError::from)?;
-    repo.align_to_view(&view).map_err(CliError::from)?;
-    repo.reindex_working_copy().map_err(CliError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    repo.align_to_view(working_copy, &view)
+        .map_err(CliError::from)?;
+    repo.reindex_working_copy(working_copy)
+        .map_err(CliError::from)?;
     drop(repo);
 
     let snapshot = verify_at(root)?;
@@ -535,7 +546,9 @@ pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<Checkpoint
 
     let current_view = {
         let repo = Repository::open(root).map_err(CliError::from)?;
-        repo.current_view().to_string()
+        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+        repo.desired_view_name(working_copy)
+            .map_err(CliError::from)?
     };
     if branch != current_view {
         return Ok(CheckpointRefresh::SkippedViewMismatch);
@@ -553,8 +566,9 @@ fn verify() -> CliResult<BridgeSnapshot> {
 
 fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
     let repo = Repository::open(root).map_err(CliError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
     let git = open_git(root)?;
-    let (branch, head, tree) = require_matching_clean_workspaces(&repo, &git, true)?;
+    let (branch, head, tree) = require_matching_clean_workspaces(&repo, working_copy, &git, true)?;
     let git_files = read_git_tree(&git, &tree)?;
     let worktree_files = read_filesystem(root)?;
     compare_file_sets(&git_files, &worktree_files).map_err(|error| {
@@ -576,7 +590,11 @@ fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
     })
 }
 
-fn current_heads(repo: &Repository, git: &GitRepository) -> CliResult<BridgeSnapshot> {
+fn current_heads(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    git: &GitRepository,
+) -> CliResult<BridgeSnapshot> {
     let head = git
         .head()
         .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
@@ -587,7 +605,9 @@ fn current_heads(repo: &Repository, git: &GitRepository) -> CliResult<BridgeSnap
         .peel_to_commit()
         .and_then(|commit| commit.tree())
         .map_err(|error| git_error(format!("cannot read Git HEAD tree: {error}")))?;
-    let view = repo.current_view().to_string();
+    let view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::from)?;
     let atomic_state = repo
         .get_view_info(&view)
         .map_err(CliError::from)?
@@ -665,14 +685,17 @@ fn require_clean_git_worktree(git: &GitRepository) -> CliResult<()> {
 
 fn require_matching_clean_workspaces<'repo>(
     repo: &Repository,
+    working_copy: WorkingCopyId,
     git: &'repo GitRepository,
     require_atomic_clean: bool,
 ) -> CliResult<(String, git2::Oid, git2::Tree<'repo>)> {
     let branch = current_attached_git_branch(git)?;
-    if branch != repo.current_view() {
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::from)?;
+    if branch != desired_view {
         return Err(git_error(format!(
-            "Git branch '{branch}' does not match current Atomic view '{}'",
-            repo.current_view()
+            "Git branch '{branch}' does not match current Atomic view '{desired_view}'"
         )));
     }
 
@@ -680,7 +703,7 @@ fn require_matching_clean_workspaces<'repo>(
 
     if require_atomic_clean {
         let atomic_status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(CliError::from)?;
         if !atomic_status.is_clean() {
             return Err(git_error("Atomic working copy is not clean"));
@@ -703,6 +726,7 @@ fn require_matching_clean_workspaces<'repo>(
 fn project_atomic_to_git(
     root: &Path,
     repo: &Repository,
+    working_copy: WorkingCopyId,
     git: &GitRepository,
     current: &BridgeSnapshot,
 ) -> CliResult<()> {
@@ -715,15 +739,17 @@ fn project_atomic_to_git(
     let branch = head
         .shorthand()
         .ok_or_else(|| git_error("Git branch name is not valid UTF-8"))?;
-    if branch != repo.current_view() {
+    let desired_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::from)?;
+    if branch != desired_view {
         return Err(git_error(format!(
-            "Git branch '{branch}' does not match current Atomic view '{}'",
-            repo.current_view()
+            "Git branch '{branch}' does not match current Atomic view '{desired_view}'"
         )));
     }
 
     let atomic_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy, StatusOptions::default())
         .map_err(CliError::from)?;
     if !atomic_status.is_clean() {
         return Err(git_error("Atomic working copy is not clean"));

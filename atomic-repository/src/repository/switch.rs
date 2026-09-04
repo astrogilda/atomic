@@ -20,6 +20,31 @@ pub(super) fn ensure_workspace_dir(dot_dir: &Path, view_name: &str) -> Result<()
     Ok(())
 }
 
+fn working_copy_workspace_path(
+    dot_dir: &Path,
+    working_copy: WorkingCopyId,
+    view_name: &str,
+) -> PathBuf {
+    dot_dir
+        .join("working-copies")
+        .join(working_copy.to_string())
+        .join(WORKSPACES_DIR)
+        .join(view_name)
+}
+
+fn ensure_working_copy_workspace_dir(
+    dot_dir: &Path,
+    working_copy: WorkingCopyId,
+    view_name: &str,
+) -> Result<(), RepositoryError> {
+    std::fs::create_dir_all(working_copy_workspace_path(
+        dot_dir,
+        working_copy,
+        view_name,
+    ))?;
+    Ok(())
+}
+
 /// Remove empty ancestor directories after file removal.
 ///
 /// Given an iterator of relative paths that were just deleted, this
@@ -32,7 +57,11 @@ pub(super) fn ensure_workspace_dir(dot_dir: &Path, view_name: &str) -> Result<()
 /// Extracting this into a standalone helper keeps `switch_view` at the
 /// orchestration level and makes the cleanup logic reusable for other
 /// operations (e.g. `atomic clean`).
-fn cleanup_empty_ancestors<'a>(root: &Path, removed_paths: impl Iterator<Item = &'a str>) {
+fn cleanup_empty_ancestors<'a>(
+    _working_copy: WorkingCopyId,
+    root: &Path,
+    removed_paths: impl Iterator<Item = &'a str>,
+) {
     let mut dirs: HashSet<PathBuf> = HashSet::new();
     for path in removed_paths {
         let p = PathBuf::from(path);
@@ -67,6 +96,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - The validated physical working-copy identity
     /// * `view` - The name of the view to switch to
     ///
     /// # Returns
@@ -85,15 +115,20 @@ impl Repository {
     /// let mut repo = Repository::open(".")?;
     ///
     /// // Switch to feature view and update working copy
-    /// let result = repo.switch_view("feature")?;
+    /// let result = repo.switch_view(working_copy, "feature")?;
     /// println!("Updated {} files", result.files_written);
     /// ```
-    pub fn switch_view(&mut self, view: &str) -> Result<MaterializeResult, RepositoryError> {
-        let old_view_name = self.current_view.clone();
+    pub fn switch_view(
+        &mut self,
+        working_copy: WorkingCopyId,
+        view: &str,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let old_view_name = self.desired_view_name(working_copy)?;
 
         // Resolve both views and validate both dependency closures before the
         // switch publishes a pointer or mutates TREE-derived state.
-        let (old_files, new_files, new_visibility, new_view_id, differing_hashes) = {
+        let (old_files, new_files, new_visibility, new_view_id) = {
             let txn = self
                 .pristine
                 .read_txn()
@@ -128,57 +163,24 @@ impl Repository {
                 .filter_map(|(path, item)| (!item.is_directory).then_some(path))
                 .collect();
 
-            let differing_ids = old_membership
-                .iter()
-                .filter(|change_id| !new_membership.contains(**change_id))
-                .chain(
-                    new_membership
-                        .iter()
-                        .filter(|change_id| !old_membership.contains(**change_id)),
-                );
-            let mut differing_hashes = Vec::new();
-            for change_id in differing_ids.copied() {
-                let hash = txn
-                    .get_external(change_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| {
-                        RepositoryError::Database(format!(
-                            "change {} has no external hash",
-                            change_id.get()
-                        ))
-                    })?;
-                differing_hashes.push(hash);
-            }
-
-            (
-                old_files,
-                new_files,
-                new_visibility,
-                new_view.id,
-                differing_hashes,
-            )
+            (old_files, new_files, new_visibility, new_view.id)
         };
-
-        let mut differing_paths = HashSet::new();
-        for hash in &differing_hashes {
-            let change = self.load_change(hash)?;
-            for op in change.hunks() {
-                if let Some(path) = op.path() {
-                    differing_paths.insert(path.to_string());
-                }
-            }
-        }
 
         // Render the complete target before publishing the target pointer,
         // shelving ignored files, or removing tracked paths. This does not make
         // filesystem execution crash-safe, but it guarantees graph/preload/
         // content errors refuse the switch before its first external effect.
-        self.validate_materialization_with_visibility(None, new_visibility.clone(), new_view_id)?;
+        self.validate_materialization_with_visibility(
+            working_copy,
+            None,
+            new_visibility.clone(),
+            new_view_id,
+        )?;
 
         // Apply only the small set of view-scoped TREE operations and publish
         // the new pointer while holding the same database write lock. A marker
         // makes the transition recoverable if the process exits mid-switch.
-        let deferred_paths = self.align_deferred_tree_and_publish_view(view, &new_visibility)?;
+        self.align_to_view(working_copy, view)?;
 
         if std::env::var_os("ATOMIC_TRACE_SWITCH").is_some() {
             eprintln!("[switch] {} -> {}", old_view_name, view);
@@ -195,7 +197,7 @@ impl Repository {
             }
         }
 
-        let working_copy = FileSystem::from_root(&self.root);
+        let filesystem_working_copy = FileSystem::from_root(&self.root);
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
         //
@@ -211,8 +213,8 @@ impl Repository {
         //   - Untracked, ignored, exposed  → left alone (persists across views)
         //   - Untracked, ignored, NOT exposed → shelved/restored per-view (phases 1 & 5)
         //   - Untracked, novel   → user's undecided work, left alone
-        let old_ws = workspace_path(&self.dot_dir, &old_view_name);
-        ensure_workspace_dir(&self.dot_dir, &old_view_name)?;
+        let old_ws = working_copy_workspace_path(&self.dot_dir, working_copy, &old_view_name);
+        ensure_working_copy_workspace_dir(&self.dot_dir, working_copy, &old_view_name)?;
 
         let repo_expose = atomic_config::RepoConfig::load(&self.config_path())
             .unwrap_or_default()
@@ -263,18 +265,18 @@ impl Repository {
                 let ws_dest = old_ws.join(path);
                 // Remove stale entry in workspace if it exists
                 if ws_dest.is_dir() {
-                    let _ = std::fs::remove_dir_all(&ws_dest);
+                    std::fs::remove_dir_all(&ws_dest)?;
                 } else if ws_dest.exists() {
-                    let _ = std::fs::remove_file(&ws_dest);
+                    std::fs::remove_file(&ws_dest)?;
                 }
                 // Ensure parent dirs exist in workspace
                 if let Some(parent) = ws_dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    std::fs::create_dir_all(parent)?;
                 }
                 // Move from working copy → workspace (O(1) rename)
                 let src = self.root.join(path);
                 if src.exists() {
-                    let _ = std::fs::rename(&src, &ws_dest);
+                    std::fs::rename(&src, &ws_dest)?;
                 }
             }
         }
@@ -290,7 +292,7 @@ impl Repository {
             let abs_path = self.root.join(&path);
             if abs_path.exists()
                 && !abs_path.is_dir()
-                && working_copy.remove_path(&path, false).is_ok()
+                && filesystem_working_copy.remove_path(&path, false).is_ok()
             {
                 removed_paths.push(path);
 
@@ -314,51 +316,30 @@ impl Repository {
             .iter()
             .map(|s| s.as_str())
             .chain(ignored_paths.iter().map(|s| s.as_str()));
-        cleanup_empty_ancestors(&self.root, all_removed);
+        cleanup_empty_ancestors(working_copy, &self.root, all_removed);
 
         // ── Phase 4: Materialize the new view's tracked files from graph ─
         //
-        // Instead of materializing ALL files, compute which files differ
-        // between the old and new views and only materialize those.
-        // Files shared between views with identical content are untouched.
-        let result = {
-            let mut affected_paths: HashSet<String> = HashSet::new();
-            affected_paths.extend(deferred_paths);
-
-            // Files only on the new view must always be materialized.
-            for path in new_files.difference(&old_files) {
-                affected_paths.insert(path.clone());
-            }
-
-            // Membership-only differences identify changes whose paths may
-            // need rematerialization. Their change objects were loaded and
-            // validated before the switch's first external effect.
-            affected_paths.extend(differing_paths);
-
-            if affected_paths.is_empty() {
-                self.materialize_parallel_with_visibility(
-                    None,
-                    new_visibility.clone(),
-                    new_view_id,
-                )?
-            } else {
-                self.materialize_parallel_with_visibility(
-                    Some(affected_paths),
-                    new_visibility.clone(),
-                    new_view_id,
-                )?
-            }
-        };
+        // Run a complete target materialization. Scoped FILE_INDEX entries let
+        // unchanged files skip writes while still proving the whole desired view
+        // was output successfully before its materialized state is recorded.
+        let result = self.materialize_parallel_with_visibility(
+            working_copy,
+            None,
+            new_visibility.clone(),
+            new_view_id,
+        )?;
 
         // ── Phase 5: Restore ignored files from the NEW view's workspace ─
         //
-        // Move artifacts from `.atomic/workspaces/<new_view>/` back into
-        // the working copy.  Again O(1) renames, no data copying.
-        let new_ws = workspace_path(&self.dot_dir, view);
+        // Move artifacts from the working-copy-scoped workspace back into the
+        // working copy. Again O(1) renames, no data copying.
+        let new_ws = working_copy_workspace_path(&self.dot_dir, working_copy, view);
         if new_ws.is_dir() {
-            self.restore_workspace_to_working_copy(&new_ws);
+            self.restore_workspace_to_working_copy(&new_ws)?;
         }
 
+        self.mark_working_copy_materialized(working_copy, view)?;
         Ok(result)
     }
 
@@ -367,12 +348,9 @@ impl Repository {
     /// Walks the top-level entries in `ws_dir` and moves each into the
     /// project root via `rename()`.  Skips the `.atomic` directory if
     /// present.
-    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) {
-        let entries = match std::fs::read_dir(ws_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
+    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) -> Result<(), RepositoryError> {
+        for entry in std::fs::read_dir(ws_dir)? {
+            let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
@@ -389,16 +367,17 @@ impl Repository {
             // was created by materialize for tracked content),
             // merge by recursing into it rather than replacing it.
             if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
-                let _ = std::fs::remove_dir_all(&src);
+                self.merge_dir_into(&src, &dst)?;
+                std::fs::remove_dir_all(&src)?;
             } else {
                 // Ensure parent exists
                 if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    std::fs::create_dir_all(parent)?;
                 }
-                let _ = std::fs::rename(&src, &dst);
+                std::fs::rename(&src, &dst)?;
             }
         }
+        Ok(())
     }
 
     /// Recursively merge the contents of `src_dir` into `dst_dir`.
@@ -408,26 +387,24 @@ impl Repository {
     /// workspace artifacts into a directory that already contains tracked
     /// files (e.g. `src/` might have tracked `.ts` files from the graph
     /// AND ignored `.cache/` from the workspace).
-    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) {
-        let entries = match std::fs::read_dir(src_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
+    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) -> Result<(), RepositoryError> {
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
             let name = entry.file_name();
             let src = entry.path();
             let dst = dst_dir.join(&name);
 
             if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
-                let _ = std::fs::remove_dir_all(&src);
+                self.merge_dir_into(&src, &dst)?;
+                std::fs::remove_dir_all(&src)?;
             } else {
                 if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    std::fs::create_dir_all(parent)?;
                 }
-                let _ = std::fs::rename(&src, &dst);
+                std::fs::rename(&src, &dst)?;
             }
         }
+        Ok(())
     }
 
     /// Walk the working copy and collect relative paths of files and

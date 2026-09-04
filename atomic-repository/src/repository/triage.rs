@@ -269,7 +269,10 @@ mod tests {
             .save_to_store(true)
             .apply_after_record(true)
             .enrich_kg(false);
-        *repo.record(header, options).unwrap().hash()
+        *repo
+            .record(repo.require_working_copy_id().unwrap(), header, options)
+            .unwrap()
+            .hash()
     }
 
     /// The key regression: coverage resolves from the change's own `file_ops`
@@ -287,7 +290,12 @@ mod tests {
         let foo = temp.path().join("src/foo.rs");
         std::fs::create_dir_all(foo.parent().unwrap()).unwrap();
         std::fs::write(&foo, "fn main() {}\n").unwrap();
-        repo.add("src/foo.rs", TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "src/foo.rs",
+            TrackingOptions::default(),
+        )
+        .unwrap();
         let hash = record_all(&repo, "add foo");
 
         // Precondition: the KG has NO MODIFIES edge for this change (unenriched).
@@ -335,7 +343,12 @@ mod tests {
         let bar = temp.path().join("src/bar.rs");
         std::fs::create_dir_all(bar.parent().unwrap()).unwrap();
         std::fs::write(&bar, "fn bar() {}\n").unwrap();
-        repo.add("src/bar.rs", TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "src/bar.rs",
+            TrackingOptions::default(),
+        )
+        .unwrap();
         let hash = record_all(&repo, "add bar");
 
         // An intent whose task touches a DIFFERENT file.
@@ -366,12 +379,14 @@ mod tests {
         // Base change on the shared/base view.
         let file = temp.path().join("a.txt");
         std::fs::write(&file, "base\n").unwrap();
-        repo.add("a.txt", TrackingOptions::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "a.txt", TrackingOptions::default())
+            .unwrap();
         record_all(&repo, "base change");
 
         // Fork a feature view and record a change only there.
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         std::fs::write(&file, "base\nfeature edit\n").unwrap();
         record_all(&repo, "feature change");
 
@@ -405,7 +420,12 @@ mod tests {
 
         let file = temp.path().join("a.txt");
         std::fs::write(&file, "base\n").unwrap();
-        repo.add("a.txt", TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "a.txt",
+            TrackingOptions::default(),
+        )
+        .unwrap();
         record_all(&repo, "base change");
 
         repo.create_view_from("feature", &base_view).unwrap();
