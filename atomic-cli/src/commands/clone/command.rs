@@ -1201,7 +1201,7 @@ impl Clone {
             if let Err(e) = repo.init_kg() {
                 log::warn!("KG table init failed: {}", e);
             }
-            match repo.kg_enrich_from_vcs() {
+            match repo.kg_enrich_from_vcs(working_copy) {
                 Ok(kg_stats) => log::info!("KG enriched: {}", kg_stats),
                 Err(e) => log::warn!("KG enrichment failed: {}", e),
             }

@@ -454,7 +454,11 @@ impl Default for Status {
 
 impl Status {
     /// Print debug information about ignore rules.
-    fn print_ignore_debug(&self, repo: &Repository) -> CliResult<()> {
+    fn print_ignore_debug(
+        &self,
+        repo: &Repository,
+        working_copy: atomic_core::WorkingCopyId,
+    ) -> CliResult<()> {
         use std::path::Path;
 
         println!("=== Ignore Debug Information ===");
@@ -473,7 +477,11 @@ impl Status {
             }
         }
 
-        let rules = repo.ignore_rules();
+        let rules = repo
+            .ignore_rules(working_copy)
+            .map_err(|e| CliError::InvalidRepository {
+                reason: e.to_string(),
+            })?;
         println!("\nIgnore rules loaded:");
         println!("  Has local rules: {}", rules.has_local_rules());
         println!("  Has global rules: {}", rules.has_global_rules());
@@ -585,7 +593,7 @@ impl Command for Status {
 
         // Debug ignore patterns if requested
         if self.debug_ignore {
-            self.print_ignore_debug(&repo)?;
+            self.print_ignore_debug(&repo, working_copy)?;
         }
 
         // Get status options

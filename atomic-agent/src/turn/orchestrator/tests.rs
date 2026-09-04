@@ -144,8 +144,12 @@ async fn test_session_start_in_sandbox_adopts_view_without_forking() {
 
     // Provision a sandbox working tree bound to the agent view.
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo); // release the canonical pristine lock before reopening
 
     // Sanity: the sandbox opens on its provisioned view.
@@ -203,8 +207,12 @@ async fn test_sandbox_session_records_the_draft_it_forked_from() {
     repo.create_view_from("agent-sbx", "feature-x").unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -236,7 +244,12 @@ async fn test_sandbox_session_on_a_root_view_records_no_parent() {
     let root = repo.current_view().to_string(); // "dev", created with no parent
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), &root).unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        &root,
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -263,8 +276,12 @@ async fn test_full_turn_in_sandbox_records_provenance_into_canonical_graph() {
     let user_view = repo.current_view().to_string();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), &user_view)
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        &user_view,
+    )
+    .unwrap();
     drop(repo);
 
     // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
@@ -349,8 +366,12 @@ async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
     repo.create_view_from("agent-draft", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-draft")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-draft",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -1313,8 +1334,12 @@ async fn test_sandbox_session_keeps_provisioned_view_under_managed_run() {
     repo.create_view_from("agent-sbx", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -1393,8 +1418,12 @@ async fn test_sandbox_session_files_land_in_canonical_store() {
     repo.create_view_from("agent-sbx2", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx2")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx2",
+    )
+    .unwrap();
     drop(repo);
 
     let mut orch = TurnOrchestrator::new(sandbox_dir.path()).await.unwrap();

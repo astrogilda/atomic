@@ -771,7 +771,7 @@ impl Command for Import {
             // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
-                match repo.kg_enrich_from_vcs() {
+                match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
                     Err(e) => log::warn!("KG enrichment failed: {}", e),
                 }
@@ -866,7 +866,7 @@ impl Command for Import {
             // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
-                match repo.kg_enrich_from_vcs() {
+                match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
                     Err(e) => log::warn!("KG enrichment failed: {}", e),
                 }

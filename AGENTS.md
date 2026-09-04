@@ -359,16 +359,25 @@ This simplifies the codebase while maintaining semantic clarity.
 
 ```
 .atomic/
-├── pristine/              # Graph database (redb)
-│   └── data.mdb           # Single database file
+├── pristine.redb          # Graph database
 ├── changes/               # Content-addressed change files
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration
-├── current_view           # Active view name
-├── working_copy_id        # Working copy state
-└── workspaces/            # Per-view shelved artifacts
-    └── <view_name>/       # Shelved build artifacts for this view
+├── working_copy_id        # Canonical 26-character WorkingCopyId (ULID)
+├── current_view           # Derived compatibility output; never authoritative
+└── working-copies/
+    └── <working-copy-id>/
+        └── workspaces/
+            └── <view_name>/ # Per-working-copy shelved artifacts
 ```
+
+`WORKING_COPIES` is authoritative for each physical directory's desired view/state
+and last verified materialized state. Ordinary directories, linked Git worktrees,
+and agent sandboxes have distinct IDs. Linked worktrees keep local
+`.atomic/working_copy_id` and `.atomic/current_view` files plus an
+`.atomic/repository` pointer to the common Atomic directory. Working-copy-aware
+repository APIs require an explicit `WorkingCopyId`; view-scoped graph APIs remain
+usable without one.
 
 ### Workspace Shelving
 
@@ -464,6 +473,7 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Canonical graph — all edges (multimap) |
 | `INODE_GRAPH` | (Inode, GraphNode) ([u8; 32]) | [GraphEdge] | File-scoped index |
 | `VIEWS` | name (str) | ViewState (var) | View metadata (scope, parent, merkle) |
+| `WORKING_COPIES` | WorkingCopyId ([u8; 16]) | WorkingCopyRecord (versioned bytes) | Desired/materialized state per physical working directory or Git worktree |
 | `VIEW_CHANGES` | (view_id, seq) ([u8; 16]) | change_id (u64) | Change log per view |
 | `REV_VIEW_CHANGES` | (view_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
 | `TREE` | path (str) | inode (u64) | Path → inode |

@@ -416,7 +416,7 @@ impl Repository {
     ///
     /// Paths that live inside `.atomic/` are never returned.
     fn collect_ignored_paths_on_disk(&self) -> Vec<String> {
-        let rules = self.ignore_rules();
+        let rules = self.load_ignore_rules();
         let mut result = Vec::new();
 
         // Recursive walker that stops descending into ignored directories.

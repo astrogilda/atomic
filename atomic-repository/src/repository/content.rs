@@ -724,6 +724,7 @@ impl Repository {
     /// An `ArchiveOutcome` with details about the created archive.
     pub fn archive_tag<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         tag_name: &str,
         destination: P,
         mut options: ArchiveOptions,
@@ -739,7 +740,7 @@ impl Repository {
         options.state = Some(tag.state);
 
         // Archive with the tag's state
-        self.archive(destination, options)
+        self.archive(working_copy, destination, options)
     }
 }
 

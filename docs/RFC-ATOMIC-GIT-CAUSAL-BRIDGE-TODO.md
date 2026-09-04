@@ -30,15 +30,15 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-1A: Persistent working-copy identity and API boundary**  
-  Intent: `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` · Priority: high · Prerequisites: Phase N, CB-0C (done)
-  Add durable `WorkingCopyId` records for ordinary and linked Git worktrees, require explicit identity at working-copy-aware repository boundaries, and make `.atomic/current_view` a derived compatibility artifact.
+- [ ] **READY — CB-1B: Durable operation/effect journal, ordered locks, crash recovery**
+  Intent: pending · Priority: high · Prerequisites: CB-1A, CB-N2 (done)
+  Add versioned operation/effect storage, enforce common→working-copy→pristine→shelf lock order, and make interrupted external effects recover idempotently.
 
 ### Parallel safety workstream
 
 Phase 0 and Phase N are complete; no additional safety prerequisite is ready in parallel.
 
-Phase 1 begins with CB-1A. CB-1B remains blocked until CB-1A completes.
+Phase 1 continues with CB-1B. CB-1C remains blocked until CB-1B completes.
 
 ---
 
@@ -64,6 +64,7 @@ Phase 1 begins with CB-1A. CB-1B remains blocked until CB-1A completes.
 | [x] DONE | 0C shared stale-baseline guard | `ATOM::continuouslee::74` / `01M1MA2019Z6XPBY3Z0TRJNYJ4` | One early guard across readers/writers/materializers/agents with v2 checkpoint evidence and WIP-backed refusal. |
 | [x] DONE | N8 native rename-plus-edit identity and explicit move evidence | `ATOM::continuouslee::75` / `01M1PBEFQ779K72YF5YAW6RS9W` | Authoritative staged moves retain inode/trunk through arbitrary edits; similarity is `ProbableMove`; ambiguous candidates remain delete+add with `RenameUnresolved`. |
 | [x] DONE | N9 native derived-index verification and atomic repair | `ATOM::continuouslee::76` / `01M1PH46D0HDWEJWNZYAS2EEY7` | Cache-independent all-view oracle, deterministic diagnostics, ambiguity/staging preservation, immediate all-or-nothing replacement, and read-only doctor checks. |
+| [x] DONE | 1A persistent working-copy identity and API boundary | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` | Versioned pristine records, safe legacy/copy migration, distinct linked worktrees and sandboxes, explicit working-copy capabilities, scoped caches/shelves, and derived `current_view`. |
 
 ---
 
@@ -146,8 +147,8 @@ execution.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] IN PROGRESS | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` |
-| [ ] BLOCKED | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | pending |
+| [x] DONE | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` |
+| [ ] READY | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | pending |
 | [ ] BLOCKED | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
 
 ### CB-1A definition of done
@@ -505,10 +506,10 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-N8.
-2. **Native integrity:** CB-N34 and CB-N6 are done; CB-N8 → CB-N9 remain.
+1. **Now:** CB-1B.
+2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
-4. **Operation substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1.
+4. **Operation substrate:** CB-1A is done; CB-1B → CB-1C → CB-FMT1.
 5. **Snapshots and semantics:** CB-2A; CB-3A → CB-3B/CB-3C → CB-2B.
 6. **Equivalence:** CB-4A → CB-4B → CB-4C.
 7. **Shared transaction:** CB-5A → CB-5B → CB-5C.
@@ -521,5 +522,5 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-N8 intent next, then CB-N9 with `blocked_by` frontmatter after CB-N8 completes.
+- Allocate the CB-1B intent next with CB-1A and CB-N2 encoded in `blocked_by` frontmatter.
 - When an intent is created, replace `pending` in this tracker with its human key and UID.

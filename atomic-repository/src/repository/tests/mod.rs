@@ -56,6 +56,43 @@ impl TestRepository {
         self.working_copy
     }
 
+    pub fn ignore_rules(&self) -> IgnoreRules {
+        self.repo.ignore_rules(self.working_copy).unwrap()
+    }
+
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.repo
+            .is_ignored(self.working_copy, path, is_dir)
+            .unwrap()
+    }
+
+    pub fn archive<P: AsRef<Path>>(
+        &self,
+        destination: P,
+        options: ArchiveOptions,
+    ) -> Result<ArchiveOutcome, RepositoryError> {
+        self.repo.archive(self.working_copy, destination, options)
+    }
+
+    pub fn archive_tag<P: AsRef<Path>>(
+        &self,
+        tag_name: &str,
+        destination: P,
+        options: ArchiveOptions,
+    ) -> Result<ArchiveOutcome, RepositoryError> {
+        self.repo
+            .archive_tag(self.working_copy, tag_name, destination, options)
+    }
+
+    pub fn provision_sandbox<P: AsRef<Path>>(
+        &self,
+        destination: P,
+        view: &str,
+    ) -> Result<usize, RepositoryError> {
+        self.repo
+            .provision_sandbox(self.working_copy, destination, view)
+    }
+
     pub fn add<P: AsRef<Path>>(
         &self,
         path: P,

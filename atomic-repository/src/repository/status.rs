@@ -517,7 +517,7 @@ impl Repository {
         );
         if scan_untracked {
             let rules = if options.respect_ignore_files {
-                Some(self.ignore_rules())
+                Some(self.load_ignore_rules())
             } else {
                 None
             };

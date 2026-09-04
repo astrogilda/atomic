@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::{RecordOptions, StatusOptions, TrackingOptions};
+use crate::{ArchiveOptions, RecordOptions, StatusOptions, TrackingOptions};
 use atomic_core::change::ChangeHeader;
 use atomic_core::pristine::{MutTxnT, Pristine, TreeTxnT, ViewTxnT, WorkingCopyTxnT};
 use atomic_core::{Hash, WorkingCopyId};
@@ -283,6 +283,25 @@ fn working_copy_boundary_rejects_an_id_from_another_repository_before_mutation()
         fs::read(first.path().join("sentinel.txt")).unwrap(),
         b"unchanged\n"
     );
+
+    let archive = first.path().join("archive");
+    assert!(matches!(
+        first_repo.archive(wrong_id, &archive, ArchiveOptions::directory()),
+        Err(RepositoryError::WorkingCopyIdentityMismatch { .. })
+    ));
+    assert!(!archive.exists());
+
+    assert!(matches!(
+        first_repo.kg_enrich_files(wrong_id),
+        Err(RepositoryError::WorkingCopyIdentityMismatch { .. })
+    ));
+
+    let sandbox = first.path().join("sandbox");
+    assert!(matches!(
+        first_repo.provision_sandbox(wrong_id, &sandbox, "dev"),
+        Err(RepositoryError::WorkingCopyIdentityMismatch { .. })
+    ));
+    assert!(!sandbox.exists());
 }
 
 #[test]

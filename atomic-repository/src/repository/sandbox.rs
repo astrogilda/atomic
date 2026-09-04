@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use atomic_core::output::alive::RetrieveOptions;
 use atomic_core::pristine::{CachedGraphTxn, Pristine, ViewTxnT};
+use atomic_core::WorkingCopyId;
 
 use serde::{Deserialize, Serialize};
 
@@ -132,9 +133,9 @@ impl Repository {
     /// `changes` store, so there is exactly one graph. `view` selects which
     /// view this sandbox operates on (typically the agent's own draft view).
     ///
-    /// The canonical `current_view` file on disk is left untouched — the view
-    /// is held in memory for this handle only, so concurrent agents on
-    /// different views never clobber one another.
+    /// The sandbox's persistent working-copy record selects its desired view.
+    /// Its local `.atomic/current_view` is derived compatibility output; the
+    /// canonical working copy's record and compatibility file remain untouched.
     ///
     /// redb serialises writers, so concurrent `record`s from several agents
     /// take turns; reads run concurrently via MVCC.
@@ -185,6 +186,7 @@ impl Repository {
     /// directory is **never** cloned — the sandbox shares the canonical graph
     /// via [`Repository::open_sandbox`].
     ///
+    /// `working_copy` identifies and validates the source directory being cloned.
     /// Returns the number of files provisioned.
     ///
     /// Also writes a [`SANDBOX_POINTER`] file into `dest` so that `atomic`
@@ -192,9 +194,11 @@ impl Repository {
     /// graph and the given `view`.
     pub fn provision_sandbox<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         dest: P,
         view: &str,
     ) -> Result<usize, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let dest = dest.as_ref();
         {
             let txn = self

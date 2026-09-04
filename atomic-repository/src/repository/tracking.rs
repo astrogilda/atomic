@@ -49,7 +49,7 @@ impl Repository {
         let mut stats = TrackingStats::new();
 
         // Load ignore rules
-        let rules = self.ignore_rules();
+        let rules = self.load_ignore_rules();
 
         // Check for internal paths and ignore patterns
         let abs_path = self.root.join(path);
@@ -279,7 +279,7 @@ impl Repository {
         let mut stats = TrackingStats::new();
 
         // Load ignore rules
-        let rules = self.ignore_rules();
+        let rules = self.load_ignore_rules();
 
         // Check for internal paths and ignore patterns
         // For add_directory, we know the path is a directory

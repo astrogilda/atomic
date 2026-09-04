@@ -1235,7 +1235,7 @@ impl Repository {
         // index already exists, so this maintains — never builds — it.
         if options.get_enrich_kg() && outcome.was_saved() {
             let hash = *outcome.hash();
-            if let Err(e) = self.kg_enrich_change(&hash) {
+            if let Err(e) = self.kg_enrich_change(working_copy, &hash) {
                 log::debug!("KG enrich for change: {}", e);
             }
             if let Err(e) = crate::content_search::update_content_index_paths(

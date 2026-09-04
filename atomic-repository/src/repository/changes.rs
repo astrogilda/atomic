@@ -27,20 +27,28 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// let repo = Repository::open(".")?;
-    /// let rules = repo.ignore_rules();
+    /// let rules = repo.ignore_rules(working_copy)?;
     ///
     /// if rules.is_ignored(Path::new("target/debug"), true) {
     ///     println!("Path is ignored");
     /// }
     /// ```
-    pub fn ignore_rules(&self) -> IgnoreRules {
+    pub fn ignore_rules(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<IgnoreRules, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        Ok(self.load_ignore_rules())
+    }
+
+    pub(super) fn load_ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
     }
 
     /// Check if a path should be ignored.
     ///
     /// This is a convenience method that loads ignore rules and checks the path.
-    /// If you need to check multiple paths, use [`Self::ignore_rules()`] instead
+    /// If you need to check multiple paths, use [`Self::ignore_rules`] instead
     /// to avoid reloading the rules for each check.
     ///
     /// # Arguments
@@ -51,9 +59,13 @@ impl Repository {
     /// # Returns
     ///
     /// `true` if the path should be ignored, `false` otherwise.
-    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let rules = self.ignore_rules();
-        rules.is_ignored(path, is_dir)
+    pub fn is_ignored(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &Path,
+        is_dir: bool,
+    ) -> Result<bool, RepositoryError> {
+        Ok(self.ignore_rules(working_copy)?.is_ignored(path, is_dir))
     }
 
     /// Save a change to the repository.

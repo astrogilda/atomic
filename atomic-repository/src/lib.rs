@@ -45,7 +45,7 @@
 //!
 //! // Create archives
 //! use atomic_repository::ArchiveOptions;
-//! repo.archive("release.tar.gz", ArchiveOptions::default())?;
+//! repo.archive(working_copy, "release.tar.gz", ArchiveOptions::default())?;
 //! ```
 //!
 //! # Architecture
