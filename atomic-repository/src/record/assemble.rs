@@ -12,7 +12,10 @@ use atomic_core::types::{Base32, Hash, Merkle};
 
 use crate::status::{FileStatus, FileStatusEntry};
 
-use super::options::RecordOptions;
+use super::{
+    move_evidence::{extract_move_evidence, merge_move_evidence, MoveEvidence, MoveEvidenceError},
+    options::RecordOptions,
+};
 
 // STATISTICS
 
@@ -229,6 +232,25 @@ impl RecordOutcome {
         &self.change
     }
 
+    /// Decode the advisory move evidence attached to the recorded change.
+    ///
+    /// The evidence is read directly from `Change::unhashed`, so this accessor
+    /// cannot drift from mutations made through [`Self::change_mut`].
+    pub fn move_evidence(&self) -> Result<Option<MoveEvidence>, MoveEvidenceError> {
+        extract_move_evidence(&self.change)
+    }
+
+    /// Attach advisory move evidence to the recorded change.
+    ///
+    /// This updates only the namespaced unhashed payload and must be called
+    /// before V3 bytes are cached for hash-stable saving.
+    pub fn set_move_evidence(&mut self, evidence: MoveEvidence) -> Result<(), MoveEvidenceError> {
+        if self.v3_bytes.is_some() {
+            return Err(MoveEvidenceError::V3BytesAlreadyCached);
+        }
+        merge_move_evidence(&mut self.change, &evidence)
+    }
+
     /// Get a mutable reference to the recorded change.
     ///
     /// Used by `atomic-agent` to attach unhashed data (transcript, reasoning)
@@ -415,4 +437,37 @@ pub fn filter_files<'a>(
         })
         .filter(|f| options.should_include(&f.path().to_string_lossy()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use atomic_core::{
+        change::{Change, ChangeHeader},
+        types::{Hash, Inode},
+    };
+
+    use super::*;
+    use crate::record::{AuthoritativeMove, MoveAuthority};
+
+    #[test]
+    fn outcome_exposes_evidence_from_its_change() {
+        let change = Change::empty(ChangeHeader::builder().message("move").build());
+        let mut outcome = RecordOutcome::new(change, Hash::of(b"move"), RecordStats::new());
+        let mut evidence = MoveEvidence::new();
+        evidence.insert_authoritative(AuthoritativeMove::new(
+            "old.rs",
+            "new.rs",
+            Inode::new(42),
+            MoveAuthority::ExplicitAtomicMove,
+        ));
+        outcome.set_move_evidence(evidence.clone()).unwrap();
+        outcome.set_v3_bytes(vec![1, 2, 3]);
+
+        assert_eq!(outcome.move_evidence().unwrap(), Some(evidence));
+        assert_eq!(outcome.v3_bytes(), Some([1, 2, 3].as_slice()));
+        assert_eq!(
+            outcome.move_evidence().unwrap(),
+            extract_move_evidence(outcome.change()).unwrap()
+        );
+    }
 }

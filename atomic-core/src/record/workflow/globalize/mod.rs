@@ -114,6 +114,7 @@ mod error;
 mod file;
 mod helpers;
 mod hunk;
+mod name_conflict;
 mod options;
 mod pipeline;
 mod resolve;
@@ -128,6 +129,9 @@ pub(crate) use helpers::{
     vertex_to_option_hash,
 };
 pub use hunk::{globalize_hunk, should_use_opaque_generated_vertices, CRDT_DIFF_LINE_THRESHOLD};
+pub use name_conflict::{
+    globalize_solve_name_conflict, globalize_unsolve_name_conflict, NameConflictClaim,
+};
 pub use options::*;
 pub use pipeline::globalize_recorded_file;
 pub use resolve::*;

@@ -29,6 +29,96 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Hash;
 
+/// Why Atomic cannot safely attribute the current working-copy bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIncompleteOrigin {
+    /// Git moved the working copy, but the pre-checkout source cannot be
+    /// established well enough to attribute the resulting bytes.
+    UnknownPostCheckout,
+}
+
+impl std::fmt::Display for SessionIncompleteOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPostCheckout => write!(f, "unknown post-checkout origin"),
+        }
+    }
+}
+
+/// Durable refusal details for a managed agent session.
+///
+/// This is intentionally a plain serializable value. Git drift/WIP capture can
+/// construct it without coupling the session ledger to Git-specific APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteSession {
+    pub reason: String,
+    pub paths: Vec<String>,
+    pub recovery_ref: String,
+    pub origin: SessionIncompleteOrigin,
+}
+
+impl IncompleteSession {
+    /// Build deterministic refusal details, removing empty and duplicate paths.
+    pub fn new(
+        reason: impl Into<String>,
+        paths: impl IntoIterator<Item = String>,
+        recovery_ref: impl Into<String>,
+        origin: SessionIncompleteOrigin,
+    ) -> Self {
+        let mut paths: Vec<String> = paths.into_iter().filter(|path| !path.is_empty()).collect();
+        paths.sort();
+        paths.dedup();
+        Self {
+            reason: reason.into(),
+            paths,
+            recovery_ref: recovery_ref.into(),
+            origin,
+        }
+    }
+}
+
+impl std::fmt::Display for IncompleteSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; recovery ref {}; origin {}",
+            self.reason, self.recovery_ref, self.origin
+        )?;
+        if !self.paths.is_empty() {
+            write!(f, "; affected paths: {}", self.paths.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Durable lifecycle outcome for an indexed agent session.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    #[default]
+    Active,
+    Ended,
+    Incomplete(IncompleteSession),
+}
+
+impl SessionStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Ended => "ended",
+            Self::Incomplete(_) => "incomplete",
+        }
+    }
+
+    pub fn incomplete(&self) -> Option<&IncompleteSession> {
+        match self {
+            Self::Incomplete(outcome) => Some(outcome),
+            Self::Active | Self::Ended => None,
+        }
+    }
+}
+
 /// Repository-indexed identity and current state for an agent session.
 ///
 /// The JSON file under `.atomic/sessions/` remains mutable runtime state. This
@@ -45,6 +135,43 @@ pub struct SessionRecord {
     pub turn_count: u32,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    pub status: SessionStatus,
+}
+
+/// SessionRecord encoding written before durable lifecycle outcomes existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecordV1 {
+    session_id: String,
+    json_path: String,
+    view_name: Option<String>,
+    parent_view: Option<String>,
+    first_provenance: Option<Hash>,
+    latest_provenance: Option<Hash>,
+    turn_count: u32,
+    started_at: i64,
+    ended_at: Option<i64>,
+}
+
+impl From<SessionRecordV1> for SessionRecord {
+    fn from(value: SessionRecordV1) -> Self {
+        let status = if value.ended_at.is_some() {
+            SessionStatus::Ended
+        } else {
+            SessionStatus::Active
+        };
+        Self {
+            session_id: value.session_id,
+            json_path: value.json_path,
+            view_name: value.view_name,
+            parent_view: value.parent_view,
+            first_provenance: value.first_provenance,
+            latest_provenance: value.latest_provenance,
+            turn_count: value.turn_count,
+            started_at: value.started_at,
+            ended_at: value.ended_at,
+            status,
+        }
+    }
 }
 
 /// Index entry connecting one session turn to its immutable Atomic objects.
@@ -205,6 +332,7 @@ impl SessionRecord {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(bytes)
+            .or_else(|_| postcard::from_bytes::<SessionRecordV1>(bytes).map(SessionRecord::from))
     }
 }
 
@@ -915,12 +1043,43 @@ mod tests {
             turn_count: 2,
             started_at: 100,
             ended_at: None,
+            status: SessionStatus::Incomplete(IncompleteSession::new(
+                "working copy moved during managed turn",
+                vec!["src/z.rs".into(), "src/a.rs".into(), "src/a.rs".into()],
+                "refs/atomic/wip/run-1",
+                SessionIncompleteOrigin::UnknownPostCheckout,
+            )),
         };
 
         assert_eq!(
             SessionRecord::from_bytes(&record.to_bytes()).unwrap(),
             record
         );
+        assert_eq!(
+            record.status.incomplete().unwrap().paths,
+            vec!["src/a.rs", "src/z.rs"]
+        );
+    }
+
+    #[test]
+    fn test_session_record_reads_pre_status_encoding() {
+        let legacy = SessionRecordV1 {
+            session_id: "legacy-session".into(),
+            json_path: ".atomic/sessions/legacy-session.json".into(),
+            view_name: Some("legacy-view".into()),
+            parent_view: Some("main".into()),
+            first_provenance: None,
+            latest_provenance: None,
+            turn_count: 0,
+            started_at: 100,
+            ended_at: Some(200),
+        };
+
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let loaded = SessionRecord::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.session_id, "legacy-session");
+        assert_eq!(loaded.status, SessionStatus::Ended);
+        assert_eq!(loaded.ended_at, Some(200));
     }
 
     #[test]

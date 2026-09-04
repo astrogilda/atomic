@@ -35,6 +35,13 @@ pub struct RecordOptions {
     /// Whether to record all changes (ignore paths filter).
     all: bool,
 
+    /// Whether untracked files should be included as additions.
+    ///
+    /// Kept separate from `all` because internal callers commonly use `all` to
+    /// mean every already-tracked change, while CLI `record --all` opts into
+    /// untracked discovery explicitly.
+    include_untracked: bool,
+
     /// Diff algorithm to use.
     algorithm: Algorithm,
 
@@ -142,6 +149,13 @@ impl RecordOptions {
     #[must_use]
     pub fn with_all(mut self, all: bool) -> Self {
         self.all = all;
+        self
+    }
+
+    /// Set whether untracked files should be included as additions.
+    #[must_use]
+    pub fn include_untracked(mut self, include: bool) -> Self {
+        self.include_untracked = include;
         self
     }
 
@@ -321,6 +335,12 @@ impl RecordOptions {
         self.all
     }
 
+    /// Get whether untracked files should be included as additions.
+    #[must_use]
+    pub fn get_include_untracked(&self) -> bool {
+        self.include_untracked
+    }
+
     /// Get the diff algorithm.
     #[must_use]
     pub fn algorithm(&self) -> Algorithm {
@@ -454,6 +474,7 @@ impl Default for RecordOptions {
         Self {
             paths: Vec::new(),
             all: false,
+            include_untracked: false,
             algorithm: Algorithm::Myers,
             default_encoding: Encoding::Utf8,
             metadata_bytes: Vec::new(),

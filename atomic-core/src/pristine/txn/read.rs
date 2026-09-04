@@ -3,7 +3,7 @@
 //! This module provides the `ReadTxn` struct which implements read-only
 //! access to the pristine database.
 
-use redb::{ReadTransaction, ReadableTable, ReadableTableMetadata};
+use redb::{ReadTransaction, ReadableMultimapTable, ReadableTable, ReadableTableMetadata};
 
 use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
 use crate::pristine::traits::tag::GitShaIndexTxnT;
@@ -17,11 +17,14 @@ use crate::types::{
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
+use crate::pristine::path_claim::{
+    decode_path_claim_event, PathClaimEntry, PathClaimEvent, PATH_CLAIM_SCHEMA_KEY,
+};
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, StoredConflict, TreeTxnT,
-    ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, PathClaimTxnT,
+    StoredConflict, TreeTxnT, ViewState, ViewTxnT,
 };
 
 use super::helpers::{
@@ -55,12 +58,9 @@ impl ReadTxn {
 
     /// Enumerate every `(inode, path)` pair in `REV_TREE`.
     ///
-    /// Unlike [`TreeTxnT::iter_tree`], which walks the single-valued
-    /// `path -> inode` `TREE` index (so it hides every inode a later
-    /// same-path create overwrote), this walks the inode-keyed `REV_TREE`
-    /// and therefore exposes ALL inodes that ever claimed a path. Callers
-    /// use it to detect name conflicts: a path with two distinct inodes that
-    /// are both visible and alive under a view's change filter.
+    /// Healthy databases contain the exact inverse of `TREE`. Legacy
+    /// reverse-only rows may be inspected during migration, but durable name
+    /// claims belong in `PATH_CLAIMS` and must not be created here.
     pub fn iter_rev_tree(&self) -> PristineResult<Vec<(Inode, String)>> {
         let table = self.txn.open_table(REV_TREE)?;
         let mut results = Vec::new();
@@ -69,6 +69,47 @@ impl ReadTxn {
             results.push((Inode::new(k.value()), v.value().to_string()));
         }
         Ok(results)
+    }
+}
+
+impl PathClaimTxnT for ReadTxn {
+    fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
+        let table = self.txn.open_table(PRISTINE_META)?;
+        let version = table
+            .get(PATH_CLAIM_SCHEMA_KEY)?
+            .map(|version| version.value());
+        Ok(version)
+    }
+
+    fn get_path_claims(&self, path: &str) -> PristineResult<Vec<PathClaimEvent>> {
+        let table = self.txn.open_multimap_table(PATH_CLAIMS)?;
+        let mut events = Vec::new();
+        for value in table.get(path)? {
+            let value = value?;
+            events.push(decode_path_claim_event(value.value())?);
+        }
+        Ok(events)
+    }
+
+    fn iter_path_claims(&self) -> PristineResult<Vec<PathClaimEntry>> {
+        let table = self.txn.open_multimap_table(PATH_CLAIMS)?;
+        let mut entries = Vec::new();
+        for row in table.iter()? {
+            let (path, values) = row?;
+            let path = path.value().to_string();
+            for value in values {
+                let value = value?;
+                entries.push(PathClaimEntry::new(
+                    path.clone(),
+                    decode_path_claim_event(value.value())?,
+                ));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn iter_rev_tree_pairs(&self) -> PristineResult<Vec<(Inode, String)>> {
+        self.iter_rev_tree()
     }
 }
 
@@ -352,13 +393,26 @@ impl ViewTxnT for ReadTxn {
         }
     }
 
-    fn list_views(&self) -> PristineResult<Vec<String>> {
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
         let table = self.txn.open_table(VIEWS)?;
-        let mut names = Vec::new();
-        for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
-            names.push(k.value().to_string());
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (name, value) = entry?;
+            rows.push((
+                name.value().to_string(),
+                deserialize_view_state(value.value())?,
+            ));
         }
-        Ok(names)
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        Ok(self
+            .snapshot_views()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
@@ -384,6 +438,22 @@ impl ViewTxnT for ReadTxn {
             }
         }
         Ok(out)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let (view_id, inode) = decode_view_seq(key.value());
+            rows.push((
+                view_id,
+                Inode::new(inode),
+                deserialize_conflicts(value.value())?,
+            ));
+        }
+        rows.sort_by_key(|(view_id, inode, _)| (*view_id, *inode));
+        Ok(rows)
     }
 
     fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
@@ -495,6 +565,66 @@ impl TreeTxnT for ReadTxn {
             Some(value) => Ok(Some(Inode::new(value.value()))),
             None => Ok(None),
         }
+    }
+
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        let table = self.txn.open_table(INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, position) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Inode::new(inode.value()),
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        let table = self.txn.open_table(REV_INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (position, inode) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+                Inode::new(inode.value()),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        let table = self.txn.open_table(DIRECTORIES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, flags) = entry?;
+            rows.push((Inode::new(inode.value()), flags.value()));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        let table = self.txn.open_multimap_table(INODE_GRAPH)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, _values) = entry?;
+            let (inode, change_id, start, end) = decode_inode_vertex(key.value());
+            rows.push((
+                Inode::new(inode),
+                GraphNode::new(
+                    NodeId::new(change_id),
+                    ChangePosition::new(start),
+                    ChangePosition::new(end),
+                ),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
     }
 
     fn iter_tree(
@@ -1677,6 +1807,22 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
         self.txn.position_inode(pos)
     }
 
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        self.txn.snapshot_inodes()
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        self.txn.snapshot_rev_inodes()
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        self.txn.snapshot_directories()
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        self.txn.snapshot_inode_graph_keys()
+    }
+
     fn iter_tree(
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
@@ -1701,6 +1847,53 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
 
     fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         self.txn.iter_file_index()
+    }
+}
+
+impl<'txn> ViewTxnT for CachedGraphTxn<'txn> {
+    fn get_view_by_id(&self, id: u64) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view_by_id(id)
+    }
+
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        self.txn.get_conflicts(view_id, inode)
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        self.txn.iter_conflicts(view_id)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        self.txn.snapshot_conflicts()
+    }
+
+    fn get_view(&self, name: &str) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view(name)
+    }
+
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
+        self.txn.snapshot_views()
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        self.txn.list_views()
+    }
+
+    fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.get_change_seq(view, change_id)
+    }
+
+    fn get_change_at_seq(&self, view: &ViewState, seq: u64) -> PristineResult<Option<NodeId>> {
+        self.txn.get_change_at_seq(view, seq)
+    }
+
+    fn iter_changes(
+        &self,
+        view: &ViewState,
+        from_seq: u64,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
+    {
+        self.txn.iter_changes(view, from_seq)
     }
 }
 
@@ -2161,6 +2354,22 @@ impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
         self.txn.position_inode(pos)
     }
 
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        self.txn.snapshot_inodes()
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        self.txn.snapshot_rev_inodes()
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        self.txn.snapshot_directories()
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        self.txn.snapshot_inode_graph_keys()
+    }
+
     fn iter_tree(
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
@@ -2185,6 +2394,53 @@ impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
 
     fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         self.txn.iter_file_index()
+    }
+}
+
+impl<'txn> ViewTxnT for InodePreloadTxn<'txn> {
+    fn get_view_by_id(&self, id: u64) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view_by_id(id)
+    }
+
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        self.txn.get_conflicts(view_id, inode)
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        self.txn.iter_conflicts(view_id)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        self.txn.snapshot_conflicts()
+    }
+
+    fn get_view(&self, name: &str) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view(name)
+    }
+
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
+        self.txn.snapshot_views()
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        self.txn.list_views()
+    }
+
+    fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.get_change_seq(view, change_id)
+    }
+
+    fn get_change_at_seq(&self, view: &ViewState, seq: u64) -> PristineResult<Option<NodeId>> {
+        self.txn.get_change_at_seq(view, seq)
+    }
+
+    fn iter_changes(
+        &self,
+        view: &ViewState,
+        from_seq: u64,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
+    {
+        self.txn.iter_changes(view, from_seq)
     }
 }
 

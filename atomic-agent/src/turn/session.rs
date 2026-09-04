@@ -58,6 +58,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
+
 use crate::error::{AgentError, AgentResult};
 use crate::turn::phase::Phase;
 
@@ -117,6 +119,10 @@ pub struct AgentSession {
 
     /// Current lifecycle phase.
     pub phase: Phase,
+
+    /// Durable lifecycle outcome. Older session JSON defaults to `Active`.
+    #[serde(default)]
+    pub status: SessionStatus,
 
     /// Number of turns completed in this session.
     ///
@@ -244,6 +250,7 @@ impl AgentSession {
             session_id,
             view_name,
             phase: Phase::Idle,
+            status: SessionStatus::Active,
             turn_count: 0,
             agent_name: agent_name.into(),
             agent_display_name: agent_display_name.into(),
@@ -346,6 +353,21 @@ impl AgentSession {
         self.files_touched.len() as u32
     }
 
+    /// Persist the first incomplete outcome observed for this session.
+    pub fn mark_incomplete(&mut self, incomplete: IncompleteSession) -> &IncompleteSession {
+        if !matches!(&self.status, SessionStatus::Incomplete(_)) {
+            self.status = SessionStatus::Incomplete(incomplete);
+        }
+        self.status
+            .incomplete()
+            .expect("session was just marked incomplete")
+    }
+
+    /// Return the durable refusal details, when this session is incomplete.
+    pub fn incomplete(&self) -> Option<&IncompleteSession> {
+        self.status.incomplete()
+    }
+
     /// Mark the start of a new turn.
     pub fn begin_turn(&mut self) {
         self.current_turn_started_at = Some(Utc::now());
@@ -426,6 +448,13 @@ impl fmt::Display for AgentSession {
 impl super::phase::SessionState for AgentSession {
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
+        if !matches!(&self.status, SessionStatus::Incomplete(_)) {
+            self.status = if phase.is_ended() {
+                SessionStatus::Ended
+            } else {
+                SessionStatus::Active
+            };
+        }
         if phase.is_ended() && self.ended_at.is_none() {
             self.ended_at = Some(Utc::now());
         }
@@ -986,6 +1015,7 @@ mod tests {
         assert_eq!(loaded.session_id, s.session_id);
         assert_eq!(loaded.view_name, s.view_name);
         assert_eq!(loaded.phase, s.phase);
+        assert_eq!(loaded.status, s.status);
         assert_eq!(loaded.turn_count, s.turn_count);
         assert_eq!(loaded.agent_name, s.agent_name);
         assert_eq!(loaded.agent_display_name, s.agent_display_name);
@@ -1012,6 +1042,7 @@ mod tests {
         let loaded: AgentSession = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.session_id, "old-sess");
         assert_eq!(loaded.turn_count, 5);
+        assert_eq!(loaded.status, SessionStatus::Active);
         assert!(loaded.agent_vendor.is_empty());
         assert!(loaded.model.is_empty());
         assert!(loaded.last_interaction.is_none());
@@ -1024,6 +1055,32 @@ mod tests {
         assert!(loaded.recorded_change_hashes.is_empty());
         // managed_run was added later — old session files load with None
         assert!(loaded.managed_run.is_none());
+    }
+
+    #[test]
+    fn test_incomplete_status_roundtrip_and_first_writer_wins() {
+        let mut session = make_session();
+        let first = IncompleteSession::new(
+            "tracked work moved by checkout",
+            vec!["src/z.rs".into(), "src/a.rs".into(), "src/a.rs".into()],
+            "refs/atomic/wip/run-1",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+        let later = IncompleteSession::new(
+            "duplicate callback",
+            vec!["src/other.rs".into()],
+            "refs/atomic/wip/run-2",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+
+        assert_eq!(session.mark_incomplete(first.clone()), &first);
+        assert_eq!(session.mark_incomplete(later), &first);
+
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: AgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.status, SessionStatus::Incomplete(first));
+        assert!(loaded.files_touched.is_empty());
+        assert!(loaded.recorded_change_hashes.is_empty());
     }
 
     #[test]

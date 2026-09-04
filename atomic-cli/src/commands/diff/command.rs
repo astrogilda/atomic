@@ -1,6 +1,9 @@
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::complete::{complete_change_hashes, complete_view_names};
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 
 use super::output::*;
 use super::*;
@@ -204,6 +207,14 @@ impl Diff {
             word_diff: self.word_diff,
         }
     }
+
+    fn guard_operation(&self) -> GuardOperation {
+        if self.change.is_some() {
+            GuardOperation::HistoryOnlyDiff
+        } else {
+            GuardOperation::Diff
+        }
+    }
 }
 
 impl Default for Diff {
@@ -223,6 +234,27 @@ impl Command for Diff {
     fn run(&self) -> CliResult<()> {
         // Find the repository root
         let repo_root = find_repository_root()?;
+
+        match guard_working_copy(GuardRequest::new(&repo_root, self.guard_operation())).map_err(
+            |error| match error {
+                GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                    reason: error.to_string(),
+                },
+                GuardError::Observation(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+                GuardError::Wip(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+            },
+        )? {
+            GuardOutcome::Pass(_) => {}
+            GuardOutcome::Refuse(refusal) => {
+                return Err(CliError::StaleBaseline {
+                    report: refusal.to_string(),
+                });
+            }
+        }
 
         // Open the repository
         let repo =
@@ -449,5 +481,19 @@ impl Command for Diff {
             DiffFormat::NameOnly => self.print_name_only(&file_diffs),
             DiffFormat::NameStatus => self.print_name_status(&file_diffs, &config),
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn change_diff_preserves_history_only_bypass() {
+        assert_eq!(Diff::new().guard_operation(), GuardOperation::Diff);
+        assert_eq!(
+            Diff::new().with_change("change").guard_operation(),
+            GuardOperation::HistoryOnlyDiff
+        );
     }
 }

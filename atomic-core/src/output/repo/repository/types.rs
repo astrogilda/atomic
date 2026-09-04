@@ -27,6 +27,8 @@ pub enum MaterializedEntry {
         path: String,
         /// Last known inode, when one is available.
         inode: Option<Inode>,
+        /// Whether the absent entry is a directory.
+        directory: bool,
     },
     /// The path is present in the materialized view.
     Present {
@@ -45,6 +47,16 @@ impl MaterializedEntry {
         Self::Absent {
             path: path.into(),
             inode,
+            directory: false,
+        }
+    }
+
+    /// Create an absent directory entry with its last-known inode.
+    pub fn absent_directory(path: impl Into<String>, inode: Inode) -> Self {
+        Self::Absent {
+            path: path.into(),
+            inode: Some(inode),
+            directory: true,
         }
     }
 
@@ -88,6 +100,17 @@ impl MaterializedEntry {
     /// Return whether this entry is absent from the materialized view.
     pub fn is_absent(&self) -> bool {
         matches!(self, Self::Absent { .. })
+    }
+
+    /// Return whether this lifecycle entry denotes a directory.
+    pub fn is_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::Absent {
+                directory: true,
+                ..
+            }
+        )
     }
 }
 
@@ -371,10 +394,15 @@ impl OutputItem {
 
     /// Create a new directory output item.
     pub fn directory(path: impl Into<String>, inode: Inode) -> Self {
+        Self::directory_at(path, inode, Position::ROOT)
+    }
+
+    /// Create a directory output item backed by its graph inode position.
+    pub fn directory_at(path: impl Into<String>, inode: Inode, position: Position<NodeId>) -> Self {
         Self {
             path: path.into(),
             inode,
-            position: Position::ROOT,
+            position,
             is_directory: true,
             metadata: crate::output::traits::FileMetadata::directory(),
         }

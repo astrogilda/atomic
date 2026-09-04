@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use git2::{ErrorCode, ObjectType, Oid, Repository as GitRepository, RepositoryState};
 
+use super::is_wip_ref;
+
 const INDEX_DIGEST_DOMAIN: &[u8] = b"atomic:git-index-observation:v1\0";
 const REFS_DIGEST_DOMAIN: &[u8] = b"atomic:git-refs-observation:v1\0";
 
@@ -1346,8 +1348,12 @@ fn observe_refs(repository: &GitRepository) -> Result<Vec<RefObservation>, Obser
 fn digest_refs(refs: &[RefObservation]) -> CanonicalRefsDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(REFS_DIGEST_DOMAIN);
-    hasher.update(&(refs.len() as u64).to_le_bytes());
-    for reference in refs {
+    let publishable_count = refs
+        .iter()
+        .filter(|reference| !is_wip_ref(&reference.name))
+        .count();
+    hasher.update(&(publishable_count as u64).to_le_bytes());
+    for reference in refs.iter().filter(|reference| !is_wip_ref(&reference.name)) {
         hasher.update(&(reference.name.len() as u64).to_le_bytes());
         hasher.update(&reference.name);
         match &reference.target {
@@ -1431,9 +1437,6 @@ fn resolve_common_dir(worktree_git_dir: &Path) -> Result<PathBuf, ObservationErr
 }
 
 fn resolve_path(path: &Path, base: &Path) -> Result<PathBuf, ObservationError> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(canonical);
-    }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1448,7 +1451,7 @@ fn resolve_path(path: &Path, base: &Path) -> Result<PathBuf, ObservationError> {
         };
         base.join(path)
     };
-    Ok(absolute)
+    Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 /// Reversible display for raw Git path/ref bytes.
@@ -1955,6 +1958,35 @@ mod tests {
             .ref_locks
             .iter()
             .any(|path| path.ends_with("refs/heads/main.lock")));
+    }
+
+    #[test]
+    fn wip_refs_are_observed_but_excluded_from_canonical_digest() {
+        let (directory, repository) = initialized_repository();
+        let head = commit_file(&repository, "file.txt", b"one\n", "initial");
+        let before = repository_observation(directory.path()).refs_digest;
+        let ref_name = "refs/atomic/wip/workspace/operation";
+
+        repository
+            .reference(ref_name, head, false, "create recovery ref")
+            .expect("create WIP ref");
+        let with_wip = repository_observation(directory.path());
+        assert_eq!(with_wip.refs_digest, before);
+        assert!(with_wip
+            .refs
+            .iter()
+            .any(|reference| reference.name == ref_name.as_bytes()));
+
+        let replacement = repository.blob(b"replacement").expect("replacement object");
+        repository
+            .reference(ref_name, replacement, true, "move test recovery ref")
+            .expect("move WIP ref for digest test");
+        let moved_wip = repository_observation(directory.path());
+        assert_eq!(moved_wip.refs_digest, before);
+        assert!(moved_wip.refs.iter().any(|reference| {
+            reference.name == ref_name.as_bytes()
+                && reference.target == RefTargetObservation::Direct(replacement)
+        }));
     }
 
     #[test]

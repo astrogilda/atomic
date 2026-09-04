@@ -113,9 +113,8 @@ pub struct Record {
 
     /// Record all changes including untracked files.
     ///
-    /// This is equivalent to running `atomic add -A` before recording.
-    /// All untracked files will be added to tracking before the change
-    /// is created.
+    /// All untracked files are included in the change. Inclusion happens after
+    /// rename classification so a moved destination keeps its original inode.
     #[arg(short, long)]
     pub all: bool,
 

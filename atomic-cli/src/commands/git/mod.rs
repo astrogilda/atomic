@@ -55,12 +55,15 @@
 //! ```
 
 pub mod bridge;
+pub(crate) mod checkpoint;
+pub(crate) mod guard;
 pub mod hooks;
 pub mod import;
 pub(crate) mod observation;
 pub mod parallel;
 pub mod push;
 pub(crate) mod shadow;
+pub(crate) mod wip;
 
 use clap::Subcommand;
 
@@ -68,6 +71,10 @@ pub use bridge::Bridge;
 pub use hooks::Hooks;
 pub use import::Import;
 pub use push::Push;
+pub use wip::{
+    capture_or_reuse_tracked_wip, capture_tracked_wip, is_publishable_git_ref, is_wip_ref,
+    WipCapture, WipCaptureError, WipCaptureRequest, WIP_REF_PREFIX,
+};
 
 use crate::commands::Command;
 use crate::error::CliResult;

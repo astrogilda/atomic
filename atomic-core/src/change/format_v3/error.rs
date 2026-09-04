@@ -103,6 +103,15 @@ pub enum FormatError {
         reason: String,
     },
 
+    /// A graph operation violates a semantic contract required by V3 readers.
+    #[error("invalid {operation} graph operation: {reason}")]
+    InvalidGraphOp {
+        /// Graph operation variant being validated.
+        operation: &'static str,
+        /// Failed invariant.
+        reason: String,
+    },
+
     // ── Serialization errors ───────────────────────────────────────
     /// Postcard serialization or deserialization failed.
     ///

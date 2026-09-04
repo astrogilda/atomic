@@ -7,7 +7,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::types::{Merkle, NodeId};
+use crate::types::{Inode, Merkle, NodeId};
 
 use crate::pristine::error::PristineError;
 
@@ -740,8 +740,32 @@ pub trait ViewTxnT: GraphTxnT {
         view_id: u64,
     ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError>;
 
+    /// Return every CONFLICTS row in deterministic key order.
+    ///
+    /// Unlike [`Self::iter_conflicts`], this is a complete storage snapshot: it
+    /// includes rows for orphan view IDs and rows with empty conflict lists.
+    /// Malformed stored payloads are returned as errors rather than skipped.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_conflicts(&self) -> Result<Vec<(u64, Inode, Vec<StoredConflict>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete CONFLICTS snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
     /// Get a view by name.
     fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError>;
+
+    /// Return every VIEWS row in deterministic key order.
+    ///
+    /// The stored key and decoded state are both returned so repair can inspect
+    /// key/value inconsistencies. Malformed values are returned as errors.
+    fn snapshot_views(&self) -> Result<Vec<(String, ViewState)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete VIEWS snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
 
     /// List all view names.
     ///

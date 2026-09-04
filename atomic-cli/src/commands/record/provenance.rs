@@ -170,6 +170,7 @@ impl Record {
 
         let mut options = RecordOptions::new()
             .with_all(self.all)
+            .include_untracked(self.all)
             .with_algorithm(algorithm)
             .with_skip_binary(self.skip_binary)
             .allow_conflict_markers(self.allow_conflict_markers)

@@ -3,6 +3,7 @@ use super::*;
 use crate::tracking::{
     TreeProjectionError, TreeProjectionKind, TreeProjectionOperation, TreeProjectionPlan,
 };
+use atomic_core::pristine::{PathClaimMutTxnT, PathClaimTxnT};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -66,16 +67,29 @@ struct DesiredTreePath {
     last_present_path: Option<String>,
     known_paths: HashSet<String>,
     deleted: bool,
-    /// Concurrent, causally maximal actions disagree. Until CB-N6 can retain
-    /// multiple path claims, projection preserves the current cache path.
+    maximal_changes: Vec<Hash>,
+    /// Concurrent journal actions disagree. This field is retained only for
+    /// legacy journal validation; PATH_CLAIMS owns canonical projection.
     ambiguous: bool,
     directory: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectedAbsent {
+    pub(super) path: String,
+    pub(super) inode: Inode,
+    pub(super) position: Position<NodeId>,
+    pub(super) directory: bool,
+    pub(super) deleted_by: Vec<Hash>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct TreeProjection {
     pub(super) present: HashMap<String, OutputItem>,
+    pub(super) present_metadata: HashMap<String, super::name_resolution::ProjectedPathClaim>,
     pub(super) absent: Vec<MaterializedEntry>,
+    pub(super) absent_metadata: HashMap<String, ProjectedAbsent>,
+    pub(super) name_conflicts: HashMap<String, super::name_resolution::ProjectedNameConflict>,
 }
 
 fn projected_parent(path: &str) -> Option<&str> {
@@ -154,15 +168,15 @@ where
             }
         }
 
+        let maximal_changes: Vec<Hash> = maximal.iter().map(|(_, op)| op.change).collect();
         let (desired_path, last_present_path, deleted, ambiguous) = if maximal.is_empty() {
             (baseline.clone(), baseline, false, false)
         } else {
             let first = &maximal[0].1.action;
             if maximal.iter().any(|(_, op)| &op.action != first) {
-                // CB-N6 will retain every path claim explicitly. Until then,
-                // do not let journal order pick a winner and do not turn a
-                // previously insertable conflict into a hard failure. Callers
-                // preserve the current projected cache path for this inode.
+                // The legacy journal validator must not invent an order for
+                // concurrent actions. Canonical projection is performed from
+                // PATH_CLAIMS and never consumes this compatibility value.
                 (None, baseline.clone(), false, true)
             } else {
                 match first {
@@ -241,16 +255,15 @@ where
                 last_present_path,
                 known_paths,
                 deleted,
+                maximal_changes,
                 ambiguous,
                 directory,
             },
         );
     }
 
-    // Multiple visible inodes may currently claim one path. Until CB-N6 adds
-    // PATH_CLAIMS, REV_TREE is the compatibility source for surfacing those
-    // name conflicts. Keep every desired inode here; rejecting the projection
-    // would turn an existing honest conflict into an insert failure.
+    // Keep every journal claimant for compatibility validation. This result is
+    // never projected into TREE; durable PATH_CLAIMS performs that reduction.
     Ok(desired)
 }
 
@@ -603,6 +616,8 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
 pub(super) struct PreparedTreeProjection {
     ops: Vec<DeferredTreeOp>,
     prerequisites: TreeProjectionPlan,
+    change_id: NodeId,
+    change: Change,
 }
 
 impl PreparedTreeProjection {
@@ -754,7 +769,12 @@ impl Repository {
 
         let prerequisites =
             TreeProjectionPlan::plan(&*txn, projection_ops).map_err(projection_error)?;
-        Ok(PreparedTreeProjection { ops, prerequisites })
+        Ok(PreparedTreeProjection {
+            ops,
+            prerequisites,
+            change_id,
+            change: change.clone(),
+        })
     }
 
     pub(super) fn apply_tree_projection(
@@ -764,6 +784,16 @@ impl Repository {
         view_name: &str,
         preserve_existing_tree_paths: bool,
     ) -> Result<HashSet<String>, RepositoryError> {
+        let claim_entries = super::name_resolution::path_claim_events_for_change(
+            &*txn,
+            prepared.change_id,
+            &prepared.change,
+        )?;
+        for entry in claim_entries {
+            txn.put_path_claim(&entry.path, &entry.event)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        }
+
         let (journal, changed) = self.merge_deferred_tree_ops(&prepared.ops)?;
         let view = txn
             .get_view(view_name)
@@ -773,11 +803,17 @@ impl Repository {
             })?;
         let visibility = graph_visibility_closure(&*txn, &view)?;
         self.validate_deferred_tree_metadata(&*txn, &journal, &visibility)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &*txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
 
         let affected = if preserve_existing_tree_paths {
             HashSet::new()
         } else {
-            self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?
+            self.apply_deferred_tree_ops_in_txn(txn, &journal, &claim_visibility)?
         };
         if changed {
             self.persist_deferred_tree_journal(&journal)?;
@@ -804,9 +840,91 @@ impl Repository {
         Ok(journal)
     }
 
-    /// Project the path/lifecycle state for a change closure without treating
-    /// the global TREE cache or rendered byte length as file presence.
+    /// Project path/lifecycle state from durable structural claims. TREE is a
+    /// strict one-to-one cache and never participates in claimant selection.
     pub(super) fn project_tree_for_visibility<T>(
+        &self,
+        txn: &T,
+        visibility: &GraphVisibilityClosure,
+    ) -> Result<TreeProjection, RepositoryError>
+    where
+        T: GraphTxnT + TreeTxnT + PathClaimTxnT,
+    {
+        let reduced = super::name_resolution::reduce_path_claims(txn, visibility)?;
+        let name_conflicts = reduced.conflicts;
+        let alive_inodes: HashSet<Inode> = reduced
+            .present
+            .iter()
+            .map(|side| side.inode)
+            .chain(
+                name_conflicts
+                    .values()
+                    .flat_map(|conflict| conflict.sides.iter().map(|side| side.inode)),
+            )
+            .collect();
+        let alive_paths: HashSet<String> = reduced
+            .present
+            .iter()
+            .map(|side| side.path.clone())
+            .chain(name_conflicts.keys().cloned())
+            .collect();
+        let mut projection = TreeProjection::default();
+        for side in reduced.present {
+            let item = if side.is_directory() {
+                OutputItem::directory_at(side.path.clone(), side.inode, side.position)
+            } else {
+                OutputItem::file(side.path.clone(), side.inode, side.position)
+            };
+            if projection.present.insert(side.path.clone(), item).is_some() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "PATH_CLAIMS projected more than one uncontested entry at '{}'",
+                        side.path
+                    ),
+                });
+            }
+            projection.present_metadata.insert(side.path.clone(), side);
+        }
+        for absent in reduced.absent {
+            if !absent.directory
+                && !alive_inodes.contains(&absent.inode)
+                && !alive_paths.contains(&absent.path)
+                && crate::repository::status::is_file_alive_via_retrieval(
+                    txn,
+                    absent.inode,
+                    absent.position,
+                    visibility,
+                )?
+            {
+                projection.present.insert(
+                    absent.path.clone(),
+                    OutputItem::file(absent.path, absent.inode, absent.position),
+                );
+                continue;
+            }
+            if projection.present.contains_key(&absent.path)
+                || name_conflicts.contains_key(&absent.path)
+            {
+                continue;
+            }
+            projection
+                .absent_metadata
+                .insert(absent.path.clone(), absent.clone());
+            projection.absent.push(if absent.directory {
+                MaterializedEntry::absent_directory(absent.path, absent.inode)
+            } else {
+                MaterializedEntry::absent(absent.path, Some(absent.inode))
+            });
+        }
+        projection
+            .absent
+            .sort_by(|left, right| left.path().cmp(right.path()));
+        projection.name_conflicts = name_conflicts;
+        Ok(projection)
+    }
+
+    #[allow(dead_code)]
+    fn project_tree_for_visibility_legacy<T>(
         &self,
         txn: &T,
         visibility: &GraphVisibilityClosure,
@@ -939,7 +1057,7 @@ impl Repository {
                 None => {
                     if let Some(path) = current_path {
                         let item = if is_directory {
-                            OutputItem::directory(path.clone(), inode)
+                            OutputItem::directory_at(path.clone(), inode, position)
                         } else {
                             OutputItem::file(path.clone(), inode, position)
                         };
@@ -969,21 +1087,35 @@ impl Repository {
 
                     if let Some(path) = projected_path {
                         let item = if is_directory {
-                            OutputItem::directory(path.clone(), inode)
+                            OutputItem::directory_at(path.clone(), inode, position)
                         } else {
                             OutputItem::file(path.clone(), inode, position)
                         };
                         projection.present.insert(path, item);
-                    } else if !is_directory {
+                    } else {
                         for path in &state.known_paths {
                             absent_by_path.insert(
                                 path.clone(),
-                                MaterializedEntry::absent(path.clone(), Some(inode)),
+                                ProjectedAbsent {
+                                    path: path.clone(),
+                                    inode,
+                                    position,
+                                    directory: is_directory,
+                                    deleted_by: state.maximal_changes.clone(),
+                                },
                             );
                         }
                         if let Some(path) = current_path {
-                            absent_by_path
-                                .insert(path.clone(), MaterializedEntry::absent(path, Some(inode)));
+                            absent_by_path.insert(
+                                path.clone(),
+                                ProjectedAbsent {
+                                    path,
+                                    inode,
+                                    position,
+                                    directory: is_directory,
+                                    deleted_by: state.maximal_changes.clone(),
+                                },
+                            );
                         }
                     }
                 }
@@ -991,10 +1123,20 @@ impl Repository {
         }
 
         absent_by_path.retain(|path, _| !projection.present.contains_key(path));
-        projection.absent = absent_by_path.into_values().collect();
+        projection.absent = absent_by_path
+            .values()
+            .map(|entry| {
+                if entry.directory {
+                    MaterializedEntry::absent_directory(entry.path.clone(), entry.inode)
+                } else {
+                    MaterializedEntry::absent(entry.path.clone(), Some(entry.inode))
+                }
+            })
+            .collect();
         projection
             .absent
             .sort_by(|left, right| left.path().cmp(right.path()));
+        projection.absent_metadata = absent_by_path;
         Ok(projection)
     }
 
@@ -1171,7 +1313,122 @@ impl Repository {
         Ok(())
     }
 
+    pub(super) fn realign_tree_projection_in_txn(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        view_name: &str,
+    ) -> Result<HashSet<String>, RepositoryError> {
+        let journal = self.load_deferred_tree_journal()?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&*txn, &view)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &*txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        self.apply_deferred_tree_ops_in_txn(txn, &journal, &claim_visibility)
+    }
+
     fn apply_deferred_tree_ops_in_txn(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        _journal: &DeferredTreeJournal,
+        visibility: &GraphVisibilityClosure,
+    ) -> Result<HashSet<String>, RepositoryError> {
+        let projection = self.project_tree_for_visibility(&*txn, visibility)?;
+        let desired: HashMap<Inode, (String, bool)> = projection
+            .present
+            .into_values()
+            .map(|item| (item.inode, (item.path, item.is_directory)))
+            .collect();
+        let mut operations = Vec::new();
+        let mut affected = HashSet::new();
+
+        for entry in txn
+            .iter_tree()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+        {
+            let (path, inode) =
+                entry.map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if txn
+                .inode_position(inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .is_none()
+            {
+                continue;
+            }
+            if desired
+                .get(&inode)
+                .is_none_or(|(desired_path, _)| desired_path != &path)
+            {
+                affected.insert(path);
+                operations.push(TreeProjectionOperation::Delete {
+                    inode,
+                    retire: false,
+                });
+            }
+        }
+
+        let desired_paths: HashMap<String, Inode> = desired
+            .iter()
+            .map(|(inode, (path, _))| (path.clone(), *inode))
+            .collect();
+        for (inode, (path, is_directory)) in &desired {
+            let current = txn
+                .get_path(*inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let kind = if *is_directory {
+                TreeProjectionKind::Directory
+            } else {
+                TreeProjectionKind::File
+            };
+            match current.as_deref() {
+                Some(current_path) if current_path == path => {}
+                Some(current_path) => {
+                    affected.insert(current_path.to_string());
+                    affected.insert(path.clone());
+                    operations.push(TreeProjectionOperation::Move {
+                        inode: *inode,
+                        path: path.clone(),
+                    });
+                }
+                None => {
+                    affected.insert(path.clone());
+                    operations.push(TreeProjectionOperation::Undelete {
+                        inode: *inode,
+                        path: path.clone(),
+                        kind,
+                    });
+                }
+            }
+            if *is_directory {
+                let empty = !desired_paths
+                    .keys()
+                    .any(|candidate| projected_parent(candidate) == Some(path.as_str()));
+                operations.push(TreeProjectionOperation::DirectoryOccupancy {
+                    inode: *inode,
+                    empty,
+                });
+            }
+        }
+
+        TreeProjectionPlan::plan(&*txn, operations)
+            .map_err(projection_error)?
+            .apply(txn)
+            .map_err(projection_error)?;
+        txn.validate_tree_bijection()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(affected)
+    }
+
+    #[allow(dead_code)]
+    fn apply_deferred_tree_ops_in_txn_legacy(
         &self,
         txn: &mut atomic_core::pristine::WriteTxn<'_>,
         journal: &DeferredTreeJournal,
@@ -1368,7 +1625,13 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: pending.source_view.clone(),
             })?;
-        let visibility = graph_visibility_closure(&txn, &source_view)?;
+        let full_visibility = graph_visibility_closure(&txn, &source_view)?;
+        let visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &source_view,
+            &full_visibility,
+        )?;
         self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &visibility)?;
         self.write_current_view(&pending.source_view)?;
         txn.commit()
@@ -1402,8 +1665,20 @@ impl Repository {
         // opener that observes it must wait for this transaction. If the
         // marker survives, recovery restores the source view.
         self.write_deferred_tree_alignment_pending(&old_view, view_name)?;
+        let target_view = txn
+            .get_view(view_name)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &target_view,
+            visibility,
+        )?;
         let affected_paths =
-            match self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, visibility) {
+            match self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &claim_visibility) {
                 Ok(paths) => paths,
                 Err(error) => {
                     let _ = self.clear_deferred_tree_alignment_pending();

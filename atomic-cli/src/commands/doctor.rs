@@ -3,7 +3,10 @@
 use atomic_repository::CrdtMaterializeOptions;
 use clap::{Args, Subcommand};
 
-use crate::commands::{require_repository, Command};
+use crate::commands::{
+    require_repository, require_repository_for_native_check, require_repository_for_native_repair,
+    Command,
+};
 use crate::error::CliResult;
 use crate::output::{print_hint, print_info, print_success, print_warning};
 
@@ -24,6 +27,10 @@ pub enum DoctorCommands {
     /// without repeatedly loading change files.
     #[command(name = "repair-dependency-index")]
     RepairDependencyIndex(RepairDependencyIndex),
+
+    /// Atomically rebuild native tree, inode, directory, claim, and conflict caches.
+    #[command(name = "repair-native-indexes")]
+    RepairNativeIndexes(RepairNativeIndexes),
 
     /// Materialize stored FileOps into CRDT semantic tables.
     ///
@@ -50,6 +57,10 @@ pub enum DoctorCommands {
 #[derive(Debug, Args, Default)]
 pub struct Check {}
 
+/// Atomically rebuild graph-derived native indexes.
+#[derive(Debug, Args, Default)]
+pub struct RepairNativeIndexes {}
+
 /// Rebuild the normal change dependency index from stored changes.
 #[derive(Debug, Args, Default)]
 pub struct RepairDependencyIndex {
@@ -74,6 +85,7 @@ impl Command for Doctor {
     fn run(&self) -> CliResult<()> {
         match &self.command {
             DoctorCommands::RepairDependencyIndex(cmd) => cmd.run(),
+            DoctorCommands::RepairNativeIndexes(cmd) => cmd.run(),
             DoctorCommands::MaterializeCrdt(cmd) => cmd.run(),
             DoctorCommands::Check(cmd) => cmd.run(),
         }
@@ -82,7 +94,39 @@ impl Command for Doctor {
 
 impl Command for Check {
     fn run(&self) -> CliResult<()> {
-        let repo = require_repository(None)?;
+        let repo = match require_repository_for_native_check(None) {
+            Ok(repo) => repo,
+            Err(error) => {
+                print_warning(&format!(
+                    "Native derived indexes are unrepairable because repository authority cannot be opened: {}",
+                    error
+                ));
+                return Err(error);
+            }
+        };
+
+        print_info("Verifying native derived indexes against graph authority...");
+        let native = repo
+            .verify_native_derived_indexes()
+            .map_err(|e| crate::error::CliError::Internal(e.into()))?;
+        if !native.is_healthy() {
+            print_warning(&format!(
+                "{} native derived-index problem(s) found:",
+                native.problems.len()
+            ));
+            for problem in &native.problems {
+                println!("  ✗ {}", problem);
+            }
+            print_hint("Run `atomic doctor repair-native-indexes` to rebuild derived caches atomically from graph and change facts.");
+            return Err(crate::error::CliError::Internal(anyhow::anyhow!(
+                "native derived-index verification found {} problem(s)",
+                native.problems.len()
+            )));
+        }
+        print_success(&format!(
+            "Native derived indexes are consistent ({} rows).",
+            native.expected_rows
+        ));
 
         print_info("Verifying working-copy consistency against the graph...");
         let report = repo
@@ -112,6 +156,45 @@ impl Command for Check {
             "working-copy verification found {} problem(s)",
             report.problems.len()
         )))
+    }
+}
+
+impl Command for RepairNativeIndexes {
+    fn run(&self) -> CliResult<()> {
+        let repo = match require_repository_for_native_repair(None) {
+            Ok(repo) => repo,
+            Err(error) => {
+                print_warning(&format!(
+                    "Native derived indexes are unrepairable because repository authority cannot be opened: {}",
+                    error
+                ));
+                return Err(error);
+            }
+        };
+        print_info("Rebuilding native derived indexes from graph authority...");
+        let outcome = match repo.repair_native_derived_indexes() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                print_warning(&format!(
+                    "Native derived indexes are unrepairable from available authority: {}",
+                    error
+                ));
+                print_hint("No repair transaction was committed. Restore missing/corrupt change or graph authority and retry.");
+                return Err(crate::error::CliError::Repository(error));
+            }
+        };
+        if outcome.already_healthy {
+            print_success(&format!(
+                "Native derived indexes are already consistent ({} rows).",
+                outcome.rows_written
+            ));
+        } else {
+            print_success(&format!(
+                "Repaired {} native derived-index problem(s); wrote {} rows atomically.",
+                outcome.problems_repaired, outcome.rows_written
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -206,6 +289,11 @@ mod tests {
     fn repair_dependency_index_defaults_to_non_force() {
         let cmd = RepairDependencyIndex::default();
         assert!(!cmd.force);
+    }
+
+    #[test]
+    fn repair_native_indexes_has_no_unsafe_override() {
+        let _ = RepairNativeIndexes::default();
     }
 
     #[test]

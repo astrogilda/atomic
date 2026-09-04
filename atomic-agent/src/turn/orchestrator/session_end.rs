@@ -27,6 +27,13 @@ impl TurnOrchestrator {
     ) -> AgentResult<DispatchResult> {
         let session_id = &event.session_id;
 
+        // Refusal is terminal and precedes watcher cancellation, view alignment,
+        // status, flush-recording, provenance, and attestation. Repeated
+        // session-end hooks return the same durable recovery object.
+        if let Some(result) = self.persist_boundary_incomplete(session_id)? {
+            return Ok(result);
+        }
+
         let mut session = match self.session_store.load(session_id)? {
             Some(s) => s,
             None => {

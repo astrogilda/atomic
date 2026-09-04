@@ -406,6 +406,51 @@ impl ChangeCmd {
             }
         }
 
+        if let Ok(Some(evidence)) = extract_move_evidence(change) {
+            output.push('\n');
+            output.push_str("Move evidence:\n");
+            for moved in evidence.authoritative_moves {
+                let authority = match moved.authority {
+                    MoveAuthority::ExplicitAtomicMove => "explicit atomic move",
+                    MoveAuthority::StableInodeProjection => "stable inode projection",
+                };
+                output.push_str(&format!(
+                    "  authoritative: {} → {} ({})\n",
+                    moved.old_path, moved.new_path, authority
+                ));
+            }
+            for moved in evidence.probable_moves {
+                let basis = match moved.basis {
+                    MoveBasis::ByteIdentity => "byte identity",
+                    MoveBasis::ContentSimilarity => "content similarity",
+                };
+                output.push_str(&format!(
+                    "  probable: {} → {} ({}.{:02}%, {})\n",
+                    moved.old_path,
+                    moved.new_path,
+                    moved.score / 100,
+                    moved.score % 100,
+                    basis
+                ));
+            }
+            for loss in evidence.loss_notes {
+                match loss {
+                    LossNote::RenameUnresolved { candidates } => {
+                        output.push_str("  loss: rename unresolved; retained delete + add\n");
+                        for candidate in candidates {
+                            output.push_str(&format!(
+                                "    candidate: {} → {} ({}.{:02}%)\n",
+                                candidate.source_path,
+                                candidate.destination_path,
+                                candidate.score / 100,
+                                candidate.score % 100
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Graph statistics
         output.push('\n');
         let (vertices, edges) = count_atoms(&change.hashed.hunks);

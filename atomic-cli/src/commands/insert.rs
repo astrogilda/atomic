@@ -15,7 +15,12 @@ use atomic_repository::{
 };
 
 use crate::commands::complete::{complete_change_hashes, complete_view_names};
-use crate::commands::{format_hash, require_repository};
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
+use crate::commands::{
+    find_repository_root, find_repository_root_from, format_hash, require_repository,
+};
 use crate::error::{CliError, CliResult};
 use crate::output;
 
@@ -188,10 +193,49 @@ pub struct PreviewArgs {
 
 // Command Implementation
 
+impl Insert {
+    fn may_materialize_working_copy(&self) -> bool {
+        match &self.command {
+            Some(InsertSubcommand::View(args)) => !args.dry_run,
+            Some(InsertSubcommand::Tag(args)) => !args.dry_run,
+            Some(InsertSubcommand::Change(_)) => true,
+            Some(InsertSubcommand::Preview(_)) => false,
+            None => self.change.is_some(),
+        }
+    }
+}
+
 impl crate::commands::Command for Insert {
     fn run(&self) -> CliResult<()> {
         let repo_path = self.repository.as_ref().map(std::path::Path::new);
-        let repo = require_repository(repo_path)?;
+        let repo_root = match repo_path {
+            Some(path) => find_repository_root_from(path)?,
+            None => find_repository_root()?,
+        };
+
+        if self.may_materialize_working_copy() {
+            match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
+                .map_err(|error| match error {
+                    GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                        reason: error.to_string(),
+                    },
+                    GuardError::Observation(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                    GuardError::Wip(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                })? {
+                GuardOutcome::Pass(_) => {}
+                GuardOutcome::Refuse(refusal) => {
+                    return Err(CliError::StaleBaseline {
+                        report: refusal.to_string(),
+                    });
+                }
+            }
+        }
+
+        let repo = require_repository(Some(&repo_root))?;
 
         match &self.command {
             Some(InsertSubcommand::View(args)) => run_view_insert(&repo, args),
@@ -760,6 +804,43 @@ fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_materialization_guard_selector() {
+        let bare_promotion = Insert {
+            command: None,
+            change: None,
+            view: None,
+            deps: true,
+            allow_conflicts: false,
+            dry_run: false,
+            confirm: false,
+            repository: None,
+        };
+        assert!(!bare_promotion.may_materialize_working_copy());
+
+        let preview = Insert {
+            command: Some(InsertSubcommand::Preview(PreviewArgs {
+                from_view: "feature".to_string(),
+                to_view: None,
+                up_to_tag: None,
+            })),
+            ..bare_promotion
+        };
+        assert!(!preview.may_materialize_working_copy());
+
+        let change = Insert {
+            command: None,
+            change: Some("change".to_string()),
+            view: None,
+            deps: true,
+            allow_conflicts: false,
+            dry_run: false,
+            confirm: false,
+            repository: None,
+        };
+        assert!(change.may_materialize_working_copy());
+    }
 
     #[test]
     fn test_insert_subcommand_variants() {

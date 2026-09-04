@@ -2,7 +2,7 @@
 
 Source: [`RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md`](RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md)
 
-Last audited: 2026-09-03
+Last audited: 2026-09-04
 
 This file is the operational backlog for the RFC. The RFC remains the normative
 architecture and acceptance contract; this tracker answers what is done, what is
@@ -30,21 +30,15 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-N34: Complete `DirDel`, undelete, and explicit empty-directory lifecycle**  
-  Intent: pending · Priority: high · Prerequisite: CB-N2 (done)  
-  Correct directory deletion to remove the structural claims created by `DirAdd`, add normal file/directory undelete constructors that preserve inode identity, and materialize explicit empty directories through full and prefix output.
+- [ ] **READY — CB-1A: Persistent working-copy identity and API boundary**  
+  Intent: pending · Priority: high · Prerequisites: Phase N, CB-0C (done)  
+  Add durable `WorkingCopyId` records for ordinary and linked Git worktrees, require explicit identity at working-copy-aware repository boundaries, and make `.atomic/current_view` a derived compatibility artifact.
 
 ### Parallel safety workstream
 
-- [ ] **READY — CB-0B: Local WIP refs and durable incomplete-agent outcome**  
-  Intent: pending · Priority: high · Prerequisite: CB-0A (done)  
-  Preserve drifted tracked repository bytes under local WIP refs before refusal and make managed agent turn-end durably incomplete rather than falsely empty.
+Phase 0 and Phase N are complete; no additional safety prerequisite is ready in parallel.
 
-- [ ] **READY — CB-0D: Append-only Git event journal and advisory `post-checkout`**  
-  Intent: pending · Priority: medium · Prerequisite: CB-0A (done)  
-  Add immutable advisory Git event evidence without making hooks a correctness boundary.
-
-CB-N6 is blocked by CB-N34. CB-0C is blocked by CB-0B. All later work remains dependency-blocked.
+Phase 1 begins with CB-1A. CB-1B remains blocked until CB-1A completes.
 
 ---
 
@@ -63,6 +57,13 @@ CB-N6 is blocked by CB-N34. CB-0C is blocked by CB-0B. All later work remains de
 | [x] DONE | Fail-closed semantic render errors | `ATOM::continuouslee::64` / `01M1KRAZ4BJN9QABKW8BMR70DZ` | Supporting integrity prerequisite. |
 | [x] DONE | N1 nested parent globalization | `ATOM::continuouslee::65` / `01M1KTZ8WWP5CF17VSP7ARFPZ3` | Parent-first anchors and parent dependencies. |
 | [x] DONE | Strict workspace cleanup gate | `ATOM::continuouslee::66` / `01M1KXEV9N2QB10FQRXX9TDK53` | Format, strict clippy, workspace tests, delete harness. |
+| [x] DONE | N34 directory delete, identity-preserving undelete, and empty-directory lifecycle | `ATOM::continuouslee::70` / `01M1M5AYVPFGP7G1Y4KQRRKM9N` | Exact graph claims, causal aliveness, all materialization modes, reopen and sibling-view evidence. |
+| [x] DONE | 0B local WIP recovery and durable incomplete managed-agent outcome | `ATOM::continuouslee::71` / `01M1M5B12HVZ3C5DDDA1ZWGNNQ` | Alternate-index repository bytes, create-only reflogged refs, no false recording, local-only publication. |
+| [x] DONE | 0D append-only advisory Git event journal | `ATOM::continuouslee::72` / `01M1M5B5HQWR13R1508XT2RYJG` | Common-dir/custom-hook-safe dispatcher, deferred read-only receipts, hook-independent correctness. |
+| [x] DONE | N6 durable causal path claims and graph-backed name resolution | `ATOM::continuouslee::73` / `01M1MA1ZZ6ATGBE5EEK3HGQMW0` | Strict TREE bijection, A11/A12 order independence, reversible solve visibility, and lossless legacy migration. |
+| [x] DONE | 0C shared stale-baseline guard | `ATOM::continuouslee::74` / `01M1MA2019Z6XPBY3Z0TRJNYJ4` | One early guard across readers/writers/materializers/agents with v2 checkpoint evidence and WIP-backed refusal. |
+| [x] DONE | N8 native rename-plus-edit identity and explicit move evidence | `ATOM::continuouslee::75` / `01M1PBEFQ779K72YF5YAW6RS9W` | Authoritative staged moves retain inode/trunk through arbitrary edits; similarity is `ProbableMove`; ambiguous candidates remain delete+add with `RenameUnresolved`. |
+| [x] DONE | N9 native derived-index verification and atomic repair | `ATOM::continuouslee::76` / `01M1PH46D0HDWEJWNZYAS2EEY7` | Cache-independent all-view oracle, deterministic diagnostics, ambiguity/staging preservation, immediate all-or-nothing replacement, and read-only doctor checks. |
 
 ---
 
@@ -72,12 +73,12 @@ CB-N6 is blocked by CB-N34. CB-0C is blocked by CB-0B. All later work remains de
 |---|---|---|---|---|
 | [x] DONE | CB-N1 | Nested parent globalization | — | `ATOM::continuouslee::65` |
 | [x] DONE | CB-N2 | Central operation-aware tree projection and directory occupancy | N1, N5, N7 | `ATOM::continuouslee::68` |
-| [ ] READY | CB-N34 | Complete `DirDel`, file/directory undelete, and explicit empty-directory lifecycle | N2 | pending |
+| [x] DONE | CB-N34 | Complete `DirDel`, file/directory undelete, and explicit empty-directory lifecycle | N2 | `ATOM::continuouslee::70` / `01M1M5AYVPFGP7G1Y4KQRRKM9N` |
 | [x] DONE | CB-N5 | Typed materialization/content presence | — | `ATOM::continuouslee::61` |
-| [ ] BLOCKED | CB-N6 | Durable `PATH_CLAIMS` and graph-backed name-conflict resolution | N2, N34 | pending |
+| [x] DONE | CB-N6 | Durable `PATH_CLAIMS` and graph-backed name-conflict resolution | N2, N34 | `ATOM::continuouslee::73` / `01M1MA1ZZ6ATGBE5EEK3HGQMW0` |
 | [x] DONE | CB-N7 | Canonical membership/visibility closure | — | `ATOM::continuouslee::62` |
-| [ ] BLOCKED | CB-N8 | Native rename-plus-edit with stable inode and `ProbableMove` evidence | N2, N6 | pending |
-| [ ] BLOCKED | CB-N9 | Verify and repair native derived tree indexes | N2, N34, N6, N8 | pending |
+| [x] DONE | CB-N8 | Native rename-plus-edit with stable inode and `ProbableMove` evidence | N2, N6 | `ATOM::continuouslee::75` / `01M1PBEFQ779K72YF5YAW6RS9W` |
+| [x] DONE | CB-N9 | Verify and repair native derived tree indexes | N2, N34, N6, N8 | `ATOM::continuouslee::76` / `01M1PH46D0HDWEJWNZYAS2EEY7` |
 
 ### CB-N34 definition of done
 
@@ -114,9 +115,9 @@ graph facts or deleting ambiguous content.
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
 | [x] DONE | CB-0A | Read-only Git observer, provisional checkpoint/`Unanchored`, `status --no-reconcile` | — | `ATOM::continuouslee::69` |
-| [ ] READY | CB-0B | Local WIP refs and durable incomplete-agent outcome | 0A | pending |
-| [ ] BLOCKED | CB-0C | Shared stale-baseline guard across all working-copy commands | 0A, 0B | pending |
-| [ ] READY | CB-0D | Append-only Git event journal and advisory `post-checkout` | 0A | pending |
+| [x] DONE | CB-0B | Local WIP refs and durable incomplete-agent outcome | 0A | `ATOM::continuouslee::71` / `01M1M5B12HVZ3C5DDDA1ZWGNNQ` |
+| [x] DONE | CB-0C | Shared stale-baseline guard across all working-copy commands | 0A, 0B | `ATOM::continuouslee::74` / `01M1MA2019Z6XPBY3Z0TRJNYJ4` |
+| [x] DONE | CB-0D | Append-only Git event journal and advisory `post-checkout` | 0A | `ATOM::continuouslee::72` / `01M1M5B5HQWR13R1508XT2RYJG` |
 
 ### CB-0B definition of done
 
@@ -145,7 +146,7 @@ execution.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | pending |
+| [ ] READY | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | pending |
 | [ ] BLOCKED | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | pending |
 | [ ] BLOCKED | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
 
@@ -504,9 +505,9 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-N34. In parallel, CB-0B and optionally CB-0D.
-2. **Native integrity:** CB-N34 → CB-N6 → CB-N8 → CB-N9.
-3. **Phase 0 completion:** CB-0B → CB-0C; CB-0D is independently ready.
+1. **Now:** CB-N8.
+2. **Native integrity:** CB-N34 and CB-N6 are done; CB-N8 → CB-N9 remain.
+3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1.
 5. **Snapshots and semantics:** CB-2A; CB-3A → CB-3B/CB-3C → CB-2B.
 6. **Equivalence:** CB-4A → CB-4B → CB-4C.
@@ -520,5 +521,5 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate Atomic intents for every pending row. Start with CB-N34 and CB-0B; CB-0D is also parallel-ready. Create later intents in dependency order with `blocked_by` frontmatter.
+- Allocate the CB-N8 intent next, then CB-N9 with `blocked_by` frontmatter after CB-N8 completes.
 - When an intent is created, replace `pending` in this tracker with its human key and UID.

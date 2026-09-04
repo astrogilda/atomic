@@ -109,6 +109,9 @@ use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
 use atomic_repository::Repository;
 
 use crate::commands::git::bridge::read_checkpoint_observation;
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
@@ -222,6 +225,14 @@ impl Status {
             debug_ignore: false,
             reindex: false,
             no_reconcile: false,
+        }
+    }
+
+    fn guard_operation(&self) -> GuardOperation {
+        if self.no_reconcile {
+            GuardOperation::ForensicStatus
+        } else {
+            GuardOperation::Status
         }
     }
 
@@ -507,6 +518,27 @@ impl Command for Status {
     fn run(&self) -> CliResult<()> {
         // Find the repository root
         let repo_root = find_repository_root()?;
+
+        match guard_working_copy(GuardRequest::new(&repo_root, self.guard_operation())).map_err(
+            |error| match error {
+                GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                    reason: error.to_string(),
+                },
+                GuardError::Observation(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+                GuardError::Wip(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+            },
+        )? {
+            GuardOutcome::Pass(_) => {}
+            GuardOutcome::Refuse(refusal) => {
+                return Err(CliError::StaleBaseline {
+                    report: refusal.to_string(),
+                });
+            }
+        }
 
         if self.no_reconcile {
             return print_forensic_status(&repo_root);
@@ -1026,6 +1058,15 @@ mod tests {
         let status = Status::new();
         let _options = status.get_status_options();
         // Just verify it doesn't panic and returns valid options
+    }
+
+    #[test]
+    fn test_guard_operation_preserves_forensic_bypass() {
+        let mut status = Status::new();
+        assert_eq!(status.guard_operation(), GuardOperation::Status);
+
+        status.no_reconcile = true;
+        assert_eq!(status.guard_operation(), GuardOperation::ForensicStatus);
     }
 
     #[test]

@@ -114,8 +114,20 @@ impl Repository {
             status_by_path.insert(e.path().to_string_lossy().to_string(), e.status());
         }
 
-        let conflicted: std::collections::HashSet<String> =
-            self.list_conflicts()?.into_iter().map(|(p, _)| p).collect();
+        let listed_conflicts = self.list_conflicts()?;
+        let conflicted: std::collections::HashSet<String> = listed_conflicts
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        let name_conflicted: std::collections::HashSet<String> = listed_conflicts
+            .iter()
+            .filter(|(_, records)| {
+                records
+                    .iter()
+                    .any(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
         report.conflicted_files = conflicted.len();
 
         // Files visible (tracked + recorded) on the current view.
@@ -160,7 +172,12 @@ impl Repository {
                 .unwrap_or(false);
             let status_conflicted = st == Some(FileStatus::Conflicted);
             let listed = conflicted.contains(path);
-            if !(markers == status_conflicted && status_conflicted == listed) {
+            let honest = if name_conflicted.contains(path) {
+                status_conflicted && listed
+            } else {
+                markers == status_conflicted && status_conflicted == listed
+            };
+            if !honest {
                 report.problems.push(VerifyProblem::ConflictHonesty {
                     path: path.clone(),
                     markers,

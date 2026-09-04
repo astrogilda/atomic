@@ -29,7 +29,7 @@ impl Repository {
     /// | 43,000 files | ~150s | <3s |
     /// | 80,000 files | ~150s | <5s |
     pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
-        self.status_inner(options, UntrackedScanPolicy::Always, true)
+        self.status_inner(options, UntrackedScanPolicy::Always, true, false)
     }
 
     /// Compute status for recording without scanning unrelated untracked files.
@@ -42,13 +42,16 @@ impl Repository {
         &self,
         options: StatusOptions,
         detect_raw_renames: bool,
+        include_all_untracked: bool,
     ) -> Result<RepositoryStatus, RepositoryError> {
-        let policy = if detect_raw_renames {
+        let policy = if include_all_untracked {
+            UntrackedScanPolicy::Always
+        } else if detect_raw_renames {
             UntrackedScanPolicy::WhenRegularFileDeleted
         } else {
             UntrackedScanPolicy::Never
         };
-        self.status_inner(options, policy, false)
+        self.status_inner(options, policy, false, true)
     }
 
     fn status_inner(
@@ -56,6 +59,7 @@ impl Repository {
         options: StatusOptions,
         untracked_policy: UntrackedScanPolicy,
         hash_untracked: bool,
+        for_record: bool,
     ) -> Result<RepositoryStatus, RepositoryError> {
         use std::time::SystemTime;
 
@@ -73,9 +77,25 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
         let projected_present_paths: HashSet<PathBuf> =
             projection.present.into_keys().map(PathBuf::from).collect();
+        let projected_absent: Vec<_> = projection.absent_metadata.into_values().collect();
+        let projected_name_conflicts = projection.name_conflicts;
+        let persisted_name_paths: HashSet<String> = txn
+            .iter_conflicts(view.id)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .into_iter()
+            .flat_map(|(_, records)| records)
+            .filter(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+            .map(|record| record.path)
+            .collect();
 
         let mut status = RepositoryStatus::new(self.current_view.clone(), Some(view.state));
 
@@ -157,6 +177,29 @@ impl Repository {
             tracked_paths.insert(normalized);
         }
 
+        // TREE is aligned to the current visible lifecycle and therefore omits
+        // recorded deletions. Reintroduce those paths for status classification
+        // using the operation-aware projection so a filesystem reappearance is
+        // an undelete of the original inode rather than an untracked new file.
+        for absent in &projected_absent {
+            let normalized = PathBuf::from(&absent.path);
+            if !options.path_filters.is_empty() {
+                let matches = options
+                    .path_filters
+                    .iter()
+                    .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
+                if !matches {
+                    continue;
+                }
+            }
+            tracked_paths.insert(normalized.clone());
+            inode_map.insert(normalized.clone(), absent.inode);
+            has_graph_content_cache.insert(normalized.clone(), true);
+            if absent.directory {
+                directory_inodes.insert(absent.inode);
+            }
+        }
+
         let tree_ms = tree_start.elapsed().as_millis();
         log::debug!(
             "status: TREE scan took {}ms ({} tracked files, {} dirs)",
@@ -164,6 +207,18 @@ impl Repository {
             tracked_paths.len(),
             directory_inodes.len()
         );
+
+        for path in projected_name_conflicts.keys() {
+            let normalized = PathBuf::from(path);
+            if options.path_filters.is_empty()
+                || options
+                    .path_filters
+                    .iter()
+                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
+            {
+                tracked_paths.insert(normalized);
+            }
+        }
 
         // ── Batch-load FILE_INDEX ───────────────────────────────────────
         //
@@ -208,9 +263,11 @@ impl Repository {
             // Skip tracked directories — handle separately
             if is_dir {
                 found_on_disk.insert(path.clone());
+                let projected_present = projected_present_paths.contains(path);
                 if abs_path.is_dir() {
-                    if !has_graph {
-                        // Directory tracked but not yet recorded
+                    if !has_graph || !projected_present {
+                        // A projected-absent directory that reappears is an
+                        // undelete candidate carrying its original inode.
                         let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
                         if let Some(inode) = inode {
                             entry.set_inode(inode);
@@ -218,9 +275,9 @@ impl Repository {
                         entry.set_details("directory".to_string());
                         status.add_entry(entry);
                     }
-                    // else: Clean directory — skip
+                } else if has_graph && !projected_present {
+                    // The deletion is already recorded on this view.
                 } else {
-                    // Directory deleted from disk
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Deleted);
                     if let Some(inode) = inode {
                         entry.set_inode(inode);
@@ -267,6 +324,20 @@ impl Repository {
             };
 
             found_on_disk.insert(path.clone());
+
+            if has_graph && !projected_present_paths.contains(path) {
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                if options.hash_contents {
+                    if let Ok(hash) = hash_file_contents(&abs_path) {
+                        entry.set_current_hash(hash);
+                    }
+                }
+                status.add_entry(entry);
+                continue;
+            }
 
             // Not yet recorded → Added
             if !has_graph {
@@ -456,6 +527,51 @@ impl Repository {
             }
         }
 
+        // PATH_CLAIMS conflicts are authoritative and visible even before a
+        // materialize has persisted compatibility conflict rows. A12 file
+        // conflicts become recordable Modified entries once markers are removed;
+        // A11 and directory conflicts have no in-file marker channel.
+        for (path, conflict) in &projected_name_conflicts {
+            let normalized = PathBuf::from(path);
+            if !options.path_filters.is_empty()
+                && !options
+                    .path_filters
+                    .iter()
+                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
+            {
+                continue;
+            }
+            let abs_path = self.root.join(&normalized);
+            let has_markers = std::fs::read(&abs_path)
+                .ok()
+                .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                .is_some();
+            let path_sides = conflict.sides_at_path(path);
+            let marker_resolved_a12 = for_record
+                && persisted_name_paths.contains(path)
+                && !conflict.is_rename_conflict()
+                && !has_markers
+                && path_sides.iter().all(|side| !side.is_directory())
+                && abs_path.is_file();
+            let mut entry = FileStatusEntry::new(
+                normalized,
+                if marker_resolved_a12 {
+                    FileStatus::Modified
+                } else {
+                    FileStatus::Conflicted
+                },
+            );
+            if path_sides.len() == 1 {
+                entry.set_inode(path_sides[0].inode);
+            }
+            entry.set_details(format!(
+                "name conflict ({} path(s), {} claimant(s))",
+                conflict.paths.len(),
+                conflict.sides.len()
+            ));
+            status.add_or_replace_entry(entry);
+        }
+
         // ── Conflicted files ────────────────────────────────────────────
         //
         // Surface persisted conflict state (written by the last materialize
@@ -548,24 +664,68 @@ impl Repository {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
-        let mut out = Vec::new();
+        let full_visibility = graph_visibility_closure(&txn, &view)?;
+        let visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &full_visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let active_name_paths: HashSet<String> = projection
+            .name_conflicts
+            .iter()
+            .filter_map(|(path, conflict)| {
+                let sides = conflict.sides_at_path(path);
+                let requires_marker =
+                    !conflict.is_rename_conflict() && sides.iter().all(|side| !side.is_directory());
+                let has_marker = std::fs::read(self.root.join(path))
+                    .ok()
+                    .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                    .is_some();
+                (!requires_marker || has_marker).then(|| path.clone())
+            })
+            .collect();
+        let mut by_path = HashMap::<String, Vec<atomic_core::pristine::StoredConflict>>::new();
         for (_inode, records) in txn
             .iter_conflicts(view.id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            let Some(first) = records.first() else {
-                continue;
-            };
-            let abs_path = self.root.join(&first.path);
-            let still_conflicted = std::fs::read(&abs_path)
-                .ok()
-                .and_then(|c| super::materialize::first_conflict_marker_line(&c))
-                .is_some();
-            if !still_conflicted {
+            for record in records {
+                let still_conflicted = if record.kind
+                    == atomic_core::pristine::StoredConflictKind::Name
+                {
+                    active_name_paths.contains(&record.path)
+                } else {
+                    std::fs::read(self.root.join(&record.path))
+                        .ok()
+                        .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                        .is_some()
+                };
+                if still_conflicted {
+                    by_path.entry(record.path.clone()).or_default().push(record);
+                }
+            }
+        }
+        for (path, conflict) in projection.name_conflicts {
+            if !active_name_paths.contains(&path) {
                 continue;
             }
-            out.push((first.path.clone(), records));
+            by_path.entry(path.clone()).or_insert_with(|| {
+                vec![atomic_core::pristine::StoredConflict {
+                    kind: atomic_core::pristine::StoredConflictKind::Name,
+                    path,
+                    line: None,
+                    sides: conflict
+                        .sides
+                        .iter()
+                        .flat_map(|side| side.event_changes.iter())
+                        .map(|change| change.get().to_string())
+                        .collect(),
+                }]
+            });
         }
+        let mut out: Vec<_> = by_path.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }

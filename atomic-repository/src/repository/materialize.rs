@@ -1,5 +1,5 @@
 use super::*;
-use atomic_core::pristine::{CachedGraphTxn, StoredConflict, StoredConflictKind};
+use atomic_core::pristine::{PathClaimTxnT, StoredConflict, StoredConflictKind};
 
 /// Return the 1-based line number of the first Atomic conflict-start marker
 /// (`>>>>>>>`) in `content`, or `None` if the content has no markers.
@@ -114,12 +114,6 @@ fn render_name_conflict<C: atomic_core::change::ChangeStore>(
     path: &str,
     sides: &[(Inode, Position<NodeId>)],
 ) -> Result<Vec<u8>, String> {
-    use atomic_core::output::repo::{
-        output_graph_content_resolved, resolve_conflicts_semantically,
-    };
-    use atomic_core::output::{compute_order, retrieve_graph, RetrieveOptions, Writer};
-    use atomic_core::pristine::InodePreloadTxn;
-
     let mut out: Vec<u8> = Vec::new();
     for (i, (inode, position)) in sides.iter().enumerate() {
         if i == 0 {
@@ -128,29 +122,16 @@ fn render_name_conflict<C: atomic_core::change::ChangeStore>(
             out.extend_from_slice(b"=======\n");
         }
 
-        let preloaded = InodePreloadTxn::from_table(txn, *inode, inode_graph_table)
-            .map_err(|e| format!("{}: name-conflict preload: {:?}", path, e))?;
-        let retrieve_opts = RetrieveOptions::default().with_graph_visibility(visibility.clone());
-        let retrieve_result = retrieve_graph(&preloaded, *position, retrieve_opts)
-            .map_err(|e| format!("{}: name-conflict retrieve: {:?}", path, e))?;
-        let mut graph = retrieve_result.graph;
-        let order = compute_order(&mut graph);
-        let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order)
-            .map_err(|error| format!("{}: name-conflict semantic resolution: {}", path, error))?;
-        let buffer = Vec::with_capacity(graph.total_bytes());
-        let mut writer = Writer::new(buffer);
-        let hash_fn =
-            |node_id: NodeId| -> Result<Option<Hash>, atomic_core::pristine::PristineError> {
-                if node_id.is_root() {
-                    return Ok(None);
-                }
-                external_hashes.get(&node_id).copied().map(Some).ok_or(
-                    atomic_core::pristine::PristineError::ChangeNotFound { id: node_id.get() },
-                )
-            };
-        output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
-            .map_err(|e| format!("{}: name-conflict content: {:?}", path, e))?;
-        let side = writer.into_inner();
+        let side = render_name_conflict_side(
+            txn,
+            store,
+            inode_graph_table,
+            visibility,
+            external_hashes,
+            path,
+            *inode,
+            *position,
+        )?;
         out.extend_from_slice(&side);
         if !side.ends_with(b"\n") {
             out.push(b'\n');
@@ -160,6 +141,127 @@ fn render_name_conflict<C: atomic_core::change::ChangeStore>(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_name_conflict_side<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    visibility: &GraphVisibilityClosure,
+    external_hashes: &std::collections::HashMap<NodeId, Hash>,
+    path: &str,
+    inode: Inode,
+    position: Position<NodeId>,
+) -> Result<Vec<u8>, String> {
+    use atomic_core::output::repo::{
+        output_graph_content_resolved, resolve_conflicts_semantically,
+    };
+    use atomic_core::output::{compute_order, retrieve_graph, RetrieveOptions, Writer};
+    use atomic_core::pristine::InodePreloadTxn;
+
+    let preloaded = InodePreloadTxn::from_table(txn, inode, inode_graph_table)
+        .map_err(|e| format!("{}: name-conflict preload: {:?}", path, e))?;
+    let retrieve_opts = RetrieveOptions::default().with_graph_visibility(visibility.clone());
+    let retrieve_result = retrieve_graph(&preloaded, position, retrieve_opts)
+        .map_err(|e| format!("{}: name-conflict retrieve: {:?}", path, e))?;
+    let mut graph = retrieve_result.graph;
+    let order = compute_order(&mut graph);
+    let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order)
+        .map_err(|error| format!("{}: name-conflict semantic resolution: {}", path, error))?;
+    let buffer = Vec::with_capacity(graph.total_bytes());
+    let mut writer = Writer::new(buffer);
+    let hash_fn = |node_id: NodeId| -> Result<Option<Hash>, atomic_core::pristine::PristineError> {
+        if node_id.is_root() {
+            return Ok(None);
+        }
+        external_hashes
+            .get(&node_id)
+            .copied()
+            .map(Some)
+            .ok_or(atomic_core::pristine::PristineError::ChangeNotFound { id: node_id.get() })
+    };
+    output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
+        .map_err(|e| format!("{}: name-conflict content: {:?}", path, e))?;
+    Ok(writer.into_inner())
+}
+
+struct PreparedNameConflictOutput {
+    files: Vec<MaterializedEntry>,
+    directories: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_name_conflict_output<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    visibility: &GraphVisibilityClosure,
+    external_hashes: &std::collections::HashMap<NodeId, Hash>,
+    conflicts: &std::collections::HashMap<String, super::name_resolution::ProjectedNameConflict>,
+    only_paths: Option<&std::collections::HashSet<String>>,
+) -> Result<PreparedNameConflictOutput, RepositoryError> {
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut paths: Vec<_> = conflicts.keys().cloned().collect();
+    paths.sort();
+    for path in paths {
+        if only_paths.is_some_and(|selected| !selected.contains(&path)) {
+            continue;
+        }
+        let conflict = &conflicts[&path];
+        let sides = conflict.sides_at_path(&path);
+        if sides.is_empty() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("name conflict '{}' has no path-local side", path),
+            });
+        }
+        let directories_at_path = sides.iter().filter(|side| side.is_directory()).count();
+        if directories_at_path == sides.len() {
+            directories.push(path);
+            continue;
+        }
+        if directories_at_path != 0 {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot materialize mixed file/directory name conflict '{}' without choosing a side",
+                    path
+                ),
+            });
+        }
+
+        let content = if sides.len() == 1 {
+            let side = sides[0];
+            render_name_conflict_side(
+                txn,
+                store,
+                inode_graph_table,
+                visibility,
+                external_hashes,
+                &path,
+                side.inode,
+                side.position,
+            )
+            .map_err(RepositoryError::Output)?
+        } else {
+            let render_sides: Vec<_> = sides
+                .iter()
+                .map(|side| (side.inode, side.position))
+                .collect();
+            render_name_conflict(
+                txn,
+                store,
+                inode_graph_table,
+                visibility,
+                external_hashes,
+                &path,
+                &render_sides,
+            )
+            .map_err(RepositoryError::Output)?
+        };
+        files.push(MaterializedEntry::present(path, sides[0].inode, content));
+    }
+    Ok(PreparedNameConflictOutput { files, directories })
+}
+
 impl Repository {
     fn remove_absent_entries(
         &self,
@@ -167,17 +269,17 @@ impl Repository {
         only_paths: Option<&std::collections::HashSet<String>>,
         prefix: Option<&str>,
     ) -> Result<usize, RepositoryError> {
-        let mut removed = 0;
-        for entry in entries {
-            let path = entry.path();
-            if only_paths.is_some_and(|paths| !paths.contains(path)) {
-                continue;
-            }
-            if prefix.is_some_and(|prefix| !path.starts_with(prefix)) {
-                continue;
-            }
+        let selected = |path: &str| {
+            !only_paths.is_some_and(|paths| !paths.contains(path))
+                && !prefix.is_some_and(|prefix| !path.starts_with(prefix))
+        };
+        let mut removed_files = 0;
 
-            let absolute = self.root.join(path);
+        for entry in entries
+            .iter()
+            .filter(|entry| !entry.is_directory() && selected(entry.path()))
+        {
+            let absolute = self.root.join(entry.path());
             match std::fs::symlink_metadata(&absolute) {
                 Ok(metadata)
                     if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
@@ -185,25 +287,59 @@ impl Repository {
                     std::fs::remove_file(&absolute).map_err(|error| {
                         RepositoryError::Output(format!(
                             "failed to remove absent materialized path '{}': {}",
-                            path, error
+                            entry.path(),
+                            error
                         ))
                     })?;
-                    removed += 1;
+                    removed_files += 1;
                 }
                 Ok(_) => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
                             "cannot materialize absent file '{}': working-copy path is not a file",
-                            path
+                            entry.path()
                         ),
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(RepositoryError::Io(error)),
             }
-            self.del_file_index(path)?;
+            self.del_file_index(entry.path())?;
         }
-        Ok(removed)
+
+        let mut directories: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.is_directory() && selected(entry.path()))
+            .collect();
+        directories.sort_by_key(|entry| std::cmp::Reverse(entry.path().matches('/').count()));
+        for entry in directories {
+            let absolute = self.root.join(entry.path());
+            match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    std::fs::remove_dir(&absolute).map_err(|error| {
+                        RepositoryError::InvalidOperation {
+                            message: format!(
+                                "cannot remove absent directory '{}': {} (untracked children are never removed recursively)",
+                                entry.path(), error
+                            ),
+                        }
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "cannot materialize absent directory '{}': working-copy path is not a directory",
+                            entry.path()
+                        ),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RepositoryError::Io(error)),
+            }
+            self.del_file_index(entry.path())?;
+        }
+
+        Ok(removed_files)
     }
 
     /// Persist the conflict state discovered by a materialize into the
@@ -219,48 +355,100 @@ impl Repository {
         view_id: u64,
         path_to_inode: &std::collections::HashMap<String, u64>,
         conflicts_by_path: &std::collections::HashMap<String, u32>,
+        name_conflicts: &std::collections::HashMap<
+            String,
+            super::name_resolution::ProjectedNameConflict,
+        >,
         only_paths: &Option<std::collections::HashSet<String>>,
     ) -> Result<(), RepositoryError> {
         let mut wtxn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut records_by_inode = std::collections::HashMap::<u64, Vec<StoredConflict>>::new();
 
-        let mk = |path: &str, line: u32| StoredConflict {
-            kind: StoredConflictKind::Order,
-            path: path.to_string(),
-            line: Some(line),
-            sides: Vec::new(),
-        };
-
-        match only_paths {
-            None => {
-                wtxn.del_conflicts_prefix(view_id)
-                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                for (path, line) in conflicts_by_path {
-                    if let Some(&inode) = path_to_inode.get(path) {
-                        let sc = mk(path, *line);
-                        wtxn.put_conflicts(view_id, inode, std::slice::from_ref(&sc))
-                            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    }
-                }
-            }
-            Some(paths) => {
-                for path in paths {
-                    if let Some(&inode) = path_to_inode.get(path) {
-                        if let Some(line) = conflicts_by_path.get(path) {
-                            let sc = mk(path, *line);
-                            wtxn.put_conflicts(view_id, inode, std::slice::from_ref(&sc))
-                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        } else {
-                            wtxn.del_conflicts(view_id, inode)
-                                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                        }
-                    }
+        if let Some(paths) = only_paths {
+            for (inode, records) in wtxn
+                .iter_conflicts(view_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                let retained: Vec<_> = records
+                    .into_iter()
+                    .filter(|record| !paths.contains(&record.path))
+                    .collect();
+                if !retained.is_empty() {
+                    records_by_inode.insert(inode, retained);
                 }
             }
         }
 
+        for (path, line) in conflicts_by_path {
+            if name_conflicts.contains_key(path) {
+                continue;
+            }
+            if let Some(&inode) = path_to_inode.get(path) {
+                records_by_inode
+                    .entry(inode)
+                    .or_default()
+                    .push(StoredConflict {
+                        kind: StoredConflictKind::Order,
+                        path: path.clone(),
+                        line: Some(*line),
+                        sides: Vec::new(),
+                    });
+            }
+        }
+
+        for (path, conflict) in name_conflicts {
+            if only_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(path))
+            {
+                continue;
+            }
+            let mut side_hashes = Vec::new();
+            for change_id in conflict
+                .sides
+                .iter()
+                .flat_map(|side| side.event_changes.iter().copied())
+            {
+                let hash = wtxn
+                    .get_external(change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "name-conflict side change {} has no external hash",
+                            change_id.get()
+                        ))
+                    })?;
+                side_hashes.push(hash.to_base32());
+            }
+            side_hashes.sort();
+            side_hashes.dedup();
+            let line = conflicts_by_path.get(path).copied();
+            for side in conflict.sides_at_path(path) {
+                records_by_inode
+                    .entry(side.inode.get())
+                    .or_default()
+                    .push(StoredConflict {
+                        kind: StoredConflictKind::Name,
+                        path: path.clone(),
+                        line,
+                        sides: side_hashes.clone(),
+                    });
+            }
+        }
+
+        wtxn.del_conflicts_prefix(view_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for (inode, mut records) in records_by_inode {
+            records.sort_by(|left, right| {
+                (&left.path, left.kind.to_string()).cmp(&(&right.path, right.kind.to_string()))
+            });
+            records.dedup();
+            wtxn.put_conflicts(view_id, inode, &records)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
         wtxn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
@@ -293,7 +481,13 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-        let visibility = graph_visibility_closure(&txn, &view)?;
+        let full_visibility = graph_visibility_closure(&txn, &view)?;
+        let visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &full_visibility,
+        )?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
 
         Ok(projection
@@ -352,45 +546,10 @@ impl Repository {
     /// Used when the parallel path is not suitable (e.g., memory-constrained
     /// environments).
     pub fn materialize_sequential(&self) -> Result<MaterializeResult, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        let visibility = graph_visibility_closure(&txn, &view)?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
-        let present_paths: HashSet<String> = projection
-            .present
-            .values()
-            .filter(|item| !item.is_directory)
-            .map(|item| item.path.clone())
-            .collect();
-        let absent_entries = projection.absent;
-
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-        let options = MaterializeOptions::new()
-            .with_graph_visibility(visibility)
-            .only_paths(present_paths.clone());
-
-        let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
-            .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
-        drop(cached_txn);
-        drop(txn);
-
-        result.files_deleted += self.remove_absent_entries(&absent_entries, None, None)?;
-        self.populate_file_index(&result, &present_paths)?;
-
-        Ok(result)
+        // PATH_CLAIMS conflict rendering is batch-validated before filesystem
+        // effects. Reuse that single implementation so sequential and parallel
+        // entry points cannot disagree about a claimant.
+        self.materialize_parallel(None)
     }
 
     /// Materialize only specific files to the working copy.
@@ -414,46 +573,7 @@ impl Repository {
         &self,
         paths: std::collections::HashSet<String>,
     ) -> Result<MaterializeResult, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        let visibility = graph_visibility_closure(&txn, &view)?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
-        let present_paths: HashSet<String> = projection
-            .present
-            .values()
-            .filter(|item| !item.is_directory && paths.contains(&item.path))
-            .map(|item| item.path.clone())
-            .collect();
-        let absent_entries = projection.absent;
-
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-        let options = MaterializeOptions::new()
-            .with_graph_visibility(visibility)
-            .only_paths(present_paths.clone());
-
-        let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
-            .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
-        drop(cached_txn);
-        drop(txn);
-
-        result.files_deleted += self.remove_absent_entries(&absent_entries, Some(&paths), None)?;
-        // Update FILE_INDEX only for selected paths that should be present.
-        self.populate_file_index_for_paths(&present_paths)?;
-
-        Ok(result)
+        self.materialize_parallel(Some(paths))
     }
 
     /// Materialize the working copy using parallel file processing.
@@ -516,14 +636,28 @@ impl Repository {
         use atomic_core::output::repo::OutputItem;
         use atomic_core::output::RetrieveOptions;
         use rayon::prelude::*;
-        use std::collections::HashSet as StdHashSet;
 
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
-        let absent_entries = projection.absent;
+        let view = txn
+            .get_view_by_id(view_id)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Database(format!(
+                    "materialization references missing view id {view_id}"
+                ))
+            })?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let mut absent_entries = projection.absent;
+        let name_conflicts = projection.name_conflicts;
         let mut items: Vec<OutputItem> = projection.present.into_values().collect();
         items.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -541,62 +675,8 @@ impl Repository {
         let total_files = file_items.len();
         let skipped_in_filter = items.iter().filter(|i| !i.is_directory).count() - total_files;
 
-        // ── Name-conflict detection ──────────────────────────────────────
-        //
-        // TREE is a single-valued path→inode index, so `iter_tree` (and hence
-        // `file_items`) exposes only ONE inode per path even when two
-        // independent creates on different views both claim it — the later
-        // recorder silently wins and the first inode is orphaned (rubric A12,
-        // ATOM::29/30). Walk REV_TREE to recover every inode that claims each
-        // path; when ≥ 2 of them are BOTH visible (creating change in the
-        // filter) and alive under this view, the path is a genuine name
-        // conflict that must be surfaced rather than silently collapsed.
-        //
-        // The (relatively expensive) aliveness probe runs ONLY for paths with
-        // ≥ 2 candidate inodes, so the common single-inode file pays nothing.
-        let name_conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> = {
-            use atomic_core::pristine::TreeTxnT;
-            let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
-                std::collections::HashMap::new();
-            let pairs = txn
-                .iter_rev_tree()
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for (inode, path) in pairs {
-                by_path.entry(path).or_default().push(inode);
-            }
-            let filter = &visibility;
-            let mut conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> =
-                std::collections::HashMap::new();
-            for item in &file_items {
-                let candidates = match by_path.get(&item.path) {
-                    Some(c) if c.len() >= 2 => c,
-                    _ => continue,
-                };
-                let mut live: Vec<(Inode, Position<NodeId>)> = Vec::new();
-                for &inode in candidates {
-                    let Some(pos) = txn
-                        .inode_position(inode)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    else {
-                        continue;
-                    };
-                    if !pos.change.is_root() && !filter.contains(pos.change) {
-                        continue; // not visible on this view
-                    }
-                    if crate::repository::status::is_file_alive_via_retrieval(
-                        &txn, inode, pos, filter,
-                    )? {
-                        live.push((inode, pos));
-                    }
-                }
-                if live.len() >= 2 {
-                    // Deterministic order: creating change, then position, then inode.
-                    live.sort_by_key(|(ino, p)| (p.change.get(), p.pos.get(), ino.get()));
-                    conflicts.insert(item.path.clone(), live);
-                }
-            }
-            conflicts
-        };
+        // Name conflicts come from the causal PATH_CLAIMS projection. TREE and
+        // REV_TREE are strict one-to-one caches and are never consulted here.
 
         let mut result = MaterializeResult::new();
         result.files_skipped += skipped_in_filter;
@@ -696,6 +776,48 @@ impl Repository {
                 .collect()
         };
 
+        // A prior view can materialize contested names that intentionally have
+        // no TREE row. Remove only paths that are both globally graph-claimed
+        // and FILE_INDEX-backed, but absent from the target claim projection.
+        // This proves Atomic previously materialized the path and avoids
+        // recursively deleting untracked directory contents.
+        let target_paths: HashSet<&str> = items
+            .iter()
+            .map(|item| item.path.as_str())
+            .chain(name_conflicts.keys().map(String::as_str))
+            .collect();
+        let mut globally_claimed_files = HashSet::new();
+        let mut globally_claimed_directories = HashSet::new();
+        for entry in txn
+            .iter_path_claims()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+        {
+            match entry.event.kind {
+                atomic_core::pristine::PathClaimKind::File => {
+                    globally_claimed_files.insert(entry.path);
+                }
+                atomic_core::pristine::PathClaimKind::Directory => {
+                    globally_claimed_directories.insert(entry.path);
+                }
+            }
+        }
+        let mut absent_paths: HashSet<String> = absent_entries
+            .iter()
+            .map(|entry| entry.path().to_string())
+            .collect();
+        for path in file_index.keys() {
+            if globally_claimed_files.contains(path)
+                && !globally_claimed_directories.contains(path)
+                && !target_paths.contains(path.as_str())
+                && only_paths
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(path))
+                && absent_paths.insert(path.clone())
+            {
+                absent_entries.push(MaterializedEntry::absent(path, None));
+            }
+        }
+
         // Open the INODE_GRAPH table once, shared across all rayon threads.
         // This eliminates per-file open_multimap_table mutex contention.
         let inode_graph_table = txn
@@ -778,23 +900,6 @@ impl Repository {
                     )
                     .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
                     (writer.into_inner(), order_ms, t_content.elapsed())
-                };
-
-                // Name-conflict override (rare): when ≥ 2 inodes are alive at
-                // this path on the view, replace the single-inode content with
-                // a marker-wrapped rendering of every side so the conflict is
-                // surfaced instead of silently collapsed (rubric A12).
-                let content = match name_conflicts.get(&item.path) {
-                    Some(sides) => render_name_conflict(
-                        &txn,
-                        store,
-                        &inode_graph_table,
-                        &visibility,
-                        &external_hashes,
-                        &item.path,
-                        sides,
-                    )?,
-                    None => content,
                 };
 
                 let entry = MaterializedEntry::present(item.path.clone(), item.inode, content);
@@ -880,10 +985,38 @@ impl Repository {
         // Validate the entire render batch before the first working-copy or
         // pristine mutation. Rayon has already evaluated every item into this
         // vector, so any graph/preload/content error aborts the batch here.
-        let rendered_files = file_results
+        let mut rendered_files = file_results
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(RepositoryError::Output)?;
+        let prepared_name_conflicts = prepare_name_conflict_output(
+            &txn,
+            store,
+            &inode_graph_table,
+            &visibility,
+            &external_hashes,
+            &name_conflicts,
+            only_paths.as_ref(),
+        )?;
+        for entry in prepared_name_conflicts.files {
+            let bytes = entry
+                .bytes()
+                .expect("prepared name-conflict file is present");
+            rendered_files.push(Some((
+                entry.clone(),
+                Hash::of(bytes),
+                true,
+                first_conflict_marker_line(bytes),
+            )));
+        }
+        for path in name_conflicts.keys() {
+            if only_paths.as_ref().is_none_or(|paths| paths.contains(path)) {
+                result.add_conflict(atomic_core::output::repo::FileConflict::new(
+                    path,
+                    atomic_core::output::repo::FileConflictType::Name,
+                ));
+            }
+        }
 
         if !execute {
             drop(inode_graph_table);
@@ -907,6 +1040,11 @@ impl Repository {
             .iter()
             .map(|i| (i.path.clone(), i.inode.get()))
             .collect();
+        for (path, conflict) in &name_conflicts {
+            if let Some(side) = conflict.sides_at_path(path).first() {
+                path_to_inode.insert(path.clone(), side.inode.get());
+            }
+        }
         for entry in &absent_entries {
             if let Some(inode) = entry.inode() {
                 path_to_inode.insert(entry.path().to_string(), inode.get());
@@ -915,14 +1053,30 @@ impl Repository {
 
         // Execution phase. From this point onward an external filesystem error
         // can leave partial effects; graph/render/preload errors cannot reach it.
-        let file_paths: StdHashSet<&str> = file_items.iter().map(|i| i.path.as_str()).collect();
+        for path in &prepared_name_conflicts.directories {
+            let abs_dir = root.join(path);
+            if !abs_dir.exists() {
+                std::fs::create_dir_all(&abs_dir).map_err(|error| {
+                    RepositoryError::Output(format!(
+                        "failed to create conflicted directory '{}': {}",
+                        path, error
+                    ))
+                })?;
+            }
+            result.record_directory();
+        }
         for item in &items {
             if !item.is_directory {
                 continue;
             }
-            let dir_prefix = format!("{}/", item.path);
-            let has_children = file_paths.iter().any(|path| path.starts_with(&dir_prefix));
-            if !has_children {
+            let selected = only_paths.as_ref().is_none_or(|paths| {
+                paths.contains(&item.path)
+                    || paths.iter().any(|path| {
+                        path.strip_prefix(&item.path)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                    })
+            });
+            if !selected {
                 result.record_skipped();
                 continue;
             }
@@ -1003,38 +1157,15 @@ impl Repository {
         }
         result.files_deleted +=
             self.remove_absent_entries(&absent_entries, only_paths.as_ref(), None)?;
-        self.persist_view_conflicts(view_id, &path_to_inode, &conflicts_by_path, &only_paths)?;
+        self.persist_view_conflicts(
+            view_id,
+            &path_to_inode,
+            &conflicts_by_path,
+            &name_conflicts,
+            &only_paths,
+        )?;
 
         Ok(result)
-    }
-
-    /// Populate FILE_INDEX for the tracked paths that the lifecycle projection
-    /// says must be present after materialization.
-    ///
-    /// Tracked paths that are absent in this view are intentionally excluded;
-    /// every selected present path must stat and read successfully.
-    fn populate_file_index(
-        &self,
-        _result: &MaterializeResult,
-        present_paths: &std::collections::HashSet<String>,
-    ) -> Result<(), RepositoryError> {
-        let tracked = self.list_tracked_files()?;
-        let tracked_paths: std::collections::HashSet<String> = tracked
-            .iter()
-            .map(|file| file.path.to_string_lossy().replace('\\', "/"))
-            .collect();
-        if let Some(path) = present_paths
-            .iter()
-            .find(|path| !tracked_paths.contains(path.as_str()))
-        {
-            return Err(RepositoryError::InvalidOperation {
-                message: format!(
-                    "cannot index materialized path '{}': path is not tracked",
-                    path
-                ),
-            });
-        }
-        self.populate_file_index_for_paths(present_paths)
     }
 
     /// Update FILE_INDEX for paths that must be present after materialization.
@@ -1115,43 +1246,38 @@ impl Repository {
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the current view for the change filter
         let view = txn
             .get_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: self.current_view.clone(),
             })?;
-
-        let visibility = graph_visibility_closure(&txn, &view)?;
+        let full_visibility = graph_visibility_closure(&txn, &view)?;
+        let visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &full_visibility,
+        )?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
-        let present_paths: HashSet<String> = projection
+        let mut paths: HashSet<String> = projection
             .present
-            .values()
-            .filter(|item| !item.is_directory && item.path.starts_with(prefix))
-            .map(|item| item.path.clone())
+            .keys()
+            .chain(projection.absent_metadata.keys())
+            .chain(projection.name_conflicts.keys())
+            .filter(|path| path.starts_with(prefix))
+            .cloned()
             .collect();
-        let absent_entries = projection.absent;
-
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let working_copy = FileSystem::from_root(&self.root);
-        let options = MaterializeOptions::new()
-            .prefix(prefix)
-            .with_graph_visibility(visibility)
-            .only_paths(present_paths.clone());
-
-        let mut result = materialize_view(&cached_txn, &self.change_store, &working_copy, options)
-            .map_err(|e| RepositoryError::Output(format!("{}", e)))?;
-        drop(cached_txn);
+        for path in projection.present.keys() {
+            if prefix
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                paths.insert(path.clone());
+            }
+        }
         drop(txn);
-
-        result.files_deleted += self.remove_absent_entries(&absent_entries, None, Some(prefix))?;
-        self.populate_file_index(&result, &present_paths)?;
-
-        Ok(result)
+        self.materialize_parallel(Some(paths))
     }
 }
 

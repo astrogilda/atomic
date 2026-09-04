@@ -6,12 +6,14 @@
 //! - **ID Mappings**: `EXTERNAL`, `INTERNAL` - map between internal NodeIds and external Hashes
 //! - **Graph**: `GRAPH`, `INODE_GRAPH` - store vertices and edges
 //! - **Views**: `VIEWS`, `VIEW_CHANGES`, `REV_VIEW_CHANGES` - view metadata
-//! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
+//! - **File Tree**: `PATH_CLAIMS`, `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
 //! - **Dependencies**: `DEPS`, `REV_DEPS` - node dependency tracking for attestations/provenance
 //! - **Change Dependencies**: `CHANGE_DEPS`, `REV_CHANGE_DEPS`, `CHANGE_DEPS_INDEXED` - normal change dependency index
 //! - **State**: `STATES`, `MERKLE_CHAIN` - view state and Merkle chain
 
 use redb::{MultimapTableDefinition, TableDefinition};
+
+use super::path_claim::PATH_CLAIM_EVENT_SIZE;
 
 // ID Mapping Tables
 
@@ -105,6 +107,21 @@ pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
 pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("conflicts");
 
 // File Tree Tables
+
+/// Pristine schema completion markers.
+///
+/// Keys name independently migratable derived indexes; values are their
+/// completed schema versions. A missing marker means writable backfill is
+/// required before read-only consumers may trust that index.
+pub const PRISTINE_META: TableDefinition<&str, u32> = TableDefinition::new("pristine_meta");
+
+/// Additive path-claim transitions keyed by repository-relative path.
+///
+/// Values use the fixed-width V1 codec from `pristine::path_claim`. The table
+/// intentionally stores all transitions without view filtering; callers apply
+/// visibility and causal reduction.
+pub const PATH_CLAIMS: MultimapTableDefinition<&str, &[u8; PATH_CLAIM_EVENT_SIZE]> =
+    MultimapTableDefinition::new("path_claims");
 
 /// File tree: path → inode
 ///

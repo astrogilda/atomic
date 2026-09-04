@@ -61,6 +61,9 @@ use atomic_repository::tracking::TrackingOptions;
 use atomic_repository::{FileStatus, Repository, RepositoryStatus, StatusOptions};
 use clap::Parser;
 
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
@@ -331,6 +334,27 @@ impl Command for Restore {
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
+
+        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
+            .map_err(|error| match error {
+                GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                    reason: error.to_string(),
+                },
+                GuardError::Observation(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+                GuardError::Wip(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+            })? {
+            GuardOutcome::Pass(_) => {}
+            GuardOutcome::Refuse(refusal) => {
+                return Err(CliError::StaleBaseline {
+                    report: refusal.to_string(),
+                });
+            }
+        }
+
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         // Compute status once. Restore only touches tracked files, so we skip

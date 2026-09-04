@@ -152,12 +152,13 @@ fn graph_first_direct_import_matches_native_record_projection() {
 }
 
 #[test]
-fn legacy_losing_claim_add_delete_and_move_preserve_primary() {
+fn duplicate_path_claim_is_rejected_without_reverse_only_compatibility() {
+    use atomic_core::pristine::PathClaimTxnT;
+
     let (_temp, repo) = create_temp_repo();
     let mut txn = repo.pristine.write_txn().unwrap();
     let primary = txn.alloc_inode().unwrap();
-    let losing = txn.alloc_inode().unwrap();
-
+    let competing = txn.alloc_inode().unwrap();
     TreeProjectionPlan::plan(
         &txn,
         [TreeProjectionOperation::Add {
@@ -170,104 +171,51 @@ fn legacy_losing_claim_add_delete_and_move_preserve_primary() {
     .unwrap()
     .apply(&mut txn)
     .unwrap();
-    TreeProjectionPlan::plan(
+
+    let error = TreeProjectionPlan::plan(
         &txn,
         [TreeProjectionOperation::Add {
-            inode: losing,
+            inode: competing,
             path: Some("same.txt".to_string()),
             position: None,
             kind: TreeProjectionKind::File,
         }],
     )
-    .unwrap()
-    .apply(&mut txn)
-    .unwrap();
+    .unwrap_err();
+    assert!(error.to_string().contains("already owned"));
     assert_eq!(txn.get_inode("same.txt").unwrap(), Some(primary));
     assert_eq!(txn.get_path(primary).unwrap().as_deref(), Some("same.txt"));
-    assert_eq!(txn.get_path(losing).unwrap().as_deref(), Some("same.txt"));
-
-    TreeProjectionPlan::plan(
-        &txn,
-        [TreeProjectionOperation::Delete {
-            inode: losing,
-            retire: false,
-        }],
-    )
-    .unwrap()
-    .apply(&mut txn)
-    .unwrap();
-    assert_eq!(txn.get_inode("same.txt").unwrap(), Some(primary));
-    assert_eq!(txn.get_path(primary).unwrap().as_deref(), Some("same.txt"));
-    assert_eq!(txn.get_path(losing).unwrap(), None);
-
-    TreeProjectionPlan::plan(
-        &txn,
-        [TreeProjectionOperation::Undelete {
-            inode: losing,
-            path: "same.txt".to_string(),
-            kind: TreeProjectionKind::File,
-        }],
-    )
-    .unwrap()
-    .apply(&mut txn)
-    .unwrap();
-    TreeProjectionPlan::plan(
-        &txn,
-        [TreeProjectionOperation::Move {
-            inode: losing,
-            path: "moved.txt".to_string(),
-        }],
-    )
-    .unwrap()
-    .apply(&mut txn)
-    .unwrap();
-    assert_eq!(txn.get_inode("same.txt").unwrap(), Some(primary));
-    assert_eq!(txn.get_path(primary).unwrap().as_deref(), Some("same.txt"));
-    assert_eq!(txn.get_inode("moved.txt").unwrap(), Some(losing));
-    assert_eq!(txn.get_path(losing).unwrap().as_deref(), Some("moved.txt"));
+    assert_eq!(txn.get_path(competing).unwrap(), None);
+    txn.validate_tree_bijection().unwrap();
     txn.abort().unwrap();
 }
 
 #[test]
-fn multi_claim_primary_is_deterministic_and_corruption_still_fails_closed() {
+fn simultaneous_duplicate_projection_fails_before_mutation() {
     let (_temp, repo) = create_temp_repo();
     let mut txn = repo.pristine.write_txn().unwrap();
-    let low = txn.alloc_inode().unwrap();
-    let high = txn.alloc_inode().unwrap();
-    TreeProjectionPlan::plan(
+    let first = txn.alloc_inode().unwrap();
+    let second = txn.alloc_inode().unwrap();
+    let error = TreeProjectionPlan::plan(
         &txn,
         [
             TreeProjectionOperation::Undelete {
-                inode: high,
+                inode: first,
                 path: "same.txt".to_string(),
                 kind: TreeProjectionKind::File,
             },
             TreeProjectionOperation::Undelete {
-                inode: low,
+                inode: second,
                 path: "same.txt".to_string(),
                 kind: TreeProjectionKind::File,
             },
         ],
     )
-    .unwrap()
-    .apply(&mut txn)
-    .unwrap();
-    assert_eq!(txn.get_inode("same.txt").unwrap(), Some(low));
-    assert_eq!(txn.get_path(high).unwrap().as_deref(), Some("same.txt"));
-
-    // Remove the primary pair, deliberately leaving the losing reverse row.
-    assert_eq!(txn.del_tree("same.txt").unwrap(), Some(low));
-    let error = TreeProjectionPlan::plan(
-        &txn,
-        [TreeProjectionOperation::Delete {
-            inode: high,
-            retire: false,
-        }],
-    )
     .unwrap_err();
-    assert!(error.to_string().contains("TREE has no occupant"));
+    assert!(error.to_string().contains("projected owners"));
     assert_eq!(txn.get_inode("same.txt").unwrap(), None);
-    assert_eq!(txn.get_path(high).unwrap().as_deref(), Some("same.txt"));
+    assert_eq!(txn.get_path(first).unwrap(), None);
+    assert_eq!(txn.get_path(second).unwrap(), None);
     txn.abort().unwrap();
 }
 

@@ -357,6 +357,16 @@ pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
     Repository::open(&repo_path).map_err(CliError::from)
 }
 
+/// Open a repository without migration, recovery, or table-initialization writes.
+pub fn open_repository_readonly(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_readonly(&repo_path).map_err(CliError::from)
+}
+
 /// Open a repository or return a user-friendly error.
 ///
 /// This is a convenience wrapper around [`open_repository`] that provides
@@ -376,6 +386,31 @@ pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
 /// cannot be found or opened.
 pub fn require_repository(path: Option<&Path>) -> CliResult<Repository> {
     open_repository(path)
+}
+
+/// Open a repository strictly read-only or return a user-friendly error.
+pub fn require_repository_readonly(path: Option<&Path>) -> CliResult<Repository> {
+    open_repository_readonly(path)
+}
+
+/// Open a repository for native-index checking without implicit migration.
+pub fn require_repository_for_native_check(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_readonly_for_native_repair(repo_path).map_err(CliError::from)
+}
+
+/// Open a repository for explicit native-index repair without implicit migration.
+pub fn require_repository_for_native_repair(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_for_native_repair(repo_path).map_err(CliError::from)
 }
 
 // Formatting Utilities

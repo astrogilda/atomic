@@ -262,9 +262,43 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        if let Some(conflict) = projection.name_conflicts.get(&normalized) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
+                    normalized,
+                    conflict.paths.len(),
+                    conflict.sides.len()
+                ),
+            });
+        }
+        let Some(item) = projection.present.get(&normalized) else {
+            let inode = projection
+                .absent
+                .iter()
+                .find(|entry| entry.path() == normalized)
+                .and_then(MaterializedEntry::inode);
+            return Ok(MaterializedEntry::absent(normalized, inode));
+        };
+        if item.is_directory {
+            return Ok(MaterializedEntry::absent(normalized, Some(item.inode)));
+        }
+        let bytes = retrieve_content_with_filter_fast(
+            &txn,
+            &self.change_store,
+            item.inode,
+            item.position,
+            atomic_core::output::alive::RetrieveOptions::new().with_graph_visibility(visibility),
+        )
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(MaterializedEntry::present(normalized, item.inode, bytes))
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -318,7 +352,21 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        if projection.name_conflicts.contains_key(&normalized) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict; refusing to choose content",
+                    normalized
+                ),
+            });
+        }
         let Some(item) = projection.present.get(&normalized) else {
             return Ok(None);
         };
@@ -366,7 +414,21 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        if projection.name_conflicts.contains_key(&normalized) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict; refusing to choose content",
+                    normalized
+                ),
+            });
+        }
         let Some(item) = projection.present.get(&normalized) else {
             return Ok(false);
         };
@@ -603,7 +665,21 @@ impl Repository {
     {
         use atomic_core::output::alive::RetrieveOptions;
 
-        let projection = self.project_tree_for_visibility(txn, &visibility)?;
+        let claim_txn = self
+            .pristine
+            .read_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let projection = self.project_tree_for_visibility(&claim_txn, &visibility)?;
+        if let Some(conflict) = projection.name_conflicts.get(normalized_path) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
+                    normalized_path,
+                    conflict.paths.len(),
+                    conflict.sides.len()
+                ),
+            });
+        }
         let Some(item) = projection.present.get(normalized_path) else {
             let inode = projection
                 .absent

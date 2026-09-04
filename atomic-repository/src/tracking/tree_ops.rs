@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use atomic_core::pristine::directory_flags;
-use atomic_core::pristine::{MutTxnT, TreeTxnT};
+use atomic_core::pristine::{MutTxnT, PathClaimTxnT, TreeTxnT};
 use atomic_core::types::{Inode, NodeId, Position};
 
 use super::{TrackedFile, TrackingError, TrackingResult};
@@ -67,20 +67,12 @@ impl From<TreeProjectionError> for TrackingError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlannedPathEffect {
-    Add,
-    Delete,
-    Move,
-    Undelete,
-}
-
 #[derive(Debug, Clone, Default)]
 struct PlannedTreeEntry {
     binding: Option<Position<NodeId>>,
     kind: Option<TreeProjectionKind>,
     path: Option<Option<String>>,
-    path_effect: Option<PlannedPathEffect>,
+
     directory_flags: Option<u8>,
     retire: bool,
 }
@@ -99,7 +91,7 @@ pub struct TreeProjectionPlan {
 impl TreeProjectionPlan {
     pub fn plan<T, I>(txn: &T, operations: I) -> Result<Self, TreeProjectionError>
     where
-        T: TreeTxnT,
+        T: TreeTxnT + PathClaimTxnT,
         I: IntoIterator<Item = TreeProjectionOperation>,
     {
         let mut plan = Self::default();
@@ -111,7 +103,7 @@ impl TreeProjectionPlan {
         Ok(plan)
     }
 
-    fn derive_directory_occupancy<T: TreeTxnT>(
+    fn derive_directory_occupancy<T: TreeTxnT + PathClaimTxnT>(
         &mut self,
         txn: &T,
     ) -> Result<(), TreeProjectionError> {
@@ -218,17 +210,15 @@ impl TreeProjectionPlan {
                 entry.kind = Some(kind);
                 if let Some(path) = path {
                     entry.path = Some(Some(path));
-                    entry.path_effect = Some(PlannedPathEffect::Add);
                 }
             }
             TreeProjectionOperation::Delete { retire, .. } => {
                 entry.path = Some(None);
-                entry.path_effect = Some(PlannedPathEffect::Delete);
+
                 entry.retire |= retire;
             }
             TreeProjectionOperation::Move { path, .. } => {
                 entry.path = Some(Some(path));
-                entry.path_effect = Some(PlannedPathEffect::Move);
             }
             TreeProjectionOperation::Undelete { path, kind, .. } => {
                 if let Some(existing) = entry.kind {
@@ -241,7 +231,6 @@ impl TreeProjectionPlan {
                 }
                 entry.kind = Some(kind);
                 entry.path = Some(Some(path));
-                entry.path_effect = Some(PlannedPathEffect::Undelete);
             }
             TreeProjectionOperation::DirectoryOccupancy { empty, .. } => {
                 entry.kind = Some(TreeProjectionKind::Directory);
@@ -283,16 +272,25 @@ impl TreeProjectionPlan {
         Ok(Some(primary))
     }
 
-    fn validate<T: TreeTxnT>(&self, txn: &T) -> Result<(), TreeProjectionError> {
+    fn validate<T: TreeTxnT + PathClaimTxnT>(&self, txn: &T) -> Result<(), TreeProjectionError> {
+        txn.validate_tree_bijection()
+            .map_err(|error| TreeProjectionError::IncompleteMetadata(error.to_string()))?;
         let mut desired_claims = HashMap::<String, Vec<Inode>>::new();
         for (inode, entry) in &self.entries {
             if let Some(Some(path)) = &entry.path {
                 desired_claims.entry(path.clone()).or_default().push(*inode);
             }
         }
-        for claims in desired_claims.values_mut() {
+        for (path, claims) in &mut desired_claims {
             claims.sort_by_key(|inode| inode.get());
             claims.dedup();
+            if claims.len() > 1 {
+                return Err(TreeProjectionError::Conflict(format!(
+                    "path '{}' has {} projected owners; PATH_CLAIMS must surface the conflict before TREE projection",
+                    path,
+                    claims.len()
+                )));
+            }
         }
 
         let moving_inodes: HashSet<Inode> = self
@@ -314,20 +312,12 @@ impl TreeProjectionPlan {
                     ))
                 })?;
                 if primary != *inode {
-                    // Legacy CB-N2 compatibility: a reverse-only claimant is
-                    // valid only when the primary has a complete forward/reverse
-                    // pair for exactly the same path.
-                    let primary_path = txn
-                        .get_path(primary)
-                        .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-                    if primary_path.as_deref() != Some(path) {
-                        return Err(TreeProjectionError::IncompleteMetadata(format!(
-                            "REV_TREE claim '{}' for inode {} has corrupt primary inode {}",
-                            path,
-                            inode.get(),
-                            primary.get()
-                        )));
-                    }
+                    return Err(TreeProjectionError::IncompleteMetadata(format!(
+                        "REV_TREE maps inode {} to '{}', but TREE maps it to inode {}",
+                        inode.get(),
+                        path,
+                        primary.get()
+                    )));
                 }
             }
 
@@ -399,18 +389,10 @@ impl TreeProjectionPlan {
                             .and_then(|entry| entry.path.as_ref())
                             .is_some_and(|desired| desired.as_deref() != Some(path.as_str()));
                     let already_claims_path = current_path.as_deref() == Some(path.as_str());
-                    let joins_legacy_claim = matches!(
-                        entry.path_effect,
-                        Some(PlannedPathEffect::Add | PlannedPathEffect::Undelete)
-                    );
                     let planned_primary = desired_claims
                         .get(path)
                         .is_some_and(|claims| claims.contains(&occupant));
-                    if !occupant_moves_away
-                        && !already_claims_path
-                        && !joins_legacy_claim
-                        && !planned_primary
-                    {
+                    if !occupant_moves_away && !already_claims_path && !planned_primary {
                         return Err(TreeProjectionError::Conflict(format!(
                             "path '{}' is already owned by inode {}",
                             path,
@@ -421,40 +403,6 @@ impl TreeProjectionPlan {
             }
         }
         Ok(())
-    }
-
-    fn add_legacy_reverse_claim<T: MutTxnT>(
-        txn: &mut T,
-        path: &str,
-        claimant: Inode,
-        primary: Inode,
-    ) -> Result<(), TreeProjectionError> {
-        txn.put_tree(path, claimant)
-            .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-        txn.put_tree(path, primary)
-            .map_err(|error| TreeProjectionError::Database(error.to_string()))
-    }
-
-    fn remove_legacy_reverse_claim<T: MutTxnT>(
-        txn: &mut T,
-        path: &str,
-        claimant: Inode,
-        primary: Inode,
-    ) -> Result<(), TreeProjectionError> {
-        txn.put_tree(path, claimant)
-            .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-        let removed = txn
-            .del_tree(path)
-            .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-        if removed != Some(claimant) {
-            return Err(TreeProjectionError::IncompleteMetadata(format!(
-                "failed to remove legacy REV_TREE claim '{}' for inode {}",
-                path,
-                claimant.get()
-            )));
-        }
-        txn.put_tree(path, primary)
-            .map_err(|error| TreeProjectionError::Database(error.to_string()))
     }
 
     pub fn apply<T: MutTxnT>(&self, txn: &mut T) -> Result<(), TreeProjectionError> {
@@ -481,27 +429,28 @@ impl TreeProjectionPlan {
                             path
                         ))
                     })?;
-                    removals.push((path, *inode, primary == *inode, primary));
+                    if primary != *inode {
+                        return Err(TreeProjectionError::IncompleteMetadata(format!(
+                            "TREE/REV_TREE disagree while removing '{}' for inode {}",
+                            path,
+                            inode.get()
+                        )));
+                    }
+                    removals.push((path, *inode));
                 }
             }
         }
-        removals.sort_by(|left, right| {
-            (&left.0, left.2, left.1.get()).cmp(&(&right.0, right.2, right.1.get()))
-        });
-        for (path, inode, is_primary, primary) in removals {
-            if is_primary {
-                let removed = txn
-                    .del_tree(&path)
-                    .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-                if removed != Some(inode) {
-                    return Err(TreeProjectionError::IncompleteMetadata(format!(
-                        "TREE changed while removing '{}' for inode {}",
-                        path,
-                        inode.get()
-                    )));
-                }
-            } else {
-                Self::remove_legacy_reverse_claim(txn, &path, inode, primary)?;
+        removals.sort_by(|left, right| (&left.0, left.1.get()).cmp(&(&right.0, right.1.get())));
+        for (path, inode) in removals {
+            let removed = txn
+                .del_tree(&path)
+                .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
+            if removed != Some(inode) {
+                return Err(TreeProjectionError::IncompleteMetadata(format!(
+                    "TREE changed while removing '{}' for inode {}",
+                    path,
+                    inode.get()
+                )));
             }
         }
 
@@ -533,36 +482,26 @@ impl TreeProjectionPlan {
             }
         }
 
-        let mut desired_claims = HashMap::<String, Vec<Inode>>::new();
+        let mut desired_paths = Vec::<(String, Inode)>::new();
         for (inode, entry) in &ordered_entries {
             if let Some(Some(path)) = &entry.path {
-                desired_claims.entry(path.clone()).or_default().push(*inode);
+                desired_paths.push((path.clone(), *inode));
             }
         }
-        let mut desired_paths: Vec<(String, Vec<Inode>)> = desired_claims.into_iter().collect();
         desired_paths.sort_by(|left, right| left.0.cmp(&right.0));
-        for (path, mut claimants) in desired_paths {
-            claimants.sort_by_key(|inode| inode.get());
-            claimants.dedup();
-            let primary = match Self::validated_primary(txn, &path)? {
-                Some(existing) => existing,
-                None => {
-                    let selected = claimants[0];
-                    txn.put_tree(&path, selected)
-                        .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-                    selected
+        for (path, inode) in desired_paths {
+            match Self::validated_primary(txn, &path)? {
+                Some(existing) if existing == inode => {}
+                Some(existing) => {
+                    return Err(TreeProjectionError::Conflict(format!(
+                        "path '{}' is already owned by inode {}",
+                        path,
+                        existing.get()
+                    )));
                 }
-            };
-            for claimant in claimants {
-                if claimant == primary {
-                    continue;
-                }
-                let reverse = txn
-                    .get_path(claimant)
-                    .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
-                if reverse.as_deref() != Some(path.as_str()) {
-                    Self::add_legacy_reverse_claim(txn, &path, claimant, primary)?;
-                }
+                None => txn
+                    .put_tree(&path, inode)
+                    .map_err(|error| TreeProjectionError::Database(error.to_string()))?,
             }
         }
 
@@ -582,6 +521,8 @@ impl TreeProjectionPlan {
             }
         }
 
+        txn.validate_tree_bijection()
+            .map_err(|error| TreeProjectionError::IncompleteMetadata(error.to_string()))?;
         Ok(())
     }
 }

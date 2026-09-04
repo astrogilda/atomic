@@ -43,9 +43,7 @@ use std::sync::Arc;
 
 use atomic_core::change::{Change, ChangeHeader, GraphOp};
 pub use atomic_core::output::repo::MaterializedEntry;
-use atomic_core::output::repo::{
-    materialize_view, MaterializeOptions, MaterializeResult, OutputItem,
-};
+use atomic_core::output::repo::{MaterializeResult, OutputItem};
 use atomic_core::output::FileSystem;
 use atomic_core::output::WorkingCopy;
 use atomic_core::pristine::{
@@ -84,6 +82,9 @@ use crate::RepositoryError;
 mod deferred_tree;
 mod filter;
 mod materialize;
+mod migration;
+mod name_resolution;
+mod repair;
 mod sandbox;
 mod semantic_materialize;
 mod split;
@@ -133,6 +134,10 @@ pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
 pub use provenance_summary::ProvenanceSummary;
+pub use repair::{
+    NativeIndex, NativeIndexProblem, NativeIndexProblemKind, NativeIndexRepairOutcome,
+    NativeIndexReport,
+};
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use tags::{deserialize_tag, serialize_tag};
 pub use triage::{BaggageEntry, CandidateSet, Coverage};
@@ -362,19 +367,23 @@ default = "{}"
         let root = Self::find_root(path.as_ref())?;
         let dot_dir = root.join(DOT_DIR);
 
-        // Open the pristine database
-        let pristine = Arc::new(
-            Pristine::open(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
-        );
-
-        // Read current view from config or use default
+        // Read the current view and open the change store before the pristine:
+        // an existing database may require repository-level PATH_CLAIMS replay.
         let current_view =
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
-
-        // Open the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let pristine_path = dot_dir.join("pristine.redb");
+        let pristine =
+            Pristine::open(&pristine_path).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let pristine = migration::migrate_path_claims_if_required(
+            &pristine_path,
+            pristine,
+            &change_store,
+            &current_view,
+        )?;
+        let pristine = Arc::new(pristine);
 
         let mut repository = Self {
             root,
@@ -474,9 +483,10 @@ default = "{}"
         let current_view =
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
-        // Open the change store
-        let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        // Open the change store without creating missing paths.
+        let change_store =
+            ChangeStore::open_existing(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let repository = Self {
             root,
@@ -489,6 +499,59 @@ default = "{}"
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
                 message: "repository view switch is still completing; retry with a writable repository open"
+                    .to_string(),
+            });
+        }
+        Ok(repository)
+    }
+
+    /// Open an existing repository for native-index verification without
+    /// requiring derived-schema completion or performing any repair/migration.
+    pub fn open_readonly_for_native_repair<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_for_native_repair_mode(path.as_ref(), true)
+    }
+
+    /// Open an existing repository for one explicit native-index repair.
+    ///
+    /// This bypasses automatic migration and deferred alignment so every write
+    /// remains inside the repair transaction itself.
+    pub fn open_for_native_repair<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        Self::open_for_native_repair_mode(path.as_ref(), false)
+    }
+
+    fn open_for_native_repair_mode(path: &Path, readonly: bool) -> Result<Self, RepositoryError> {
+        if sandbox::detect_sandbox(path).is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "native-index doctor must run from the canonical repository working copy"
+                    .to_string(),
+            });
+        }
+        let root = Self::find_root(path)?;
+        let dot_dir = root.join(DOT_DIR);
+        let pristine_path = dot_dir.join("pristine.redb");
+        let pristine = if readonly {
+            Pristine::open_readonly_for_repair(pristine_path)
+        } else {
+            Pristine::open_existing_for_repair(pristine_path)
+        }
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let current_view = Self::read_current_view(&dot_dir)?;
+        let change_store =
+            ChangeStore::open_existing(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let repository = Self {
+            root,
+            dot_dir,
+            current_view,
+            pristine: Arc::new(pristine),
+            change_store,
+            is_sandbox: false,
+        };
+        if repository.has_pending_deferred_tree_alignment() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "repository view switch is still completing; native-index doctor refuses implicit recovery"
                     .to_string(),
             });
         }

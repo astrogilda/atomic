@@ -94,6 +94,15 @@ pub enum GlobalizeError {
         path: String,
     },
 
+    /// A requested name-conflict transition is incomplete or does not match the graph.
+    #[error("Invalid name-conflict operation for {path}: {reason}")]
+    InvalidNameConflict {
+        /// Surviving path supplied by the caller.
+        path: String,
+        /// Failed contract or graph invariant.
+        reason: String,
+    },
+
     /// A database error occurred during globalization.
     #[error("Database error: {0}")]
     Pristine(Box<PristineError>),

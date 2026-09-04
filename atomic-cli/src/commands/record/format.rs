@@ -67,6 +67,53 @@ impl Record {
             }
         }
 
+        if let Ok(Some(evidence)) = outcome.move_evidence() {
+            for moved in evidence.authoritative_moves {
+                let authority = match moved.authority {
+                    atomic_repository::MoveAuthority::ExplicitAtomicMove => "explicit atomic move",
+                    atomic_repository::MoveAuthority::StableInodeProjection => {
+                        "stable inode projection"
+                    }
+                };
+                output.push_str(&format!(
+                    " move: {} → {} ({})\n",
+                    moved.old_path, moved.new_path, authority
+                ));
+            }
+            for moved in evidence.probable_moves {
+                let basis = match moved.basis {
+                    atomic_repository::MoveBasis::ByteIdentity => "byte identity",
+                    atomic_repository::MoveBasis::ContentSimilarity => "content similarity",
+                };
+                output.push_str(&format!(
+                    " probable move: {} → {} ({}.{:02}%, {})\n",
+                    moved.old_path,
+                    moved.new_path,
+                    moved.score / 100,
+                    moved.score % 100,
+                    basis
+                ));
+            }
+            for loss in evidence.loss_notes {
+                match loss {
+                    atomic_repository::LossNote::RenameUnresolved { candidates } => {
+                        output.push_str(
+                            " warning: rename identity unresolved; retained delete + add\n",
+                        );
+                        for candidate in candidates {
+                            output.push_str(&format!(
+                                "   candidate: {} → {} ({}.{:02}%)\n",
+                                candidate.source_path,
+                                candidate.destination_path,
+                                candidate.score / 100,
+                                candidate.score % 100
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // File list
         for path in outcome.recorded_files() {
             output.push_str(&format!(" {}\n", path));

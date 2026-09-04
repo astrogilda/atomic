@@ -125,8 +125,10 @@
 //! | `VIEWS` | name | ViewState | View metadata |
 //! | `VIEW_CHANGES` | (view_id, seq) | change_id | Change log |
 //! | `REV_VIEW_CHANGES` | (view_id, change_id) | seq | Reverse change log |
-//! | `TREE` | path | inode | Path → inode mapping |
-//! | `REV_TREE` | inode | path | Inode → path mapping |
+//! | `PRISTINE_META` | schema key | version | Completed derived-index migrations |
+//! | `PATH_CLAIMS` | path | fixed claim event | Additive, unfiltered path transitions |
+//! | `TREE` | path | inode | Unambiguous path → inode projection |
+//! | `REV_TREE` | inode | path | Exact inverse of TREE |
 //! | `INODES` | inode | Position | Inode → graph position |
 //! | `REV_INODES` | Position | inode | Graph position → inode |
 //! | `DEPS` | change_id | `dep_id` | Dependencies (multimap) |
@@ -150,6 +152,7 @@
 mod error;
 mod inode_graph;
 pub mod ontology;
+mod path_claim;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;
@@ -161,12 +164,18 @@ pub use error::{PristineError, PristineResult};
 pub use inode_graph::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
 };
+pub use path_claim::{
+    decode_path_claim_event, encode_path_claim_event, PathClaimEntry, PathClaimEvent, PathClaimId,
+    PathClaimKind, PathClaimState, PATH_CLAIM_EVENT_SIZE, PATH_CLAIM_EVENT_VERSION,
+    PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
+};
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
     CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata,
     GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT,
-    MutTxnT, StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
+    MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, PathClaimMutTxnT, PathClaimTxnT,
+    StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
     VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState,
     ViewTxnT,
 };

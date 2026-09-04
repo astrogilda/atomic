@@ -5,7 +5,9 @@ use atomic_repository::Repository;
 
 use crate::event::{HookType, TurnEvent};
 use crate::turn::phase::Phase;
-use crate::turn::session::{AgentSession, SessionStore};
+use crate::turn::session::{
+    AgentSession, IncompleteSession, SessionIncompleteOrigin, SessionStatus, SessionStore,
+};
 use crate::watcher::fallback::FallbackWatcher;
 use crate::watcher::WatcherConfig;
 use std::fs;
@@ -1002,6 +1004,210 @@ fn make_repo_orchestrator(dir: &TempDir) -> TurnOrchestrator {
     let session_store = SessionStore::for_repo(dir.path()).unwrap();
     let watcher = FallbackWatcher::new(WatcherConfig::new(dir.path()));
     TurnOrchestrator::with_watcher(dir.path(), session_store, Box::new(watcher))
+}
+
+fn incomplete_outcome(recovery_ref: &str) -> IncompleteSession {
+    IncompleteSession::new(
+        "tracked work moved during checkout",
+        vec!["src/z.rs".into(), "src/a.rs".into(), "src/a.rs".into()],
+        recovery_ref,
+        SessionIncompleteOrigin::UnknownPostCheckout,
+    )
+}
+
+#[tokio::test]
+async fn test_managed_turn_end_persists_incomplete_without_false_recording() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    let first = incomplete_outcome("refs/atomic/wip/run-mng-1");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(first.clone());
+
+    orch.dispatch(session_start_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event(
+        "sess-incomplete-turn",
+        "edit files before checkout drift",
+    ))
+    .await
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/a.rs"), "unattributed bytes\n").unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&first));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.status, SessionStatus::Incomplete(first.clone()));
+    assert_eq!(session.turn_count, 0, "refusal is not a completed turn");
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo
+        .get_session_ledger("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(first.clone()));
+    assert!(
+        turns.is_empty(),
+        "refusal must not create a provenance turn"
+    );
+    drop(repo);
+
+    // A later duplicate carrying different details must return the first
+    // durable recovery object and must still avoid attribution.
+    let later = incomplete_outcome("refs/atomic/wip/later");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(later);
+    let duplicate = orch
+        .dispatch(turn_end_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.incomplete.as_ref(), Some(&first));
+    assert!(!duplicate.was_recorded());
+    let session = orch
+        .session_store
+        .load("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+}
+
+#[tokio::test]
+async fn test_managed_session_end_persists_incomplete_before_flush() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    let incomplete = incomplete_outcome("refs/atomic/wip/session-end");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(incomplete.clone());
+
+    orch.dispatch(session_start_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("pending.rs"), "unattributed bytes\n").unwrap();
+
+    let result = orch
+        .dispatch(session_end_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-incomplete-end")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+    assert!(
+        !session.is_ended(),
+        "incomplete must not masquerade as ended"
+    );
+
+    let duplicate = orch
+        .dispatch(session_end_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.incomplete.as_ref(), Some(&incomplete));
+    assert!(!duplicate.was_recorded());
+}
+
+#[tokio::test]
+async fn test_unmanaged_turn_end_persists_boundary_refusal_without_recording() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+    let incomplete = incomplete_outcome("refs/atomic/wip/direct-turn");
+
+    orch.dispatch(session_start_event("sess-direct-turn"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-direct-turn", "direct edit"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("direct.rs"), "must not be attributed\n").unwrap();
+    orch.set_boundary_refusal(incomplete.clone());
+
+    let result = orch
+        .dispatch(turn_end_event("sess-direct-turn"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-direct-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo
+        .get_session_ledger("sess-direct-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(incomplete));
+    assert!(turns.is_empty());
+}
+
+#[tokio::test]
+async fn test_unmanaged_session_end_creates_durable_incomplete_session() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("cursor", "Cursor");
+    let incomplete = incomplete_outcome("refs/atomic/wip/direct-session-end");
+    fs::write(dir.path().join("pending.rs"), "must not be flushed\n").unwrap();
+    orch.set_boundary_refusal(incomplete.clone());
+
+    // No SessionStart and no managed lifecycle: the explicit refusal seam must
+    // still create durable session state before the ordinary unknown-session
+    // early return or flush path can run.
+    let result = orch
+        .dispatch(session_end_event("sess-direct-end"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch.session_store.load("sess-direct-end").unwrap().unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo.get_session_ledger("sess-direct-end").unwrap().unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(incomplete));
+    assert!(turns.is_empty());
 }
 
 #[tokio::test]

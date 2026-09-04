@@ -184,7 +184,7 @@ pub fn collect_children<T: TreeTxnT + GraphTxnT>(
         .into_iter()
         .map(|tree_item| {
             if tree_item.is_directory {
-                OutputItem::directory(tree_item.path, tree_item.inode)
+                OutputItem::directory_at(tree_item.path, tree_item.inode, tree_item.position)
                     .with_metadata(tree_item.metadata)
             } else {
                 OutputItem::file(tree_item.path, tree_item.inode, tree_item.position)

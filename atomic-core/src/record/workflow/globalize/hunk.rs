@@ -499,6 +499,10 @@ fn globalize_delete<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
+    // Whole-file lifecycle changes must always depend on the inode's creating
+    // change, including zero-byte files whose deletion has no content edges.
+    ctx.add_dependency_by_id(inode_pos.change)?;
+
     if should_use_opaque_generated_vertices(&local.path) {
         let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
         let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;

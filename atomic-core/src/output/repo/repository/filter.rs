@@ -53,10 +53,11 @@ pub fn dir_has_passing_children(
     }
 }
 
-/// Compute the set of file paths whose introducing change passes the filter.
+/// Compute the set of repository paths whose introducing change passes the filter.
 ///
-/// Only non-directory items whose `position.change` is either ROOT or
-/// present in the filter set are included.
+/// Files and graph-backed explicit directories participate. Synthetic ancestor
+/// directories use ROOT and are included only when they are ancestors of a
+/// passing graph-backed item.
 ///
 /// # Arguments
 ///
@@ -72,13 +73,10 @@ pub fn compute_passing_file_paths(
 ) -> HashSet<String> {
     let mut paths = HashSet::new();
     for item in items {
-        if item.is_directory {
+        let change_id = item.position.change;
+        if item.is_directory && change_id == NodeId::ROOT {
             continue;
         }
-        // Check whether the file's introducing change is in the filter.
-        // position.change gives us the NodeId of the change that created
-        // this file's inode vertex.
-        let change_id = item.position.change;
         if change_id == NodeId::ROOT || visibility.contains(change_id) {
             paths.insert(item.path.clone());
         }

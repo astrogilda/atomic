@@ -10,8 +10,9 @@ use super::*;
 use crate::apply::CrossViewInsertOptions;
 use crate::record::{RecordError, RecordOptions};
 use crate::status::{FileStatus, StatusOptions};
-use atomic_core::change::ChangeHeader;
-use atomic_core::pristine::ViewTxnT;
+use crate::unrecord::UnrecordOptions;
+use atomic_core::change::{ChangeHeader, GraphOp};
+use atomic_core::pristine::{PathClaimTxnT, TreeTxnT, ViewTxnT};
 
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
@@ -163,6 +164,12 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
     // Insert feature's create into dev: now two inodes claim new.txt on dev.
     repo.insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
         .unwrap();
+    assert!(
+        conflicted_entry_paths(&repo)
+            .iter()
+            .any(|path| path == "new.txt"),
+        "status must surface PATH_CLAIMS conflict before materialization"
+    );
     repo.materialize().unwrap();
 
     // Both bodies survive, wrapped in a name-conflict block (no silent loss).
@@ -189,6 +196,23 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
         1,
         "dev side must appear exactly once:\n{on_disk}"
     );
+
+    std::fs::remove_file(&new_file).unwrap();
+    repo.materialize_sequential().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&new_file).unwrap(),
+        on_disk,
+        "sequential and parallel materialization must render identical sides"
+    );
+    assert!(
+        repo.get_file_content("new.txt").is_err(),
+        "content APIs must not choose one claimant"
+    );
+    {
+        let txn = repo.pristine.read_txn().unwrap();
+        assert_eq!(txn.get_inode("new.txt").unwrap(), None);
+        txn.validate_tree_bijection().unwrap();
+    }
 
     // Honesty: persisted for dev AND surfaced by status.
     assert!(
@@ -218,6 +242,125 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
     assert!(replayed.contains(">>>>>>>"));
     assert!(replayed.contains("from-feature"));
     assert!(replayed.contains("from-base"));
+}
+
+#[test]
+fn test_recorded_name_resolution_emits_real_solve_with_complete_dependencies() {
+    let (temp_dir, mut repo) = create_temp_repo();
+    let directory = temp_dir.path().join("nested");
+    std::fs::create_dir(&directory).unwrap();
+    repo.add_directory("nested", TrackingOptions::default())
+        .unwrap();
+    record_all(&repo, "base directory").unwrap();
+    repo.create_view_from("feature", "dev").unwrap();
+
+    let path = directory.join("same.txt");
+    repo.switch_view("feature").unwrap();
+    std::fs::write(&path, "feature\n").unwrap();
+    repo.add("nested/same.txt", TrackingOptions::default())
+        .unwrap();
+    let feature = record_all(&repo, "feature create").unwrap();
+    let feature_inode = repo.get_file_inode("nested/same.txt").unwrap().unwrap();
+
+    repo.switch_view("dev").unwrap();
+    std::fs::write(&path, "dev\n").unwrap();
+    repo.add("nested/same.txt", TrackingOptions::default())
+        .unwrap();
+    let dev = record_all(&repo, "dev create").unwrap();
+    let dev_inode = repo.get_file_inode("nested/same.txt").unwrap().unwrap();
+    assert_ne!(feature_inode, dev_inode);
+    repo.insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
+        .unwrap();
+    repo.materialize().unwrap();
+    assert!(std::fs::read_to_string(&path).unwrap().contains(">>>>>>>"));
+
+    std::fs::write(&path, "feature\n").unwrap();
+    let resolution = record_all(&repo, "resolve name").unwrap();
+    assert!(resolution.errors().is_empty());
+    assert!(resolution.was_applied());
+    let solves: Vec<_> = resolution
+        .change()
+        .hunks()
+        .iter()
+        .filter_map(|operation| match operation {
+            GraphOp::SolveNameConflict { name, path } => Some((name, path)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(solves.len(), 1);
+    assert_eq!(solves[0].1, "nested/same.txt");
+    assert!(!solves[0].0.edges.is_empty());
+    assert!(resolution.change().dependencies().contains(feature.hash()));
+    assert!(resolution.change().dependencies().contains(dev.hash()));
+
+    repo.materialize().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"feature\n");
+    assert!(repo.list_conflicts().unwrap().is_empty());
+
+    let resolution_hash = *resolution.hash();
+    repo.unrecord(&resolution_hash, UnrecordOptions::default())
+        .unwrap();
+    repo.materialize().unwrap();
+    let reopened_conflict = std::fs::read_to_string(&path).unwrap();
+    assert!(reopened_conflict.contains("feature\n"));
+    assert!(reopened_conflict.contains("dev\n"));
+    assert!(reopened_conflict.contains(">>>>>>>"));
+
+    repo.reinsert_change(&resolution_hash, None).unwrap();
+    repo.materialize().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"feature\n");
+    drop(repo);
+    let reopened = Repository::open(temp_dir.path()).unwrap();
+    reopened.materialize().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"feature\n");
+}
+
+#[test]
+fn test_directory_name_conflict_is_typed_without_tree_winner() {
+    let (temp, mut repo) = create_temp_repo();
+    let seed = temp.path().join("seed.txt");
+    std::fs::write(&seed, "seed\n").unwrap();
+    repo.add("seed.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base").unwrap();
+    repo.create_view_from("feature-dir", "dev").unwrap();
+
+    let directory = temp.path().join("same-dir");
+    repo.switch_view("feature-dir").unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    repo.add_directory("same-dir", TrackingOptions::default())
+        .unwrap();
+    record_all(&repo, "feature directory").unwrap();
+
+    repo.switch_view("dev").unwrap();
+    if directory.exists() {
+        std::fs::remove_dir(&directory).unwrap();
+    }
+    std::fs::create_dir(&directory).unwrap();
+    repo.add_directory("same-dir", TrackingOptions::default())
+        .unwrap();
+    record_all(&repo, "dev directory").unwrap();
+    repo.insert_from_view(CrossViewInsertOptions::new("feature-dir", "dev"))
+        .unwrap();
+
+    repo.materialize_sequential().unwrap();
+    assert!(directory.is_dir());
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(status.entries().iter().any(|entry| {
+        entry.path().to_string_lossy() == "same-dir" && entry.status() == FileStatus::Conflicted
+    }));
+    assert!(repo
+        .list_conflicts()
+        .unwrap()
+        .iter()
+        .any(|(path, records)| {
+            path == "same-dir"
+                && records
+                    .iter()
+                    .any(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+        }));
+    let txn = repo.pristine.read_txn().unwrap();
+    assert_eq!(txn.get_inode("same-dir").unwrap(), None);
+    txn.validate_tree_bijection().unwrap();
 }
 
 /// Guard against false positives: an ordinary single-create file (only one

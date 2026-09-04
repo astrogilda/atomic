@@ -312,9 +312,12 @@ impl Repository {
             )));
         }
 
-        // Update the view
+        // Update the view, then align every derived tree cache to the new
+        // visibility before committing. In particular, unrecording FileMove
+        // must restore its exact graph-backed source path and stable inode.
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, view_name)?;
 
         // Commit the transaction
         txn.commit()
@@ -330,15 +333,18 @@ impl Repository {
         // the user's disk changes). Instead, we just delete FILE_INDEX
         // entries for affected paths so that the next `status` call does
         // a full content comparison against the graph.
-        if let Ok(change) = self.load_change(hash) {
-            if let Ok(mut idx_txn) = self.pristine.write_txn() {
+        if let Ok(mut idx_txn) = self.pristine.write_txn() {
+            for path in &affected_tree_paths {
+                let _ = idx_txn.del_file_index(path);
+            }
+            if let Ok(change) = self.load_change(hash) {
                 for op in change.hunks() {
-                    if let Some(p) = op.path() {
-                        let _ = idx_txn.del_file_index(p);
+                    if let Some(path) = op.path() {
+                        let _ = idx_txn.del_file_index(path);
                     }
                 }
-                let _ = idx_txn.commit();
             }
+            let _ = idx_txn.commit();
         }
 
         // Build outcome
@@ -446,13 +452,24 @@ impl Repository {
         txn.reinsert_change(&mut view, change_id, hash, insert_at)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Update the view
+        // Reinsert changes visibility immediately; keep TREE and its reverse
+        // index in the same transaction so FileMove cannot remain projected at
+        // its pre-reinsert source path.
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let affected_tree_paths =
+            self.realign_tree_projection_in_txn(&mut txn, &self.current_view)?;
 
         // Commit the transaction
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Ok(mut idx_txn) = self.pristine.write_txn() {
+            for path in affected_tree_paths {
+                let _ = idx_txn.del_file_index(&path);
+            }
+            let _ = idx_txn.commit();
+        }
 
         Ok((view.state, view.change_count))
     }

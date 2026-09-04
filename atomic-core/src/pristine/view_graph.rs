@@ -14,9 +14,11 @@
 
 use crate::pristine::{
     FileIndexEntry, FileIndexMetadata, GraphTxnT, GraphVisibilityClosure, InodeAdjState,
-    InodeGraphOps, PristineError, TreeTxnT,
+    InodeGraphOps, PristineError, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
 };
-use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{
+    EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position, SerializedGraphEdge,
+};
 
 /// A view-scoped graph wrapper that filters edge traversal by visibility.
 ///
@@ -274,6 +276,70 @@ impl<'a, T: GraphTxnT> GraphTxnT for ViewGraph<'a, T> {
     }
 }
 
+impl<'a, T: ViewTxnT> ViewTxnT for ViewGraph<'a, T> {
+    fn get_view_by_id(&self, id: u64) -> Result<Option<ViewState>, PristineError> {
+        self.inner.get_view_by_id(id)
+    }
+
+    fn get_conflicts(
+        &self,
+        view_id: u64,
+        inode: u64,
+    ) -> Result<Vec<StoredConflict>, PristineError> {
+        self.inner.get_conflicts(view_id, inode)
+    }
+
+    fn iter_conflicts(
+        &self,
+        view_id: u64,
+    ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError> {
+        self.inner.iter_conflicts(view_id)
+    }
+
+    fn snapshot_conflicts(&self) -> Result<Vec<(u64, Inode, Vec<StoredConflict>)>, PristineError> {
+        self.inner.snapshot_conflicts()
+    }
+
+    fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError> {
+        self.inner.get_view(name)
+    }
+
+    fn snapshot_views(&self) -> Result<Vec<(String, ViewState)>, PristineError> {
+        self.inner.snapshot_views()
+    }
+
+    fn list_views(&self) -> Result<Vec<String>, PristineError> {
+        self.inner.list_views()
+    }
+
+    fn get_change_seq(
+        &self,
+        view: &ViewState,
+        change_id: NodeId,
+    ) -> Result<Option<u64>, PristineError> {
+        self.inner.get_change_seq(view, change_id)
+    }
+
+    fn get_change_at_seq(
+        &self,
+        view: &ViewState,
+        seq: u64,
+    ) -> Result<Option<NodeId>, PristineError> {
+        self.inner.get_change_at_seq(view, seq)
+    }
+
+    fn iter_changes(
+        &self,
+        view: &ViewState,
+        from_seq: u64,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>,
+        PristineError,
+    > {
+        self.inner.iter_changes(view, from_seq)
+    }
+}
+
 impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
     fn get_inode(&self, path: &str) -> Result<Option<Inode>, PristineError> {
         self.inner.get_inode(path)
@@ -293,6 +359,22 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
 
     fn position_inode(&self, pos: Position<NodeId>) -> Result<Option<Inode>, PristineError> {
         self.inner.position_inode(pos)
+    }
+
+    fn snapshot_inodes(&self) -> Result<Vec<(Inode, Position<NodeId>)>, PristineError> {
+        self.inner.snapshot_inodes()
+    }
+
+    fn snapshot_rev_inodes(&self) -> Result<Vec<(Position<NodeId>, Inode)>, PristineError> {
+        self.inner.snapshot_rev_inodes()
+    }
+
+    fn snapshot_directories(&self) -> Result<Vec<(Inode, u8)>, PristineError> {
+        self.inner.snapshot_directories()
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> Result<Vec<(Inode, GraphNode<NodeId>)>, PristineError> {
+        self.inner.snapshot_inode_graph_keys()
     }
 
     fn iter_tree(

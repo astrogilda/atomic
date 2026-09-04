@@ -626,6 +626,35 @@ impl Repository {
         Ok(())
     }
 
+    /// Persist a managed-agent incomplete outcome without indexing a turn.
+    ///
+    /// Returns the canonical stored outcome. If duplicate callbacks present a
+    /// different value, the first durable recovery object is preserved.
+    pub fn mark_session_incomplete(
+        &self,
+        session_id: &str,
+        view_name: Option<String>,
+        parent_view: Option<String>,
+        incomplete: &atomic_core::change::session::IncompleteSession,
+    ) -> Result<atomic_core::change::session::IncompleteSession, RepositoryError> {
+        let json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", session_id))
+            .to_string_lossy()
+            .to_string();
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let persisted = txn
+            .mark_session_incomplete(session_id, &json_path, view_name, parent_view, incomplete)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(persisted)
+    }
+
     /// Create a forked session from a parent at a turn boundary.
     ///
     /// The child inherits the parent's turn records through `fork_turn` as an

@@ -111,6 +111,10 @@ pub struct Import {
     /// the semantic layer regardless of this flag.
     #[arg(long = "with-crdt")]
     pub with_crdt: bool,
+
+    /// Internal bridge imports align and checkpoint in their outer operation.
+    #[arg(skip)]
+    pub(crate) skip_checkpoint_refresh: bool,
 }
 
 fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
@@ -877,6 +881,19 @@ impl Command for Import {
             ));
         }
 
+        // Standalone imports establish or refresh the bridge checkpoint only
+        // when Git and the persisted Atomic working-copy view are fully
+        // aligned. During bridge raw-switch adoption the incremental import
+        // deliberately preserves the old Atomic view, so this returns the
+        // intentional mismatch no-op; `import_git_to_atomic` aligns and
+        // checkpoints afterward.
+        if !self.skip_checkpoint_refresh {
+            let checkpoint_root = workdir.to_path_buf();
+            drop(repo);
+            drop(git_repo);
+            let _ = super::bridge::refresh_checkpoint_if_aligned(&checkpoint_root)?;
+        }
+
         Ok(())
     }
 }
@@ -1017,7 +1034,41 @@ fn init_atomicignore_and_vault(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command as ProcessCommand;
+
+    use serial_test::serial;
+
     use super::*;
+
+    struct DirGuard(PathBuf);
+
+    impl DirGuard {
+        fn new() -> Self {
+            Self(std::env::current_dir().unwrap())
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn test_default_import() {
@@ -1026,6 +1077,7 @@ mod tests {
         assert!(!import.all_branches);
         assert!(!import.incremental);
         assert!(import.branch.is_none());
+        assert!(!import.skip_checkpoint_refresh);
     }
 
     #[test]
@@ -1054,6 +1106,86 @@ mod tests {
         assert!(patterns.iter().any(|p| p == "node_modules/"));
         assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
         assert!(patterns.iter().any(|p| p == "vendor/"));
+    }
+
+    #[test]
+    #[serial]
+    fn standalone_import_refreshes_v2_checkpoint_before_status() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"tracked\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "initial"]);
+        std::env::set_current_dir(root.path()).unwrap();
+
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let checkpoint = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .expect("standalone import must publish a checkpoint");
+        assert_eq!(
+            checkpoint.version,
+            super::super::checkpoint::CHECKPOINT_VERSION
+        );
+        assert_eq!(checkpoint.view, "main");
+        crate::commands::status::Status::new()
+            .with_short(true)
+            .run()
+            .expect("guarded status must pass immediately after import");
+    }
+
+    #[test]
+    #[serial]
+    fn mismatched_incremental_import_does_not_publish_checkpoint_before_alignment() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"main\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "main"]);
+        std::env::set_current_dir(root.path()).unwrap();
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+        let before = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .unwrap();
+
+        git_ok(root.path(), &["switch", "-q", "-c", "topic"]);
+        fs::write(root.path().join("tracked.txt"), b"topic\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "topic"]);
+        Import {
+            branch: Some("topic".to_string()),
+            incremental: true,
+            no_vault: true,
+            skip_checkpoint_refresh: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let after = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before, "mismatched import must not move checkpoint");
+        let repo = Repository::open(root.path()).unwrap();
+        assert_eq!(repo.current_view(), "main");
     }
 
     #[test]

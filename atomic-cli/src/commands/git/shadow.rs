@@ -26,68 +26,366 @@ use atomic_repository::Repository;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
 
-/// After an `atomic view switch`, point the git shadow's HEAD at the branch that
-/// mirrors the new view (Direction A of §5.4 — "git shadows Atomic"). Atomic is
-/// upstream, so it drives the downstream git shadow's branch selection.
-///
-/// This is a **ref move**, never a `git checkout`: it updates HEAD (and realigns
-/// the index to the new branch's tree) but never re-renders the working copy,
-/// which Atomic just materialized. It is **best-effort** — any git error is a
-/// warning, never a failure of the view switch — and a **no-op** outside a
-/// shadow-sync repo or when HEAD is already on the branch.
-pub(crate) fn sync_git_head_to_view(repo_root: &Path, view: &str) {
-    let git_repo = match GitRepository::discover(repo_root) {
-        Ok(r) => r,
-        Err(_) => return, // not a git repo — nothing to shadow
-    };
-    // Only touch git in repos where shadow sync is actually established.
-    if !shadow_sync_active(&git_repo) {
-        return;
+/// Result of coordinating an Atomic view switch with its local Git shadow.
+#[derive(Debug)]
+pub(crate) enum ShadowSwitchSync {
+    /// The working copy is not inside a Git repository.
+    SkippedNoGit,
+    /// Git exists, but Atomic shadow sync has not been established.
+    SkippedInactive,
+    /// The target branch, HEAD, and index now describe the materialized view.
+    Synchronized(ShadowSwitchReceipt),
+}
+
+impl ShadowSwitchSync {
+    pub(crate) fn is_synchronized(&self) -> bool {
+        matches!(self, Self::Synchronized(_))
     }
 
-    let branch_ref = format!("refs/heads/{}", view);
-
-    // Idempotent: already on the mirror branch (no loop, no churn).
-    if git_repo
-        .head()
-        .ok()
-        .and_then(|h| h.name().map(str::to_owned))
-        .as_deref()
-        == Some(branch_ref.as_str())
-    {
-        return;
-    }
-
-    // Create the mirror branch at the current commit if it doesn't exist yet
-    // (a new draft view branches from wherever HEAD currently points).
-    if git_repo.find_reference(&branch_ref).is_err() {
-        match git_repo.head().and_then(|h| h.peel_to_commit()) {
-            Ok(commit) => {
-                if let Err(e) = git_repo.branch(view, &commit, false) {
-                    print_warning(&format!(
-                        "Could not create git branch '{}' to mirror the view: {}",
-                        view, e
-                    ));
-                    return;
-                }
-            }
-            // Unborn HEAD / no commits yet — nothing to anchor a branch to.
-            Err(_) => return,
+    /// Restore the Git evidence captured before synchronization. This is used
+    /// when the final bridge checkpoint cannot be refreshed after Git itself
+    /// was aligned successfully.
+    pub(crate) fn rollback(self, repo_root: &Path) -> CliResult<()> {
+        let Self::Synchronized(receipt) = self else {
+            return Ok(());
+        };
+        let git_repo = GitRepository::discover(repo_root).map_err(|error| {
+            git_error(format!(
+                "cannot reopen Git repository to roll back shadow switch: {error}"
+            ))
+        })?;
+        let failures = receipt.snapshot.restore(&git_repo, &receipt.target_ref);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(git_error(format!(
+                "failed to restore original Git state: {}",
+                failures.join("; ")
+            )))
         }
     }
+}
 
-    // Move HEAD to the mirror branch WITHOUT touching the working copy, then
-    // realign the index to the new branch tip so `git status` cleanly shows the
-    // view's content as the delta the next shadow push will commit.
-    if let Err(e) = git_repo.set_head(&branch_ref) {
-        print_warning(&format!(
-            "Could not point git HEAD at branch '{}': {}",
-            view, e
-        ));
-        return;
+#[derive(Debug)]
+pub(crate) struct ShadowSwitchReceipt {
+    target_ref: String,
+    snapshot: GitSwitchSnapshot,
+}
+
+#[derive(Clone, Debug)]
+enum ReferenceSnapshot {
+    Missing,
+    Direct(git2::Oid),
+    Symbolic(String),
+}
+
+#[derive(Clone, Debug)]
+struct GitSwitchSnapshot {
+    head: ReferenceSnapshot,
+    target: ReferenceSnapshot,
+    index: Option<Vec<u8>>,
+}
+
+impl GitSwitchSnapshot {
+    fn capture(git_repo: &GitRepository, target_ref: &str) -> CliResult<Self> {
+        let index_path = git_repo.path().join("index");
+        let index = match std::fs::read(&index_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(git_error(format!(
+                    "cannot snapshot Git index before shadow switch: {error}"
+                )))
+            }
+        };
+        Ok(Self {
+            head: snapshot_reference(git_repo, "HEAD")?,
+            target: snapshot_reference(git_repo, target_ref)?,
+            index,
+        })
     }
-    restore_index_from_head(&git_repo);
-    print_info(&format!("git shadow now tracks branch '{}'.", view));
+
+    fn restore(&self, git_repo: &GitRepository, target_ref: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Err(error) = restore_head(git_repo, &self.head) {
+            failures.push(format!("HEAD: {error}"));
+        }
+        if let Err(error) = restore_reference(git_repo, target_ref, &self.target) {
+            failures.push(format!("{target_ref}: {error}"));
+        }
+        if let Err(error) = restore_index(git_repo, self.index.as_deref()) {
+            failures.push(format!("index: {error}"));
+        }
+        failures
+    }
+}
+
+/// Project the just-materialized Atomic view into its local Git mirror.
+///
+/// The working copy is staged exclusively through [`stage_and_validate_tree`].
+/// If the target branch is stale, a local projection commit advances it from
+/// its prior tip; a missing target branches from the current Git HEAD. HEAD and
+/// the live index are then aligned to that exact tree without checking out or
+/// otherwise touching the working copy.
+///
+/// Plain non-Git and non-shadow repositories are typed no-ops. Once shadow sync
+/// is active, every failure is returned to the caller and the original Git
+/// HEAD, target ref, and index are restored where possible.
+pub(crate) fn sync_git_head_to_view(
+    repo: &Repository,
+    repo_root: &Path,
+    view: &str,
+) -> CliResult<ShadowSwitchSync> {
+    let git_repo = match GitRepository::discover(repo_root) {
+        Ok(repo) => repo,
+        Err(_) => return Ok(ShadowSwitchSync::SkippedNoGit),
+    };
+    if !shadow_sync_active(&git_repo) {
+        return Ok(ShadowSwitchSync::SkippedInactive);
+    }
+    if repo.current_view() != view {
+        return Err(git_error(format!(
+            "cannot synchronize Git shadow for view '{view}': current Atomic view is '{}'",
+            repo.current_view()
+        )));
+    }
+
+    // A coordinated switch must not silently skip its projection. Contention is
+    // an actionable failure because leaving the old branch/index would publish
+    // stale evidence for the newly materialized view.
+    let _shadow_lock = repo
+        .try_lock_shadow_commit()
+        .map_err(CliError::Repository)?
+        .ok_or_else(|| {
+            git_error(
+                "another shadow materialize is in flight; retry the view switch after it completes",
+            )
+        })?;
+
+    let target_ref = format!("refs/heads/{view}");
+    let snapshot = GitSwitchSnapshot::capture(&git_repo, &target_ref)?;
+    let sync_result = (|| -> CliResult<()> {
+        // Never bypass V1 for a switch: a conflicted materialization cannot be
+        // checkpointed as clean Git evidence.
+        let tree_oid = stage_and_validate_tree(repo, &git_repo, repo_root, view, false)?;
+        let state = repo
+            .get_view_info(view)
+            .map_err(CliError::Repository)?
+            .state_base32();
+        let commit =
+            find_or_create_switch_projection(&git_repo, &target_ref, view, &state, tree_oid)?;
+        update_target_ref(&git_repo, &target_ref, commit)?;
+        git_repo.set_head(&target_ref).map_err(|error| {
+            git_error(format!(
+                "cannot point Git HEAD at shadow branch '{view}': {error}"
+            ))
+        })?;
+        align_index_to_tree(&git_repo, tree_oid)?;
+        Ok(())
+    })();
+
+    match sync_result {
+        Ok(()) => Ok(ShadowSwitchSync::Synchronized(ShadowSwitchReceipt {
+            target_ref,
+            snapshot,
+        })),
+        Err(error) => {
+            let rollback_failures = snapshot.restore(&git_repo, &target_ref);
+            if rollback_failures.is_empty() {
+                Err(error)
+            } else {
+                Err(git_error(format!(
+                    "{error}; additionally failed to restore original Git state: {}",
+                    rollback_failures.join("; ")
+                )))
+            }
+        }
+    }
+}
+
+fn find_or_create_switch_projection(
+    git_repo: &GitRepository,
+    target_ref: &str,
+    view: &str,
+    state: &str,
+    tree_oid: git2::Oid,
+) -> CliResult<git2::Oid> {
+    let parent_oid = match git_repo.find_reference(target_ref) {
+        Ok(reference) => {
+            let commit = reference.peel_to_commit().map_err(|error| {
+                git_error(format!("cannot read target shadow branch '{view}': {error}"))
+            })?;
+            if commit.tree_id() == tree_oid {
+                return Ok(commit.id());
+            }
+            commit.id()
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => git_repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .map_err(|error| {
+                git_error(format!(
+                    "cannot create shadow branch '{view}' without a current Git HEAD commit: {error}"
+                ))
+            })?
+            .id(),
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot inspect target shadow branch '{view}': {error}"
+            )))
+        }
+    };
+    let parent = git_repo.find_commit(parent_oid).map_err(|error| {
+        git_error(format!(
+            "cannot read parent for shadow projection on '{view}': {error}"
+        ))
+    })?;
+    let tree = git_repo.find_tree(tree_oid).map_err(|error| {
+        git_error(format!(
+            "cannot read validated tree for shadow projection on '{view}': {error}"
+        ))
+    })?;
+    let signature = git_repo.signature().map_err(|error| {
+        git_error(format!(
+            "cannot determine Git signature for shadow projection: {error}"
+        ))
+    })?;
+    let message =
+        format!("Atomic shadow switch projection\n\nAtomic-View: {view}\nAtomic-State: {state}\n");
+    let commit = git_repo
+        .commit(None, &signature, &signature, &message, &tree, &[&parent])
+        .map_err(|error| {
+            git_error(format!(
+                "cannot create local shadow projection for view '{view}': {error}"
+            ))
+        })?;
+    Ok(commit)
+}
+
+fn update_target_ref(
+    git_repo: &GitRepository,
+    target_ref: &str,
+    commit: git2::Oid,
+) -> CliResult<()> {
+    match git_repo.find_reference(target_ref) {
+        Ok(mut reference) => {
+            if reference.target() != Some(commit) {
+                reference
+                    .set_target(commit, "atomic shadow view switch")
+                    .map_err(|error| {
+                        git_error(format!(
+                            "cannot advance target shadow branch '{target_ref}': {error}"
+                        ))
+                    })?;
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            git_repo
+                .reference(target_ref, commit, false, "atomic shadow view switch")
+                .map_err(|error| {
+                    git_error(format!(
+                        "cannot create target shadow branch '{target_ref}': {error}"
+                    ))
+                })?;
+        }
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot inspect target shadow branch '{target_ref}': {error}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn align_index_to_tree(git_repo: &GitRepository, tree_oid: git2::Oid) -> CliResult<()> {
+    let tree = git_repo.find_tree(tree_oid).map_err(|error| {
+        git_error(format!(
+            "cannot read shadow projection tree while aligning Git index: {error}"
+        ))
+    })?;
+    let mut index = git_repo.index().map_err(|error| {
+        git_error(format!(
+            "cannot open Git index while aligning shadow view: {error}"
+        ))
+    })?;
+    index
+        .read_tree(&tree)
+        .and_then(|_| index.write())
+        .map_err(|error| {
+            git_error(format!(
+                "cannot align Git index to the shadow projection tree: {error}"
+            ))
+        })
+}
+
+fn snapshot_reference(git_repo: &GitRepository, name: &str) -> CliResult<ReferenceSnapshot> {
+    match git_repo.find_reference(name) {
+        Ok(reference) => {
+            if let Some(target) = reference.target() {
+                Ok(ReferenceSnapshot::Direct(target))
+            } else if let Some(target) = reference.symbolic_target() {
+                Ok(ReferenceSnapshot::Symbolic(target.to_string()))
+            } else {
+                Err(git_error(format!(
+                    "cannot snapshot Git reference '{name}': it has no target"
+                )))
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(ReferenceSnapshot::Missing),
+        Err(error) => Err(git_error(format!(
+            "cannot snapshot Git reference '{name}': {error}"
+        ))),
+    }
+}
+
+fn restore_head(git_repo: &GitRepository, snapshot: &ReferenceSnapshot) -> Result<(), git2::Error> {
+    match snapshot {
+        ReferenceSnapshot::Missing => match git_repo.find_reference("HEAD") {
+            Ok(mut reference) => reference.delete(),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        ReferenceSnapshot::Direct(target) => git_repo.set_head_detached(*target),
+        ReferenceSnapshot::Symbolic(target) => git_repo.set_head(target),
+    }
+}
+
+fn restore_reference(
+    git_repo: &GitRepository,
+    name: &str,
+    snapshot: &ReferenceSnapshot,
+) -> Result<(), git2::Error> {
+    match snapshot {
+        ReferenceSnapshot::Missing => match git_repo.find_reference(name) {
+            Ok(mut reference) => reference.delete(),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        ReferenceSnapshot::Direct(target) => git_repo
+            .reference(name, *target, true, "restore failed Atomic shadow switch")
+            .map(|_| ()),
+        ReferenceSnapshot::Symbolic(target) => git_repo
+            .reference_symbolic(name, target, true, "restore failed Atomic shadow switch")
+            .map(|_| ()),
+    }
+}
+
+fn restore_index(git_repo: &GitRepository, bytes: Option<&[u8]>) -> std::io::Result<()> {
+    let index_path = git_repo.path().join("index");
+    match bytes {
+        Some(bytes) => std::fs::write(index_path, bytes),
+        None => match std::fs::remove_file(index_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn git_error(message: impl Into<String>) -> CliError {
+    CliError::GitError {
+        message: message.into(),
+    }
 }
 
 /// Whether git shadow sync is established for this repo (the `.git/info/exclude`

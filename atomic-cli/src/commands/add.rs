@@ -94,6 +94,9 @@ use atomic_repository::status::StatusOptions;
 use atomic_repository::tracking::{TrackingOptions, TrackingStats};
 use atomic_repository::Repository;
 
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -408,6 +411,27 @@ impl Command for Add {
     fn run(&self) -> CliResult<()> {
         // Find the repository root
         let repo_root = find_repository_root()?;
+
+        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Add)).map_err(
+            |error| match error {
+                GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                    reason: error.to_string(),
+                },
+                GuardError::Observation(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+                GuardError::Wip(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+            },
+        )? {
+            GuardOutcome::Pass(_) => {}
+            GuardOutcome::Refuse(refusal) => {
+                return Err(CliError::StaleBaseline {
+                    report: refusal.to_string(),
+                });
+            }
+        }
 
         // Open the repository
         let repo = Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {

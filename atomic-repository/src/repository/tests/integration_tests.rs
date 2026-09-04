@@ -1048,3 +1048,169 @@ fn test_status_clean_after_view_switch_with_sibling_changes() {
          working-copy edits"
     );
 }
+
+#[test]
+fn shared_content_does_not_absorb_draft_edit_after_parent_update_roundtrip() {
+    let (temp, mut repo) = create_temp_repo();
+    let path = temp.path().join("config.yml");
+    let base = b"app:\n  debug: false\ndatabase:\n  port: 5432\n";
+    let tweak = b"app:\n  debug: true\ndatabase:\n  port: 5432\n";
+    let shared_updated = b"app:\n  debug: false\ndatabase:\n  port: 5433\n";
+    let tweak_updated = b"app:\n  debug: true\ndatabase:\n  port: 5433\n";
+    let record = |repo: &Repository, message: &str| {
+        repo.record(
+            ChangeHeader::new(message),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap()
+    };
+
+    std::fs::write(&path, base).unwrap();
+    repo.add("config.yml", TrackingOptions::default()).unwrap();
+    record(&repo, "base config");
+    repo.create_view_from("tweak", "dev").unwrap();
+
+    repo.switch_view("tweak").unwrap();
+    std::fs::write(&path, tweak).unwrap();
+    record(&repo, "draft enables debug");
+
+    repo.switch_view("dev").unwrap();
+    std::fs::write(&path, shared_updated).unwrap();
+    record(&repo, "shared updates port");
+    assert_eq!(
+        repo.get_file_content_on_view("config.yml", "dev")
+            .unwrap()
+            .unwrap(),
+        shared_updated
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("config.yml", "tweak")
+            .unwrap()
+            .unwrap(),
+        tweak_updated
+    );
+
+    repo.switch_view("tweak").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), tweak_updated);
+    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    assert!(repo.verify_working_copy().unwrap().is_healthy());
+
+    repo.switch_view("dev").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), shared_updated);
+    assert_eq!(
+        repo.get_file_content("config.yml").unwrap().unwrap(),
+        shared_updated,
+        "shared graph retrieval must exclude the draft-only debug edit"
+    );
+    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    assert!(repo.verify_working_copy().unwrap().is_healthy());
+
+    repo.switch_view("tweak").unwrap();
+    repo.switch_view("dev").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), shared_updated);
+    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+}
+
+#[test]
+fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
+    let source_temp = TempDir::new().unwrap();
+    let source = Repository::init(source_temp.path()).unwrap();
+    let source_path = source_temp.path().join("config.yml");
+    let base = b"app:\n  debug: false\ndatabase:\n  port: 5432\n";
+    let draft = b"app:\n  debug: true\ndatabase:\n  port: 5432\n";
+    let shared_updated = b"app:\n  debug: false\ndatabase:\n  port: 5433\n";
+    let draft_updated = b"app:\n  debug: true\ndatabase:\n  port: 5433\n";
+    let record = |repo: &Repository, message: &str| {
+        repo.record(
+            ChangeHeader::new(message),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap()
+    };
+
+    std::fs::write(&source_path, base).unwrap();
+    source
+        .add("config.yml", TrackingOptions::default())
+        .unwrap();
+    let base_change = record(&source, "imported base");
+
+    let target_temp = TempDir::new().unwrap();
+    let mut target = Repository::init(target_temp.path()).unwrap();
+    target
+        .write_import_graph_change(
+            base_change.change().clone(),
+            &[],
+            false,
+            InsertOptions::default(),
+        )
+        .unwrap();
+    target.materialize().unwrap();
+    assert_eq!(
+        std::fs::read(target_temp.path().join("config.yml")).unwrap(),
+        base
+    );
+    target.create_view_from("tweak", "dev").unwrap();
+    target.switch_view("tweak").unwrap();
+    std::fs::write(target_temp.path().join("config.yml"), draft).unwrap();
+    record(&target, "draft enables debug");
+
+    target.switch_view("dev").unwrap();
+    std::fs::write(&source_path, shared_updated).unwrap();
+    let incremental = record(&source, "imported port update");
+    target
+        .write_import_graph_change(
+            incremental.change().clone(),
+            &[],
+            false,
+            InsertOptions::default(),
+        )
+        .unwrap();
+    target.materialize().unwrap();
+    assert_eq!(
+        target
+            .get_file_content_on_view("config.yml", "dev")
+            .unwrap()
+            .unwrap(),
+        shared_updated
+    );
+    assert_eq!(
+        std::fs::read(target_temp.path().join("config.yml")).unwrap(),
+        shared_updated
+    );
+
+    target.switch_view("tweak").unwrap();
+    assert_eq!(
+        target
+            .get_file_content_on_view("config.yml", "tweak")
+            .unwrap()
+            .unwrap(),
+        draft_updated
+    );
+    assert_eq!(
+        std::fs::read(target_temp.path().join("config.yml")).unwrap(),
+        draft_updated
+    );
+
+    target.switch_view("dev").unwrap();
+    assert_eq!(
+        target
+            .get_file_content_on_view("config.yml", "dev")
+            .unwrap()
+            .unwrap(),
+        shared_updated,
+        "shared graph visibility must exclude the draft-only edit"
+    );
+    assert_eq!(
+        std::fs::read(target_temp.path().join("config.yml")).unwrap(),
+        shared_updated,
+        "switch must overwrite draft bytes even when FILE_INDEX was last populated on tweak"
+    );
+    assert!(target.status(StatusOptions::default()).unwrap().is_clean());
+    assert!(target.verify_working_copy().unwrap().is_healthy());
+}

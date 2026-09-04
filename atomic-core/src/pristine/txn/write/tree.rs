@@ -53,6 +53,66 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
         }
     }
 
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        let table = self.txn.open_table(INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, position) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Inode::new(inode.value()),
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        let table = self.txn.open_table(REV_INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (position, inode) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+                Inode::new(inode.value()),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        let table = self.txn.open_table(DIRECTORIES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, flags) = entry?;
+            rows.push((Inode::new(inode.value()), flags.value()));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        let table = self.txn.open_multimap_table(INODE_GRAPH)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, _values) = entry?;
+            let (inode, change_id, start, end) = decode_inode_vertex(key.value());
+            rows.push((
+                Inode::new(inode),
+                GraphNode::new(
+                    NodeId::new(change_id),
+                    ChangePosition::new(start),
+                    ChangePosition::new(end),
+                ),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
     fn iter_tree(
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
@@ -146,7 +206,7 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::{MutTxnT, Pristine};
+    use crate::pristine::{MutTxnT, PathClaimTxnT, Pristine};
     use tempfile::tempdir;
 
     #[test]
@@ -193,5 +253,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        txn.validate_tree_bijection().unwrap();
+    }
+
+    #[test]
+    fn put_tree_rejects_path_overwrite_and_inode_rebind() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let first = Inode::new(1);
+        let second = Inode::new(2);
+
+        txn.put_tree("same.txt", first).unwrap();
+        assert!(txn.put_tree("same.txt", second).is_err());
+        assert!(txn.put_tree("other.txt", first).is_err());
+        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(first));
+        assert_eq!(txn.get_inode("other.txt").unwrap(), None);
+        assert_eq!(txn.get_path(first).unwrap().as_deref(), Some("same.txt"));
+        assert_eq!(txn.get_path(second).unwrap(), None);
+        txn.validate_tree_bijection().unwrap();
+    }
+
+    #[test]
+    fn exhaustive_bijection_validation_rejects_reverse_only_rows() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let primary = Inode::new(1);
+        let reverse_only = Inode::new(2);
+        txn.put_tree("same.txt", primary).unwrap();
+        {
+            let mut reverse = txn.txn.open_table(REV_TREE).unwrap();
+            reverse.insert(reverse_only.get(), "same.txt").unwrap();
+        }
+
+        let error = txn.validate_tree_bijection().unwrap_err();
+        assert!(error.to_string().contains("invariant violation"));
+        assert!(txn.del_tree("same.txt").is_err());
+        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(primary));
+        txn.abort().unwrap();
     }
 }

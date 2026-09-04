@@ -32,7 +32,7 @@ use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 ///
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
-pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
+pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PathClaimMutTxnT {
     // ── Change Registration ─────────────────────────────────────
 
     /// Register a new internal ID for an external hash.

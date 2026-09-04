@@ -179,6 +179,7 @@
 
 pub mod chunking;
 pub mod compact;
+mod compatibility;
 pub mod error;
 pub mod hash_table;
 pub mod reader;

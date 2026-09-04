@@ -1,6 +1,34 @@
 use super::*;
 use crate::apply::InsertOptions;
-use atomic_core::pristine::{CachedGraphTxn, ViewGraph};
+use atomic_core::pristine::{
+    CachedGraphTxn, GraphTxnT, GraphVisibilityClosure, PathClaimId, ViewGraph, ViewMembershipSet,
+};
+
+#[derive(Debug, Clone)]
+struct FileMovePlan {
+    old_path: String,
+    new_path: String,
+    inode: Inode,
+    claimant: Position<NodeId>,
+    source: PathClaimId,
+    old_content: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct FileMovePlanning {
+    moves: Vec<FileMovePlan>,
+    evidence: crate::record::MoveEvidence,
+    unresolved_destinations: std::collections::BTreeSet<String>,
+    fresh_additions: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedNameResolution {
+    winner: super::name_resolution::ProjectedPathClaim,
+    operation: GraphOp<Option<Hash>>,
+    dependencies: Vec<Hash>,
+    conflict_inodes: Vec<Inode>,
+}
 
 impl Repository {
     /// This is the main entry point for creating a change from working copy
@@ -45,10 +73,10 @@ impl Repository {
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
-        use atomic_core::output::Memory;
+        use atomic_core::output::{FileSystem, Memory};
         use atomic_core::record::workflow::{
             assemble_change, record_added_file, record_deleted_file, record_modified_file,
-            DetectedFile, RecordedFile,
+            record_moved_file, record_undeleted_file, DetectedFile, RecordedFile,
         };
 
         // Build the final header (may get message from options).
@@ -63,7 +91,11 @@ impl Repository {
             }
         }
         let status = self
-            .status_for_record(status_options, options.get_detect_raw_renames())
+            .status_for_record(
+                status_options,
+                options.get_detect_raw_renames(),
+                options.get_include_untracked(),
+            )
             .map_err(RecordError::Repository)?;
         if trace_record {
             eprintln!(
@@ -113,136 +145,9 @@ impl Repository {
             }
         }
 
-        // Filter to recordable files. When conflict markers are explicitly
-        // allowed, remap Conflicted entries to Modified so they remain
-        // recordable (the file's underlying change is a modification).
-        let remapped_entries: Vec<FileStatusEntry>;
-        let entries_for_filter: &[FileStatusEntry] = if options.get_allow_conflict_markers() {
-            remapped_entries = status
-                .entries()
-                .iter()
-                .map(|e| {
-                    if e.status() == FileStatus::Conflicted {
-                        let mut m =
-                            FileStatusEntry::new(e.path().to_path_buf(), FileStatus::Modified);
-                        if let Some(inode) = e.inode() {
-                            m.set_inode(inode);
-                        }
-                        m
-                    } else {
-                        e.clone()
-                    }
-                })
-                .collect();
-            &remapped_entries
-        } else {
-            status.entries()
-        };
-        let files_to_record = filter_files(entries_for_filter, &options);
-
-        log::debug!(
-            "record: filter_files returned {} recordable files",
-            files_to_record.len(),
-        );
-        for f in &files_to_record {
-            log::debug!("record:   {:?} {}", f.status(), f.path().display(),);
-        }
-
-        if files_to_record.is_empty() {
-            return Err(RecordError::NothingToRecord);
-        }
-
-        // ── Rename detection (Stage 1: git-style raw rename) ──────────────
-        //
-        // A tracked path now missing from disk (Deleted) whose byte-identical
-        // content reappears at an untracked on-disk path (Untracked) is a
-        // RENAME, not a delete+add. Pair them and emit a single
-        // `GraphOp::FileMove` that reuses the ORIGINAL inode (preserving
-        // history/blame), instead of a FileDel + FileAdd that would allocate a
-        // fresh inode and lose the connection.
-        //
-        // The old path is still in TREE (a raw `fs::rename` never touches
-        // tracking), so globalize's FileMove emitter can resolve the inode via
-        // `get_inode(old_path)` unchanged. The `atomic mv` command eagerly
-        // rewrites TREE and is therefore NOT covered here — that is Stage 2
-        // (see docs/MERGE-CONFLICT-RUBRIC.md §6.7).
-        //
-        // `renamed_from` collects the old (Deleted) paths that were reclassified
-        // as moves so the main loop skips deleting them.
-        let mut renamed_from: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut rename_moves: Vec<(String, String, atomic_core::types::Inode)> = Vec::new();
-        if options.get_detect_raw_renames() {
-            // Candidate destinations: regular untracked files present on disk,
-            // bucketed by size so unrelated contents are never loaded.
-            let mut untracked_by_size: std::collections::BTreeMap<u64, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for e in status.entries() {
-                if e.status() != FileStatus::Untracked {
-                    continue;
-                }
-                let p = e.path().to_string_lossy().to_string();
-                if !options.should_include(&p) {
-                    continue;
-                }
-                if let Ok(metadata) = std::fs::metadata(self.root.join(&p)) {
-                    if metadata.is_file() {
-                        untracked_by_size.entry(metadata.len()).or_default().push(p);
-                    }
-                }
-            }
-
-            for paths in untracked_by_size.values_mut() {
-                paths.sort();
-            }
-
-            if !untracked_by_size.is_empty() {
-                let mut used_new: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut deleted_candidates: Vec<&FileStatusEntry> = files_to_record
-                    .iter()
-                    .copied()
-                    .filter(|f| {
-                        f.status() == FileStatus::Deleted && f.details() != Some("directory")
-                    })
-                    .collect();
-                deleted_candidates.sort_by(|a, b| a.path().cmp(b.path()));
-
-                for f in deleted_candidates {
-                    let old_path = f.path().to_string_lossy().to_string();
-                    // The deleted file's content as the graph still holds it.
-                    let old_bytes = match self.get_file_content(&old_path) {
-                        Ok(Some(b)) => b,
-                        _ => continue,
-                    };
-                    let Some(candidates) = untracked_by_size.get(&(old_bytes.len() as u64)) else {
-                        continue;
-                    };
-                    // Pair with the first unused, same-sized destination whose
-                    // contents are byte-identical. Candidate order is stable.
-                    let matched = candidates.iter().find(|new_path| {
-                        if used_new.contains(*new_path) {
-                            return false;
-                        }
-                        std::fs::read(self.root.join(new_path))
-                            .map(|new_bytes| new_bytes == old_bytes)
-                            .unwrap_or(false)
-                    });
-                    let Some(new_path) = matched.cloned() else {
-                        continue;
-                    };
-                    let inode = match f.inode() {
-                        Some(ino) => ino,
-                        None => match self.get_file_inode(&old_path) {
-                            Ok(Some(ino)) => ino,
-                            _ => continue,
-                        },
-                    };
-                    used_new.insert(new_path.clone());
-                    renamed_from.insert(old_path.clone());
-                    rename_moves.push((old_path, new_path, inode));
-                }
-            }
-        }
+        // Move classification runs after the graph-backed path projection is
+        // available. This keeps exact source claims authoritative and ensures
+        // content equality/similarity is retained only as advisory evidence.
 
         // Statistics tracking
         let mut stats = RecordStats::new();
@@ -251,25 +156,6 @@ impl Repository {
         let mut deleted_paths: Vec<String> = Vec::new();
         let mut skipped_paths: Vec<String> = Vec::new();
         let mut errors: Vec<(String, String)> = Vec::new();
-
-        // Emit a FileMove RecordedFile for each detected rename. globalize's
-        // Moved branch turns each into a single `GraphOp::FileMove` (reusing the
-        // original inode); write_recorded then updates TREE (old → new).
-        for (old_path, new_path, inode) in &rename_moves {
-            let mut recorded = RecordedFile::new(new_path);
-            recorded.set_kind(atomic_core::record::workflow::DetectionKind::Moved);
-            recorded.set_old_path(old_path.clone());
-            recorded.set_inode(*inode);
-            if let Ok(txn) = self.pristine.read_txn() {
-                if let Ok(Some(pos)) = txn.inode_position(*inode) {
-                    recorded.set_position(pos);
-                }
-            }
-            stats.files_recorded += 1;
-            stats.vertices_added += 1; // new name vertex
-            recorded_paths.push(new_path.clone());
-            recorded_files.push(recorded);
-        }
 
         let core_options = options.to_core_options();
 
@@ -297,6 +183,22 @@ impl Repository {
             })?;
         let shared_graph_visibility =
             graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
+        let shared_claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &shared_txn,
+            &self.change_store,
+            &view,
+            &shared_graph_visibility,
+        )
+        .map_err(RecordError::Repository)?;
+        let tree_projection = self
+            .project_tree_for_visibility(&shared_txn, &shared_claim_visibility)
+            .map_err(RecordError::Repository)?;
+        let projected_present = tree_projection.present_metadata;
+        let projected_absent: std::collections::HashMap<
+            String,
+            super::deferred_tree::ProjectedAbsent,
+        > = tree_projection.absent_metadata;
+        let projected_name_conflicts = tree_projection.name_conflicts;
 
         // Alongside visibility, collect paths with a PERSISTED
         // conflict on this view (the raw CONFLICTS table, deliberately NOT the
@@ -318,6 +220,129 @@ impl Repository {
         }
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
+        let move_planning = plan_file_moves(
+            &shared_txn,
+            &shared_cached_txn,
+            &self.change_store,
+            &shared_graph_visibility,
+            status.entries(),
+            &projected_present,
+            &projected_absent,
+            &self.root,
+            options.get_detect_raw_renames(),
+        )?;
+        let FileMovePlanning {
+            moves: planned_moves,
+            evidence: move_evidence,
+            unresolved_destinations,
+            fresh_additions,
+        } = move_planning;
+        let renamed_from: std::collections::HashSet<String> = planned_moves
+            .iter()
+            .map(|planned| planned.old_path.clone())
+            .collect();
+        let renamed_to: std::collections::HashSet<String> = planned_moves
+            .iter()
+            .map(|planned| planned.new_path.clone())
+            .collect();
+        let move_source_paths = renamed_from.clone();
+
+        // Repository-owned `--all` handling runs after move classification, so
+        // adding an untracked destination can no longer erase rename evidence.
+        // Ambiguous heuristic destinations are also included to make the
+        // conservative fallback an explicit delete-plus-add change.
+        let mut remapped_entries: Vec<FileStatusEntry> = status
+            .entries()
+            .iter()
+            .map(|entry| {
+                let path = entry.path().to_string_lossy();
+                let remapped_status = if entry.status() == FileStatus::Conflicted
+                    && options.get_allow_conflict_markers()
+                {
+                    Some(FileStatus::Modified)
+                } else if entry.status() == FileStatus::Untracked
+                    && (options.get_include_untracked()
+                        || unresolved_destinations.contains(path.as_ref()))
+                {
+                    Some(FileStatus::Added)
+                } else {
+                    None
+                };
+                let Some(remapped_status) = remapped_status else {
+                    return entry.clone();
+                };
+                let mut remapped =
+                    FileStatusEntry::new(entry.path().to_path_buf(), remapped_status);
+                if let Some(inode) = entry.inode() {
+                    remapped.set_inode(inode);
+                }
+                remapped
+            })
+            .collect();
+        remapped_entries.sort_by(|left, right| left.path().cmp(right.path()));
+        let files_to_record = filter_files(&remapped_entries, &options);
+
+        log::debug!(
+            "record: filter_files returned {} recordable files and {} moves",
+            files_to_record.len(),
+            planned_moves.len(),
+        );
+        for file in &files_to_record {
+            log::debug!("record:   {:?} {}", file.status(), file.path().display());
+        }
+
+        if files_to_record.is_empty() && planned_moves.is_empty() {
+            return Err(RecordError::NothingToRecord);
+        }
+
+        let working_copy = FileSystem::from_root(&self.root);
+        for planned in planned_moves {
+            let (trunk, branches) =
+                existing_crdt_identity(&shared_txn, planned.inode, &shared_graph_visibility)?;
+            let detected = DetectedFile::moved(&planned.old_path, &planned.new_path)
+                .with_inode(planned.inode)
+                .with_position(planned.claimant);
+            let recorded = record_moved_file(
+                &working_copy,
+                &detected,
+                &planned.old_content,
+                None,
+                &core_options,
+                planned.inode,
+                planned.claimant,
+                planned.source,
+                trunk,
+                (!branches.is_empty()).then_some(branches.as_slice()),
+            )
+            .map_err(RecordError::Database)?;
+
+            stats.files_recorded += 1;
+            stats.hunks_created += recorded.hunk_count() + 1;
+            stats.vertices_added += 1;
+            stats.edges_modified += 1;
+            for hunk in recorded.hunks() {
+                use atomic_core::record::workflow::graph_op::BuiltHunkKind;
+                match hunk.kind {
+                    BuiltHunkKind::Insert => stats.vertices_added += 1,
+                    BuiltHunkKind::Replace => {
+                        stats.vertices_added += 1;
+                        stats.edges_modified += 1;
+                    }
+                    BuiltHunkKind::Delete => stats.edges_modified += 1,
+                }
+                stats.content_bytes += hunk.content_len();
+            }
+            if let Some(crdt_stats) = recorded.crdt_stats() {
+                stats.lines_added += crdt_stats.lines_added;
+                stats.lines_deleted += crdt_stats.lines_deleted;
+                stats.lines_modified += crdt_stats.lines_modified;
+                stats.tokens_added += crdt_stats.tokens_added;
+                stats.tokens_deleted += crdt_stats.tokens_deleted;
+                stats.tokens_replaced += crdt_stats.tokens_replaced;
+            }
+            recorded_paths.push(planned.new_path);
+            recorded_files.push(recorded);
+        }
 
         if trace_record {
             eprintln!(
@@ -339,7 +364,7 @@ impl Repository {
             // Skip the old side of a detected rename: it was reclassified as a
             // FileMove above, so recording it as a Deleted here would emit a
             // spurious FileDel and drop the inode.
-            if renamed_from.contains(&path) {
+            if renamed_from.contains(&path) || renamed_to.contains(&path) {
                 continue;
             }
 
@@ -356,9 +381,25 @@ impl Repository {
                     stats.vertices_added += 2; // name span + inode span
                     recorded_paths.push(format!("{}/ (directory)", path));
 
-                    // Create a minimal RecordedFile for the directory
-                    // The actual GraphOp::DirAdd will be created during globalization
-                    let recorded = RecordedFile::new_directory(&path);
+                    let recorded = if let Some(absent) = projected_absent.get(&path) {
+                        if !absent.directory {
+                            errors.push((
+                                path.clone(),
+                                "Projected undelete changes file kind to directory".to_string(),
+                            ));
+                            stats.errors += 1;
+                            continue;
+                        }
+                        RecordedFile::new_undeleted_directory(
+                            &path,
+                            absent.inode,
+                            absent.position,
+                            absent.deleted_by.clone(),
+                        )
+                    } else {
+                        // The actual GraphOp::DirAdd is created during globalization.
+                        RecordedFile::new_directory(&path)
+                    };
                     recorded_files.push(recorded);
                 }
 
@@ -390,12 +431,57 @@ impl Repository {
                             // Write to memory working copy
                             memory_wc.add_file(&path, &content);
 
-                            // Create a detected file descriptor
-                            let detected = DetectedFile::added(&path);
+                            let mut detected = DetectedFile::added(&path);
+                            let recorded_result = if fresh_additions.contains(&path) {
+                                record_added_file(&memory_wc, &detected, &core_options)
+                            } else if let Some(absent) = projected_absent.get(&path) {
+                                if absent.directory {
+                                    Err("Projected undelete changes directory kind to file"
+                                        .to_string())
+                                } else {
+                                    detected.inode = Some(absent.inode);
+                                    detected.position = Some(absent.position);
+                                    let baseline = visibility_before_deletions(
+                                        &shared_txn,
+                                        &absent.deleted_by,
+                                    )?;
+                                    let old_content =
+                                        retrieve_content_with_filter_fast_with_fork_info(
+                                            &shared_cached_txn,
+                                            &self.change_store,
+                                            absent.inode,
+                                            absent.position,
+                                            atomic_core::output::alive::RetrieveOptions::new()
+                                                .with_graph_visibility(baseline.clone()),
+                                        )
+                                        .map_err(|error| {
+                                            RecordError::Database(format!(
+                                            "failed to retrieve pre-delete content for '{}': {}",
+                                            path, error
+                                        ))
+                                        })?
+                                        .0;
+                                    let (trunk, branches) = existing_crdt_identity(
+                                        &shared_txn,
+                                        absent.inode,
+                                        &baseline,
+                                    )?;
+                                    record_undeleted_file(
+                                        &memory_wc,
+                                        &detected,
+                                        &absent.deleted_by,
+                                        &old_content,
+                                        None,
+                                        &core_options,
+                                        trunk,
+                                        (!branches.is_empty()).then_some(branches.as_slice()),
+                                    )
+                                }
+                            } else {
+                                record_added_file(&memory_wc, &detected, &core_options)
+                            };
 
-                            // Record the added file
-                            log::debug!("record: calling record_added_file for '{}'", path);
-                            match record_added_file(&memory_wc, &detected, &core_options) {
+                            match recorded_result {
                                 Ok(recorded) => {
                                     log::debug!(
                                         "record: record_added_file '{}' returned: is_empty={} hunks={} content_len={}",
@@ -405,8 +491,12 @@ impl Repository {
                                         stats.files_recorded += 1;
                                         stats.hunks_created += recorded.hunk_count();
                                         stats.content_bytes += recorded.content_len() as u64;
-                                        // FileAdd creates 3 vertices: name, inode, content
-                                        stats.vertices_added += 3;
+                                        if recorded.is_undelete() {
+                                            stats.edges_modified += 1;
+                                        } else {
+                                            // FileAdd creates name, inode, and content vertices.
+                                            stats.vertices_added += 3;
+                                        }
 
                                         // Collect CRDT token-level statistics
                                         if let Some(crdt_stats) = recorded.crdt_stats() {
@@ -611,23 +701,50 @@ impl Repository {
         // NOT pre-globalize here: pre-globalization handled multi-line vertices
         // at whole-vertex granularity, which lost unchanged lines and produced
         // spurious conflicts on sequential edits.
-        use atomic_core::output::FileSystem;
         use rayon::prelude::*;
 
         enum ModifiedResult {
             // `RecordedFile` is large; box it so the enum's variants stay
             // similarly sized (clippy::large_enum_variant).
-            Recorded(String, Box<RecordedFile>),
-            Skipped(String),
+            Recorded(String, Box<RecordedFile>, Option<PreparedNameResolution>),
+            Skipped(String, Option<PreparedNameResolution>),
             Error(String, String),
         }
 
         let par_results: Vec<ModifiedResult> = modified_work
             .par_iter()
             .map(|(path, _full_path, _)| {
-                let (file_inode, file_position) = match get_inode_position(&shared_txn, path) {
-                    Ok(v) => v,
-                    Err(e) => return ModifiedResult::Error(path.clone(), e),
+                let resolution = match projected_name_conflicts.get(path) {
+                    Some(conflict) => {
+                        let working = match std::fs::read(self.root.join(path)) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                return ModifiedResult::Error(path.clone(), error.to_string())
+                            }
+                        };
+                        match prepare_name_resolution(
+                            &shared_txn,
+                            &shared_cached_txn,
+                            &self.change_store,
+                            &shared_graph_visibility,
+                            path,
+                            conflict,
+                            &working,
+                        ) {
+                            Ok(resolution) => Some(resolution),
+                            Err(error) => {
+                                return ModifiedResult::Error(path.clone(), error.to_string())
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let (file_inode, file_position) = match &resolution {
+                    Some(resolution) => (resolution.winner.inode, resolution.winner.position),
+                    None => match get_inode_position(&shared_txn, path) {
+                        Ok(value) => value,
+                        Err(error) => return ModifiedResult::Error(path.clone(), error),
+                    },
                 };
 
                 // Old content = the file as the current view sees it in the graph.
@@ -757,17 +874,29 @@ impl Repository {
                     existing_trunk_id,
                     existing_branches_slice,
                 ) {
-                    Ok(recorded) if recorded.is_empty() => ModifiedResult::Skipped(path.clone()),
-                    Ok(recorded) => ModifiedResult::Recorded(path.clone(), Box::new(recorded)),
+                    Ok(recorded) if recorded.is_empty() => {
+                        ModifiedResult::Skipped(path.clone(), resolution)
+                    }
+                    Ok(recorded) => {
+                        ModifiedResult::Recorded(path.clone(), Box::new(recorded), resolution)
+                    }
                     Err(e) => ModifiedResult::Error(path.clone(), e),
                 }
             })
             .collect();
 
-        // Merge parallel results back into sequential state
+        // Merge parallel results back into sequential state.
+        let mut name_resolution_ops = Vec::new();
+        let mut name_resolution_dependencies = std::collections::HashSet::new();
+        let mut resolved_name_conflict_inodes = std::collections::HashSet::new();
         for result in par_results {
             match result {
-                ModifiedResult::Recorded(path, recorded) => {
+                ModifiedResult::Recorded(path, recorded, resolution) => {
+                    if let Some(resolution) = resolution {
+                        name_resolution_ops.push(resolution.operation);
+                        name_resolution_dependencies.extend(resolution.dependencies);
+                        resolved_name_conflict_inodes.extend(resolution.conflict_inodes);
+                    }
                     stats.files_recorded += 1;
                     stats.hunks_created += recorded.hunk_count();
                     // Account for the graph effects of a modified file so the
@@ -789,9 +918,17 @@ impl Repository {
                     recorded_paths.push(path);
                     recorded_files.push(*recorded);
                 }
-                ModifiedResult::Skipped(path) => {
-                    skipped_paths.push(path);
-                    stats.files_skipped += 1;
+                ModifiedResult::Skipped(path, resolution) => {
+                    if let Some(resolution) = resolution {
+                        name_resolution_ops.push(resolution.operation);
+                        name_resolution_dependencies.extend(resolution.dependencies);
+                        resolved_name_conflict_inodes.extend(resolution.conflict_inodes);
+                        recorded_paths.push(path);
+                        stats.hunks_created += 1;
+                    } else {
+                        skipped_paths.push(path);
+                        stats.files_skipped += 1;
+                    }
                 }
                 ModifiedResult::Error(path, msg) => {
                     errors.push((path, msg));
@@ -810,7 +947,7 @@ impl Repository {
         }
 
         // Check if we actually recorded anything
-        if recorded_files.is_empty() {
+        if recorded_files.is_empty() && name_resolution_ops.is_empty() {
             return Err(RecordError::NothingToRecord);
         }
 
@@ -837,12 +974,31 @@ impl Repository {
         let assembly_options = options.to_assembly_options();
 
         let assemble_t0 = std::time::Instant::now();
-        let assembly_result = assemble_change(
-            &view_graph,
-            &recorded_files,
-            final_header,
-            &assembly_options,
-        )?;
+        let mut change = if recorded_files.is_empty() {
+            Change::empty(final_header)
+        } else {
+            assemble_change(
+                &view_graph,
+                &recorded_files,
+                final_header,
+                &assembly_options,
+            )?
+            .into_change()
+        };
+        for operation in name_resolution_ops {
+            change.add_hunk(operation);
+        }
+
+        change
+            .hashed
+            .dependencies
+            .extend(name_resolution_dependencies);
+        change.hashed.dependencies.sort();
+        change.hashed.dependencies.dedup();
+        if !move_evidence.is_empty() {
+            crate::record::merge_move_evidence(&mut change, &move_evidence)
+                .map_err(|error| RecordError::ChangeStore(error.to_string()))?;
+        }
         if trace_record {
             eprintln!(
                 "[record] assemble_change: {:.1}ms",
@@ -850,7 +1006,6 @@ impl Repository {
             );
         }
 
-        let change = assembly_result.into_change();
         stats.dependency_count = change.dependencies().len();
 
         let serialize_t0 = std::time::Instant::now();
@@ -992,9 +1147,12 @@ impl Repository {
                             }
                         }
 
-                        // Remove FILE_INDEX entries for deleted files so
-                        // they don't linger as stale entries.
+                        // Remove FILE_INDEX entries for deleted and moved-from
+                        // paths so stale source metadata cannot survive a rename.
                         for path_str in outcome.deleted_files() {
+                            let _ = idx_txn.del_file_index(path_str);
+                        }
+                        for path_str in &move_source_paths {
                             let _ = idx_txn.del_file_index(path_str);
                         }
 
@@ -1009,6 +1167,9 @@ impl Repository {
                                 if let Ok(Some(inode)) = idx_txn.get_inode(clean_path) {
                                     let _ = idx_txn.del_conflicts(view.id, inode.get());
                                 }
+                            }
+                            for inode in &resolved_name_conflict_inodes {
+                                let _ = idx_txn.del_conflicts(view.id, inode.get());
                             }
                         }
 
@@ -1225,6 +1386,491 @@ impl Repository {
         let options = RecordOptions::new().with_all(true);
         self.record_with_message(message, options)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_file_moves(
+    txn: &atomic_core::pristine::ReadTxn,
+    cached: &CachedGraphTxn<'_>,
+    store: &ChangeStore,
+    visibility: &GraphVisibilityClosure,
+    entries: &[FileStatusEntry],
+    present: &std::collections::HashMap<String, super::name_resolution::ProjectedPathClaim>,
+    absent: &std::collections::HashMap<String, super::deferred_tree::ProjectedAbsent>,
+    root: &Path,
+    detect_heuristic_moves: bool,
+) -> Result<FileMovePlanning, RecordError> {
+    use crate::record::{
+        AuthoritativeMove, LossNote, MoveAuthority, MoveBasis, ProbableMove, RenameCandidate,
+        PROBABLE_MOVE_THRESHOLD_BPS,
+    };
+
+    #[derive(Debug, Clone)]
+    struct Candidate {
+        old_path: String,
+        new_path: String,
+        inode: Inode,
+        score: u16,
+        basis: MoveBasis,
+    }
+
+    let load_old_content =
+        |inode: Inode, position: Position<NodeId>| -> Result<Vec<u8>, RecordError> {
+            super::content::retrieve_content_with_filter_fast_with_fork_info(
+                cached,
+                store,
+                inode,
+                position,
+                atomic_core::output::alive::RetrieveOptions::new()
+                    .with_graph_visibility(visibility.clone()),
+            )
+            .map(|(content, _)| content)
+            .map_err(|error| RecordError::Database(error.to_string()))
+        };
+    let make_plan = |old_path: &str,
+                     new_path: &str,
+                     inode: Inode|
+     -> Result<FileMovePlan, RecordError> {
+        let source = present.get(old_path).ok_or_else(|| {
+            RecordError::Database(format!(
+                "FileMove source '{}' is not one uncontested visible path claim",
+                old_path
+            ))
+        })?;
+        let inode_position = txn
+            .inode_position(inode)
+            .map_err(|error| RecordError::Database(error.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!(
+                    "FileMove inode {} has no graph position",
+                    inode.get()
+                ))
+            })?;
+        if source.inode != inode || source.position != inode_position {
+            return Err(RecordError::Database(format!(
+                "FileMove source '{}' does not match stable inode {}",
+                old_path,
+                inode.get()
+            )));
+        }
+        if source.claims.len() != 1 {
+            return Err(RecordError::Database(format!(
+                "FileMove source '{}' has {} causally maximal structural claims; refusing ambiguity",
+                old_path,
+                source.claims.len()
+            )));
+        }
+        Ok(FileMovePlan {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+            inode,
+            claimant: source.position,
+            source: source.claims[0],
+            old_content: load_old_content(inode, source.position)?,
+        })
+    };
+
+    let entries_by_path: std::collections::BTreeMap<String, &FileStatusEntry> = entries
+        .iter()
+        .map(|entry| (entry.path().to_string_lossy().to_string(), entry))
+        .collect();
+    let mut planning = FileMovePlanning::default();
+    let mut used_old = std::collections::BTreeSet::new();
+    let mut used_new = std::collections::BTreeSet::new();
+
+    // `atomic mv` stages the original inode at its destination in TREE. Compare
+    // that explicit stable-inode relationship with graph-backed visible claims;
+    // content is deliberately irrelevant, so a complete rewrite still moves.
+    let mut visible_paths: Vec<_> = present.keys().cloned().collect();
+    visible_paths.sort();
+    for old_path in visible_paths {
+        let source = &present[&old_path];
+        let current_path = txn
+            .get_path(source.inode)
+            .map_err(|error| RecordError::Database(error.to_string()))?;
+        let Some(new_path) = current_path else {
+            continue;
+        };
+        if new_path == old_path
+            || present.contains_key(&new_path)
+            || root.join(&old_path).is_file()
+            || !root.join(&new_path).is_file()
+            || !entries_by_path
+                .get(&new_path)
+                .is_some_and(|entry| entry.status() == FileStatus::Added)
+        {
+            continue;
+        }
+        planning
+            .moves
+            .push(make_plan(&old_path, &new_path, source.inode)?);
+        planning
+            .evidence
+            .insert_authoritative(AuthoritativeMove::new(
+                &old_path,
+                &new_path,
+                source.inode,
+                MoveAuthority::StableInodeProjection,
+            ));
+        used_old.insert(old_path);
+        used_new.insert(new_path);
+    }
+
+    let mut deleted: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.status() == FileStatus::Deleted && entry.details() != Some("directory")
+        })
+        .collect();
+    deleted.sort_by(|left, right| left.path().cmp(right.path()));
+
+    // Historical same-inode paths are candidates, not authority. Even when
+    // heuristic detection is disabled, a simultaneous deletion and recreation
+    // at such a path must be a fresh add rather than an implicit undelete.
+    let deleted_inodes: std::collections::BTreeSet<Inode> = deleted
+        .iter()
+        .filter_map(|entry| present.get(entry.path().to_string_lossy().as_ref()))
+        .map(|source| source.inode)
+        .collect();
+    let historical_destinations: std::collections::BTreeSet<String> = entries
+        .iter()
+        .filter(|entry| entry.status() == FileStatus::Added && entry.details() != Some("directory"))
+        .filter_map(|entry| {
+            let path = entry.path().to_string_lossy().to_string();
+            absent
+                .get(&path)
+                .filter(|projected| deleted_inodes.contains(&projected.inode))
+                .map(|_| path)
+        })
+        .collect();
+
+    if !detect_heuristic_moves {
+        planning
+            .fresh_additions
+            .extend(historical_destinations.difference(&used_new).cloned());
+        planning
+            .moves
+            .sort_by(|left, right| left.old_path.cmp(&right.old_path));
+        return Ok(planning);
+    }
+
+    // With detection enabled, only content evidence can justify a
+    // `ProbableMove`. This prevents unrelated bytes recreated at an old path
+    // from inheriting the current inode.
+    let mut destinations: Vec<(String, Vec<u8>, Option<Inode>)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let path = entry.path().to_string_lossy().to_string();
+            let expected_inode = match entry.status() {
+                FileStatus::Untracked => None,
+                FileStatus::Added if historical_destinations.contains(&path) => {
+                    Some(absent.get(&path)?.inode)
+                }
+                _ => return None,
+            };
+            if used_new.contains(&path) || !root.join(&path).is_file() {
+                return None;
+            }
+            std::fs::read(root.join(&path))
+                .ok()
+                .map(|bytes| (path, bytes, expected_inode))
+        })
+        .collect();
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut candidates = Vec::new();
+    for entry in deleted {
+        let old_path = entry.path().to_string_lossy().to_string();
+        if used_old.contains(&old_path) {
+            continue;
+        }
+        let Some(source) = present.get(&old_path) else {
+            continue;
+        };
+        let old_content = load_old_content(source.inode, source.position)?;
+        for (new_path, new_content, expected_inode) in &destinations {
+            if expected_inode.is_some_and(|inode| inode != source.inode) {
+                continue;
+            }
+            let (score, basis) = move_similarity(&old_content, new_content);
+            if score >= PROBABLE_MOVE_THRESHOLD_BPS {
+                candidates.push(Candidate {
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                    inode: source.inode,
+                    score,
+                    basis,
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        (&left.old_path, &left.new_path).cmp(&(&right.old_path, &right.new_path))
+    });
+
+    let mut source_degree = std::collections::HashMap::<String, usize>::new();
+    let mut destination_degree = std::collections::HashMap::<String, usize>::new();
+    for candidate in &candidates {
+        *source_degree.entry(candidate.old_path.clone()).or_default() += 1;
+        *destination_degree
+            .entry(candidate.new_path.clone())
+            .or_default() += 1;
+    }
+
+    let mut unresolved = Vec::new();
+    for candidate in candidates {
+        let unique =
+            source_degree[&candidate.old_path] == 1 && destination_degree[&candidate.new_path] == 1;
+        if unique {
+            planning.moves.push(make_plan(
+                &candidate.old_path,
+                &candidate.new_path,
+                candidate.inode,
+            )?);
+            planning.evidence.insert_probable(ProbableMove::new(
+                &candidate.old_path,
+                &candidate.new_path,
+                candidate.inode,
+                candidate.score,
+                candidate.basis,
+            ));
+            used_old.insert(candidate.old_path);
+            used_new.insert(candidate.new_path);
+        } else {
+            planning
+                .unresolved_destinations
+                .insert(candidate.new_path.clone());
+            unresolved.push(RenameCandidate::new(
+                candidate.old_path,
+                candidate.new_path,
+                candidate.score,
+                candidate.basis,
+            ));
+        }
+    }
+    if !unresolved.is_empty() {
+        planning
+            .evidence
+            .insert_loss(LossNote::rename_unresolved(unresolved));
+    }
+    planning
+        .fresh_additions
+        .extend(historical_destinations.difference(&used_new).cloned());
+    planning
+        .moves
+        .sort_by(|left, right| left.old_path.cmp(&right.old_path));
+    Ok(planning)
+}
+
+fn move_similarity(old: &[u8], new: &[u8]) -> (u16, crate::record::MoveBasis) {
+    use crate::record::MoveBasis;
+
+    if old == new {
+        return (10_000, MoveBasis::ByteIdentity);
+    }
+    if old.len() < 2 || new.len() < 2 {
+        return (0, MoveBasis::ContentSimilarity);
+    }
+
+    // Sørensen-Dice similarity over byte-bigram multisets is deterministic,
+    // encoding-agnostic, and remains stable across small insertions without the
+    // quadratic cost of pairwise edit distance.
+    let mut old_counts = vec![0_u32; 1 << 16];
+    let mut new_counts = vec![0_u32; 1 << 16];
+    for pair in old.windows(2) {
+        old_counts[(usize::from(pair[0]) << 8) | usize::from(pair[1])] += 1;
+    }
+    for pair in new.windows(2) {
+        new_counts[(usize::from(pair[0]) << 8) | usize::from(pair[1])] += 1;
+    }
+    let intersection: u64 = old_counts
+        .iter()
+        .zip(&new_counts)
+        .map(|(left, right)| u64::from((*left).min(*right)))
+        .sum();
+    let total = (old.len() - 1 + new.len() - 1) as u64;
+    let score = ((2 * intersection * 10_000) / total).min(10_000) as u16;
+    (score, MoveBasis::ContentSimilarity)
+}
+
+fn prepare_name_resolution(
+    txn: &atomic_core::pristine::ReadTxn,
+    cached: &CachedGraphTxn<'_>,
+    store: &ChangeStore,
+    visibility: &GraphVisibilityClosure,
+    path: &str,
+    conflict: &super::name_resolution::ProjectedNameConflict,
+    working: &[u8],
+) -> Result<PreparedNameResolution, RecordError> {
+    use atomic_core::record::workflow::globalize::{
+        globalize_solve_name_conflict, GlobalizeContext, NameConflictClaim,
+    };
+
+    if conflict.is_rename_conflict() {
+        return Err(RecordError::Database(format!(
+            "rename conflict at '{}' must be resolved by recording a surviving path, not by choosing file content",
+            path
+        )));
+    }
+    let sides = conflict.sides_at_path(path);
+    if sides.len() < 2 || sides.iter().any(|side| side.is_directory()) {
+        return Err(RecordError::Database(format!(
+            "name conflict at '{}' cannot infer a unique file claimant",
+            path
+        )));
+    }
+
+    let mut external_hashes = std::collections::HashMap::new();
+    for change_id in visibility.iter_dependency_first().copied() {
+        if change_id.is_root() {
+            continue;
+        }
+        let hash = txn
+            .get_external(change_id)
+            .map_err(|error| RecordError::Database(error.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!(
+                    "visible change {} has no external hash",
+                    change_id.get()
+                ))
+            })?;
+        external_hashes.insert(change_id, hash);
+    }
+    let inode_graph_table = txn
+        .open_inode_graph_table()
+        .map_err(|error| RecordError::Database(error.to_string()))?;
+    let mut matching = Vec::new();
+    for side in &sides {
+        let content = super::materialize::render_name_conflict_side(
+            txn,
+            store,
+            &inode_graph_table,
+            visibility,
+            &external_hashes,
+            path,
+            side.inode,
+            side.position,
+        )
+        .map_err(RecordError::Database)?;
+
+        if content == working {
+            matching.push((*side).clone());
+        }
+    }
+    if matching.len() != 1 {
+        return Err(RecordError::Database(format!(
+            "resolved name conflict at '{}' matches {} claimants; leave exactly one side byte-for-byte before recording",
+            path,
+            matching.len()
+        )));
+    }
+    let winner = matching.remove(0);
+    let losing_claims: Vec<_> = sides
+        .iter()
+        .filter(|side| side.inode != winner.inode)
+        .flat_map(|side| {
+            side.claims.iter().map(|claim| {
+                NameConflictClaim::new(side.position, claim.parent, claim.name, claim.introduced_by)
+            })
+        })
+        .collect();
+    if losing_claims.is_empty() {
+        return Err(RecordError::Database(format!(
+            "name conflict at '{}' has no losing structural claims",
+            path
+        )));
+    }
+
+    let view_graph = ViewGraph::new(cached, visibility.clone());
+    let mut context = GlobalizeContext::new(&view_graph);
+    let operation =
+        globalize_solve_name_conflict(&mut context, path, winner.position, losing_claims)?;
+    let mut conflict_inodes: Vec<_> = conflict.sides.iter().map(|side| side.inode).collect();
+    conflict_inodes.sort_by_key(|inode| inode.get());
+    conflict_inodes.dedup();
+    Ok(PreparedNameResolution {
+        winner,
+        operation,
+        dependencies: context.dependencies_sorted(),
+        conflict_inodes,
+    })
+}
+
+fn visibility_before_deletions(
+    txn: &atomic_core::pristine::ReadTxn,
+    deletions: &[Hash],
+) -> Result<GraphVisibilityClosure, RecordError> {
+    if deletions.is_empty() {
+        return Err(RecordError::Database(
+            "undelete has no causally maximal deletion".to_string(),
+        ));
+    }
+
+    let mut membership = Vec::new();
+    for deletion in deletions {
+        let deletion_id = txn
+            .get_internal(deletion)
+            .map_err(|error| RecordError::Database(error.to_string()))?
+            .ok_or_else(|| {
+                RecordError::Database(format!("undelete references unknown deletion {}", deletion))
+            })?;
+        for dependency in txn
+            .get_indexed_change_deps(deletion_id)
+            .map_err(|error| RecordError::Database(error.to_string()))?
+        {
+            let dependency_id = txn
+                .get_internal(&dependency)
+                .map_err(|error| RecordError::Database(error.to_string()))?
+                .ok_or_else(|| {
+                    RecordError::Database(format!(
+                        "deletion {} has unregistered dependency {}",
+                        deletion, dependency
+                    ))
+                })?;
+            membership.push(dependency_id);
+        }
+    }
+    let membership = ViewMembershipSet::from_ordered(membership);
+    GraphVisibilityClosure::try_from_membership(txn, &membership)
+        .map_err(|error| RecordError::Database(error.to_string()))
+}
+
+fn existing_crdt_identity(
+    txn: &atomic_core::pristine::ReadTxn,
+    inode: Inode,
+    visibility: &GraphVisibilityClosure,
+) -> Result<(atomic_core::crdt::TrunkId, Vec<atomic_core::crdt::BranchId>), RecordError> {
+    use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+    use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+    use atomic_core::pristine::CrdtTxnT;
+
+    let trunk_key = txn
+        .get_crdt_inode_trunk(inode.get())
+        .map_err(|error| RecordError::Database(error.to_string()))?
+        .ok_or_else(|| {
+            RecordError::Database(format!(
+                "inode {} has no CRDT trunk identity required for identity-preserving lifecycle recording",
+                inode.get()
+            ))
+        })?;
+    let trunk = decode_trunk_id(&trunk_key);
+    let mut branches = Vec::new();
+    for branch in iter_trunk_branches_in_file_order(txn, trunk)
+        .map_err(|error| RecordError::Database(error.to_string()))?
+    {
+        if !visibility.contains(branch.change_id()) {
+            continue;
+        }
+        let key = encode_branch_id(&branch);
+        if txn
+            .get_crdt_branch(&key)
+            .map_err(|error| RecordError::Database(error.to_string()))?
+            .is_some_and(|data| data.state.is_alive())
+        {
+            branches.push(branch);
+        }
+    }
+    Ok((trunk, branches))
 }
 
 /// Look up inode + position for a path using a shared read transaction.

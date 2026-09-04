@@ -523,7 +523,13 @@ impl Push {
         })?;
         let current = head.shorthand().unwrap_or("HEAD");
         let target = override_branch.unwrap_or(current);
-        let refspec = format!("HEAD:refs/heads/{}", target);
+        let destination = format!("refs/heads/{}", target);
+        if !super::is_publishable_git_ref(destination.as_bytes()) {
+            return Err(CliError::GitError {
+                message: format!("refusing to publish local recovery ref '{destination}'"),
+            });
+        }
+        let refspec = format!("HEAD:{destination}");
 
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),

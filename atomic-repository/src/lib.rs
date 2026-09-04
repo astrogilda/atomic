@@ -224,8 +224,10 @@ pub use remote::{RemoteConfig, RemoteEntry, RemoteError, RemoteResult};
 
 // Record exports
 pub use record::{
-    build_header, filter_files, RecordError, RecordOptions, RecordOutcome, RecordResult,
-    RecordStats,
+    build_header, extract_move_evidence, filter_files, merge_move_evidence, AuthoritativeMove,
+    LossNote, MoveAuthority, MoveBasis, MoveEvidence, MoveEvidenceError, ProbableMove, RecordError,
+    RecordOptions, RecordOutcome, RecordResult, RecordStats, RenameCandidate,
+    MOVE_EVIDENCE_UNHASHED_KEY, MOVE_EVIDENCE_VERSION, PROBABLE_MOVE_THRESHOLD_BPS,
 };
 
 // Archive exports

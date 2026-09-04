@@ -1,30 +1,27 @@
 //! Minimal experimental bridge between a clean Git checkout and an Atomic view.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::Path;
-
-use clap::{Parser, Subcommand};
-use git2::{
-    ObjectType, Oid, Repository as GitRepository, Status, StatusOptions as GitStatusOptions,
-};
-use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 use atomic_repository::{
     graph_visibility_closure, InsertOptions, Repository, RepositoryError, StatusOptions,
 };
-
-use super::observation::{
-    observe_head, BridgeCheckpointObservation, HeadObservation, ObservationError,
+use clap::{Parser, Subcommand};
+use git2::{
+    ObjectType, Oid, Repository as GitRepository, Status, StatusOptions as GitStatusOptions,
 };
-use super::Import;
+
+use super::checkpoint::{self, BridgeCheckpoint, VerifiedCheckpointInput};
+use super::observation::{
+    observe_git, observe_head, BridgeCheckpointObservation, GitObservation, HeadObservation,
+    ObservationError,
+};
+use super::{hooks, Import};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::print_success;
-
-const BRIDGE_METADATA_VERSION: u32 = 1;
 
 /// Reconcile and verify a clean, attached Git checkout against Atomic.
 #[derive(Parser, Debug, Default)]
@@ -43,33 +40,56 @@ pub enum BridgeCommand {
     Verify,
     /// Switch Git and Atomic together to an existing view.
     Switch { view: String },
+    /// Enable the advisory Git checkout event bridge.
+    Enable,
+    /// Internal callback used only by the Atomic-owned post-checkout dispatcher.
+    #[command(hide = true)]
+    HookPostCheckout {
+        old_head: String,
+        new_head: String,
+        checkout_flag: String,
+    },
+    /// Internal worker for one immutable deferred-observation request.
+    #[command(hide = true)]
+    ObserveDeferred {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
 }
 
 impl Command for Bridge {
     fn run(&self) -> CliResult<()> {
-        match self.command {
+        match &self.command {
             BridgeCommand::Reconcile => reconcile(),
             BridgeCommand::Verify => {
                 verify()?;
                 print_success("Git HEAD matches the current Atomic view");
                 Ok(())
             }
-            BridgeCommand::Switch { ref view } => switch(view),
+            BridgeCommand::Switch { view } => switch(view),
+            BridgeCommand::Enable => {
+                let root = find_repository_root()?;
+                hooks::enable_bridge(&root)
+            }
+            BridgeCommand::HookPostCheckout {
+                old_head,
+                new_head,
+                checkout_flag,
+            } => {
+                let root = find_repository_root()?;
+                hooks::record_post_checkout(&root, old_head, new_head, checkout_flag)
+            }
+            BridgeCommand::ObserveDeferred { root, request } => {
+                hooks::run_deferred_observation(root, request)
+            }
         }
     }
 }
 
 #[derive(Debug)]
 struct BridgeSnapshot {
-    view: String,
-    atomic_state: String,
-    git_head: String,
-    git_tree: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct WorkspaceMetadata {
-    version: u32,
     view: String,
     atomic_state: String,
     git_head: String,
@@ -316,7 +336,7 @@ fn plan_switch_collisions(
     Ok(())
 }
 
-fn checkpoint_matches_snapshot(checkpoint: &WorkspaceMetadata, snapshot: &BridgeSnapshot) -> bool {
+fn checkpoint_matches_snapshot(checkpoint: &BridgeCheckpoint, snapshot: &BridgeSnapshot) -> bool {
     checkpoint.view == snapshot.view
         && checkpoint.atomic_state == snapshot.atomic_state
         && checkpoint.git_head == snapshot.git_head
@@ -467,6 +487,7 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
         branch: Some(view.clone()),
         no_vault: true,
         with_crdt: false,
+        skip_checkpoint_refresh: true,
         ..Import::default()
     }
     .run()?;
@@ -484,6 +505,45 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
     write_workspace_metadata(root, &snapshot)?;
     print_success("Reconciled Git HEAD with the current Atomic view");
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointRefresh {
+    Refreshed,
+    SkippedNoGit,
+    SkippedUnsupportedHead,
+    SkippedViewMismatch,
+}
+
+/// Refresh the local v2 checkpoint only when the existing bridge verifier can
+/// prove that Git and the persisted Atomic working-copy view are fully aligned.
+///
+/// No-Git repositories and intentional branch/view mismatches are no-ops. The
+/// latter is required by bridge incremental raw-switch adoption: `Import::run`
+/// preserves the old Atomic pointer until `import_git_to_atomic` aligns it.
+pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<CheckpointRefresh> {
+    let observation = observe_git(root).map_err(observation_error)?;
+    let GitObservation::Repository(git) = observation else {
+        return Ok(CheckpointRefresh::SkippedNoGit);
+    };
+    let HeadObservation::Attached { symref, .. } = &git.head else {
+        return Ok(CheckpointRefresh::SkippedUnsupportedHead);
+    };
+    let Some(branch) = symref.strip_prefix("refs/heads/") else {
+        return Ok(CheckpointRefresh::SkippedUnsupportedHead);
+    };
+
+    let current_view = {
+        let repo = Repository::open(root).map_err(CliError::from)?;
+        repo.current_view().to_string()
+    };
+    if branch != current_view {
+        return Ok(CheckpointRefresh::SkippedViewMismatch);
+    }
+
+    let snapshot = verify_at(root)?;
+    write_workspace_metadata(root, &snapshot)?;
+    Ok(CheckpointRefresh::Refreshed)
 }
 
 fn verify() -> CliResult<BridgeSnapshot> {
@@ -554,31 +614,8 @@ pub(crate) fn read_checkpoint_observation(
     })
 }
 
-fn read_workspace_metadata(root: &Path) -> CliResult<Option<WorkspaceMetadata>> {
-    let path = root.join(".atomic/bridge/workspace.json");
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(git_error(format!(
-                "cannot read bridge checkpoint '{}': {error}",
-                path.display()
-            )))
-        }
-    };
-    let metadata: WorkspaceMetadata = serde_json::from_slice(&bytes).map_err(|error| {
-        git_error(format!(
-            "bridge checkpoint '{}' is malformed: {error}",
-            path.display()
-        ))
-    })?;
-    if metadata.version != BRIDGE_METADATA_VERSION {
-        return Err(git_error(format!(
-            "unsupported bridge checkpoint version {}",
-            metadata.version
-        )));
-    }
-    Ok(Some(metadata))
+fn read_workspace_metadata(root: &Path) -> CliResult<Option<BridgeCheckpoint>> {
+    checkpoint::read_checkpoint(root).map_err(checkpoint_error)
 }
 
 fn open_git(root: &Path) -> CliResult<GitRepository> {
@@ -992,37 +1029,21 @@ fn format_paths<T: AsRef<str>>(paths: &[&T]) -> String {
 }
 
 fn write_workspace_metadata(root: &Path, snapshot: &BridgeSnapshot) -> CliResult<()> {
-    let directory = root.join(".atomic/bridge");
-    fs::create_dir_all(&directory)
-        .map_err(|error| git_error(format!("cannot create bridge metadata directory: {error}")))?;
-    let destination = directory.join("workspace.json");
-    let temporary = directory.join(format!(".workspace.json.{}.tmp", std::process::id()));
-    let metadata = WorkspaceMetadata {
-        version: BRIDGE_METADATA_VERSION,
-        view: snapshot.view.clone(),
-        atomic_state: snapshot.atomic_state.clone(),
-        git_head: snapshot.git_head.clone(),
-        git_tree: snapshot.git_tree.clone(),
-    };
-    let bytes = serde_json::to_vec_pretty(&metadata)
-        .map_err(|error| git_error(format!("cannot encode bridge metadata: {error}")))?;
+    checkpoint::write_verified_checkpoint(
+        root,
+        VerifiedCheckpointInput {
+            view: &snapshot.view,
+            atomic_state: &snapshot.atomic_state,
+            git_head: &snapshot.git_head,
+            git_tree: &snapshot.git_tree,
+        },
+    )
+    .map(|_| ())
+    .map_err(checkpoint_error)
+}
 
-    let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, &destination)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(git_error(format!("cannot write bridge metadata: {error}")));
-    }
-    Ok(())
+fn checkpoint_error(error: checkpoint::CheckpointError) -> CliError {
+    git_error(error.to_string())
 }
 
 fn observation_error(error: ObservationError) -> CliError {
@@ -1038,6 +1059,7 @@ fn git_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::Signature;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1076,6 +1098,37 @@ mod tests {
             .iter()
             .map(|(path, content)| ((*path).to_string(), content.to_vec()))
             .collect()
+    }
+
+    fn init_git_with_commit(root: &Path, branch: &str) {
+        let repository = GitRepository::init(root).unwrap();
+        repository
+            .set_head(&format!("refs/heads/{branch}"))
+            .unwrap();
+        fs::write(root.join("tracked.txt"), b"tracked\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Atomic Test", "atomic@example.com").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_refresh_skips_intentional_import_view_mismatch() {
+        let root = TestDirectory::new();
+        let repo = Repository::init_with_view(&root.0, "main").unwrap();
+        drop(repo);
+        init_git_with_commit(&root.0, "topic");
+
+        assert_eq!(
+            refresh_checkpoint_if_aligned(&root.0).unwrap(),
+            CheckpointRefresh::SkippedViewMismatch
+        );
+        assert!(!checkpoint::checkpoint_path(&root.0).exists());
     }
 
     #[test]
@@ -1120,13 +1173,7 @@ mod tests {
 
     #[test]
     fn checkpoint_match_requires_every_recorded_head() {
-        let checkpoint = WorkspaceMetadata {
-            version: BRIDGE_METADATA_VERSION,
-            view: "main".to_string(),
-            atomic_state: "atomic-1".to_string(),
-            git_head: "git-1".to_string(),
-            git_tree: "tree-1".to_string(),
-        };
+        let checkpoint = BridgeCheckpoint::legacy_compatible("main", "atomic-1", "git-1", "tree-1");
         let mut snapshot = BridgeSnapshot {
             view: "main".to_string(),
             atomic_state: "atomic-1".to_string(),

@@ -22,10 +22,14 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Builder, Database, ReadTransaction, ReadableTable};
+use redb::{Builder, Database, ReadTransaction, ReadableMultimapTable, ReadableTable};
 
 use crate::pristine::error::{PristineError, PristineResult};
+use crate::pristine::path_claim::{
+    path_claim_schema_error, PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
+};
 use crate::pristine::tables::*;
+use crate::pristine::traits::PathClaimTxnT;
 
 use super::helpers::deserialize_view_state;
 use super::read::ReadTxn;
@@ -36,11 +40,36 @@ fn next_id(max_id: u64) -> PristineResult<u64> {
     max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
 }
 
+fn require_path_claim_schema(db: &Database) -> PristineResult<()> {
+    let read_txn = db.begin_read()?;
+    let metadata = match read_txn.open_table(PRISTINE_META) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(path_claim_schema_error(None));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let version_guard = metadata.get(PATH_CLAIM_SCHEMA_KEY)?;
+    let version = version_guard.map(|version| version.value());
+    if version != Some(PATH_CLAIM_SCHEMA_VERSION) {
+        return Err(path_claim_schema_error(version));
+    }
+    match read_txn.open_multimap_table(PATH_CLAIMS) {
+        Ok(_) => Ok(()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Err(path_claim_schema_error(version)),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
     let mut max_id = 0u64;
 
     for result in read_txn.open_table(INODES)?.iter()? {
         let (inode, _) = result?;
+        max_id = max_id.max(inode.value());
+    }
+    for result in read_txn.open_table(REV_INODES)?.iter()? {
+        let (_, inode) = result?;
         max_id = max_id.max(inode.value());
     }
     for result in read_txn.open_table(TREE)?.iter()? {
@@ -55,8 +84,18 @@ fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
         let (inode, _) = result?;
         max_id = max_id.max(inode.value());
     }
+    for result in read_txn.open_table(CONFLICTS)?.iter()? {
+        let (key, _) = result?;
+        let (_, inode) = decode_view_seq(key.value());
+        max_id = max_id.max(inode);
+    }
+    for result in read_txn.open_multimap_table(INODE_GRAPH)?.iter()? {
+        let (key, _values) = result?;
+        let (inode, _, _, _) = decode_inode_vertex(key.value());
+        max_id = max_id.max(inode);
+    }
 
-    next_id(max_id)
+    Ok(max_id.saturating_add(1).max(1))
 }
 
 /// The pristine database handle
@@ -93,6 +132,8 @@ impl Pristine {
     ///
     /// This will create all necessary tables if they don't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        let path = path.as_ref();
+        let is_new_database = !path.exists();
         // Use 8 GB cache for machines with plenty of RAM.  The default
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
@@ -118,11 +159,17 @@ impl Pristine {
             write_txn.open_table(CONFLICTS)?;
 
             // Tree tables
+            write_txn.open_table(PRISTINE_META)?;
+            write_txn.open_multimap_table(PATH_CLAIMS)?;
             write_txn.open_table(TREE)?;
             write_txn.open_table(REV_TREE)?;
             write_txn.open_table(INODES)?;
             write_txn.open_table(REV_INODES)?;
             write_txn.open_table(DIRECTORIES)?;
+            if is_new_database {
+                let mut metadata = write_txn.open_table(PRISTINE_META)?;
+                metadata.insert(PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION)?;
+            }
 
             // File index cache (mtime + size + content hash for fast status detection)
             write_txn.open_table(FILE_INDEX)?;
@@ -158,41 +205,11 @@ impl Pristine {
         }
         write_txn.commit()?;
 
-        // Determine the next available IDs by scanning existing data.
-        // Errors are propagated (not silently skipped) so that open()
-        // fails fast on corrupted data rather than underestimating the
-        // max ID and reusing an already-allocated slot.
-        let read_txn = db.begin_read()?;
-
-        let next_node_id = {
-            let table = read_txn.open_table(EXTERNAL)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (k, _) = result?;
-                max_id = max_id.max(k.value());
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
-
-        let next_view_id = {
-            let table = read_txn.open_table(VIEWS)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (_, value) = result?;
-                let state = deserialize_view_state(value.value())?;
-                max_id = max_id.max(state.id);
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
-
-        let next_inode = AtomicU64::new(next_inode_id(&read_txn)?);
-
-        Ok(Self {
-            db,
-            next_node_id,
-            next_view_id,
-            next_inode,
-        })
+        // Existing repositories intentionally remain unmarked until their
+        // repository-level change files have been replayed into PATH_CLAIMS.
+        // `open` returns a writable handle so that backfill can happen in one
+        // transaction; read-only/open-existing modes reject the incomplete schema.
+        Self::scan_ids(db, false)
     }
 
     /// Open an existing pristine database without the table-init write lock.
@@ -213,9 +230,16 @@ impl Pristine {
     /// Returns an error if the database file doesn't exist, is corrupted,
     /// or the ID-scan read transaction fails.
     pub fn open_existing<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
-        Self::scan_ids(db)
+        Self::open_existing_with_schema_check(path, true)
+    }
+
+    /// Open an existing database for repair without initializing tables or
+    /// requiring a completed PATH_CLAIMS schema.
+    ///
+    /// Opening performs no writes. The returned handle permits a later explicit
+    /// repair write transaction.
+    pub fn open_existing_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        Self::open_existing_with_schema_check(path, false)
     }
 
     /// Open an existing pristine database in read-only mode
@@ -239,11 +263,24 @@ impl Pristine {
     /// // Read operations...
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        // Open database without creating (read-only mode)
-        // Use the same 8 GiB cache as open() for consistent performance.
+        Self::open_existing_with_schema_check(path, true)
+    }
+
+    /// Open an existing database for read-only repair inspection without
+    /// initializing tables or requiring a completed PATH_CLAIMS schema.
+    ///
+    /// This method performs no writes.
+    pub fn open_readonly_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        Self::open_existing_with_schema_check(path, false)
+    }
+
+    fn open_existing_with_schema_check<P: AsRef<Path>>(
+        path: P,
+        require_complete_path_claims: bool,
+    ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
-        Self::scan_ids(db)
+        Self::scan_ids(db, require_complete_path_claims)
     }
 
     /// Scan existing tables for the next available IDs.
@@ -251,7 +288,10 @@ impl Pristine {
     /// Shared implementation for `open_existing` and `open_readonly` — both
     /// skip the table-init write transaction and only need a read pass to
     /// discover the max allocated node, view, and inode IDs.
-    fn scan_ids(db: Database) -> PristineResult<Self> {
+    fn scan_ids(db: Database, require_complete_path_claims: bool) -> PristineResult<Self> {
+        if require_complete_path_claims {
+            require_path_claim_schema(&db)?;
+        }
         let read_txn = db.begin_read()?;
 
         let next_node_id = {
@@ -285,6 +325,22 @@ impl Pristine {
         })
     }
 
+    /// Return the completed path-claim schema version, if any.
+    pub fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
+        self.read_txn()?.path_claim_schema_version()
+    }
+
+    /// Whether repository-level path-claim backfill is still required.
+    pub fn path_claim_migration_required(&self) -> PristineResult<bool> {
+        match self.path_claim_schema_version()? {
+            Some(PATH_CLAIM_SCHEMA_VERSION) => Ok(false),
+            Some(version) if version > PATH_CLAIM_SCHEMA_VERSION => {
+                Err(path_claim_schema_error(Some(version)))
+            }
+            _ => Ok(true),
+        }
+    }
+
     /// Begin a read-only transaction
     ///
     /// Read transactions can run concurrently with other read transactions
@@ -300,8 +356,23 @@ impl Pristine {
     /// must be explicitly committed with `commit()` or it will be rolled back
     /// when dropped.
     pub fn write_txn(&self) -> PristineResult<WriteTxn<'_>> {
+        self.write_txn_with_durability(redb::Durability::Eventual)
+    }
+
+    /// Begin a repair write transaction with immediate durability.
+    ///
+    /// Immediate durability fsyncs the commit before returning, which is
+    /// appropriate for destructive derived-index replacement.
+    pub fn write_txn_immediate(&self) -> PristineResult<WriteTxn<'_>> {
+        self.write_txn_with_durability(redb::Durability::Immediate)
+    }
+
+    fn write_txn_with_durability(
+        &self,
+        durability: redb::Durability,
+    ) -> PristineResult<WriteTxn<'_>> {
         let mut txn = self.db.begin_write()?;
-        txn.set_durability(redb::Durability::Eventual);
+        txn.set_durability(durability);
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
@@ -326,7 +397,10 @@ impl Pristine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::{MutTxnT, TreeTxnT};
+    use crate::pristine::{
+        MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, PathClaimMutTxnT,
+        PathClaimTxnT, TreeTxnT, PATH_CLAIM_SCHEMA_VERSION,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -334,6 +408,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
         let pristine = Pristine::open(&db_path).unwrap();
+
+        assert_eq!(
+            pristine.path_claim_schema_version().unwrap(),
+            Some(PATH_CLAIM_SCHEMA_VERSION)
+        );
+        assert!(!pristine.path_claim_migration_required().unwrap());
 
         // Should be able to create transactions
         let _read = pristine.read_txn().unwrap();
@@ -384,6 +464,122 @@ mod tests {
         let mut txn = reopened.write_txn().unwrap();
         assert_eq!(txn.alloc_inode().unwrap().get(), 2);
         txn.abort().unwrap();
+    }
+
+    #[test]
+    fn incomplete_path_claim_schema_requires_writable_migration() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+
+        {
+            let pristine = Pristine::open(&db_path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            txn.reset_path_claim_migration().unwrap();
+            txn.commit().unwrap();
+        }
+
+        let repair_readonly = Pristine::open_readonly_for_repair(&db_path).unwrap();
+        assert_eq!(repair_readonly.path_claim_schema_version().unwrap(), None);
+        drop(repair_readonly);
+
+        let repair_existing = Pristine::open_existing_for_repair(&db_path).unwrap();
+        assert_eq!(repair_existing.path_claim_schema_version().unwrap(), None);
+        drop(repair_existing);
+
+        let readonly_error = match Pristine::open_readonly(&db_path) {
+            Ok(_) => panic!("read-only open must reject an incomplete claim schema"),
+            Err(error) => error,
+        };
+        assert!(readonly_error
+            .to_string()
+            .contains("PATH_CLAIMS migration required"));
+
+        let existing_error = match Pristine::open_existing(&db_path) {
+            Ok(_) => panic!("open-existing must reject an incomplete claim schema"),
+            Err(error) => error,
+        };
+        assert!(existing_error
+            .to_string()
+            .contains("PATH_CLAIMS migration required"));
+
+        {
+            let pristine = Pristine::open(&db_path).unwrap();
+            assert!(pristine.path_claim_migration_required().unwrap());
+            let mut txn = pristine.write_txn().unwrap();
+            txn.complete_path_claim_migration().unwrap();
+            txn.commit().unwrap();
+        }
+
+        let readonly = Pristine::open_readonly(&db_path).unwrap();
+        assert!(readonly
+            .read_txn()
+            .unwrap()
+            .path_claim_schema_is_complete()
+            .unwrap());
+    }
+
+    #[test]
+    fn poisoned_inode_maxima_open_repair_reset_and_allocate_without_wrapping() {
+        for poisoned_inode in [u64::MAX - 1, u64::MAX] {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("pristine");
+            {
+                let pristine = Pristine::open(&db_path).unwrap();
+                let txn = pristine.write_txn().unwrap();
+                {
+                    let mut tree = txn.txn.open_table(TREE).unwrap();
+                    tree.insert("poisoned.txt", poisoned_inode).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+
+            {
+                let pristine = Pristine::open_existing(&db_path).unwrap();
+                let mut txn = pristine.write_txn().unwrap();
+                assert!(matches!(
+                    txn.alloc_inode(),
+                    Err(PristineError::IdSpaceExhausted)
+                ));
+                txn.abort().unwrap();
+            }
+            {
+                let pristine = Pristine::open_readonly(&db_path).unwrap();
+                assert_eq!(
+                    pristine
+                        .read_txn()
+                        .unwrap()
+                        .get_inode("poisoned.txt")
+                        .unwrap(),
+                    Some(crate::types::Inode::new(poisoned_inode))
+                );
+            }
+
+            {
+                let pristine = Pristine::open_existing_for_repair(&db_path).unwrap();
+                let mut txn = pristine.write_txn_immediate().unwrap();
+                txn.replace_native_derived_indexes(&NativeDerivedIndexes::default())
+                    .unwrap();
+                txn.commit().unwrap();
+
+                let mut txn = pristine.write_txn().unwrap();
+                let first = txn.alloc_inode().unwrap();
+                let second = txn.alloc_inode().unwrap();
+                assert_eq!(first.get(), 1);
+                assert_eq!(second.get(), 2);
+                assert!(!first.is_root());
+                assert!(!second.is_root());
+                txn.put_tree("first.txt", first).unwrap();
+                txn.put_tree("second.txt", second).unwrap();
+                txn.commit().unwrap();
+            }
+
+            let pristine = Pristine::open_existing(&db_path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            let third = txn.alloc_inode().unwrap();
+            assert_eq!(third.get(), 3);
+            assert!(!third.is_root());
+            txn.abort().unwrap();
+        }
     }
 
     #[test]

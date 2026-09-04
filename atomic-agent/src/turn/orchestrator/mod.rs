@@ -86,7 +86,9 @@ use crate::error::AgentResult;
 use crate::event::{HookType, TurnEvent};
 use crate::record::TurnRecordOutcome;
 use crate::turn::phase::Phase;
-use crate::turn::session::{ManagedRunStamp, SessionStore};
+use crate::turn::session::{
+    AgentSession, IncompleteSession, ManagedRunStamp, SessionStatus, SessionStore,
+};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -145,6 +147,10 @@ pub struct DispatchResult {
 
     /// Whether any warnings were emitted (e.g., stale session).
     pub warnings: Vec<String>,
+
+    /// Durable refusal outcome. No status, add, record, provenance, or
+    /// attestation work is performed when this is present.
+    pub incomplete: Option<IncompleteSession>,
 }
 
 impl DispatchResult {
@@ -160,6 +166,7 @@ impl DispatchResult {
             view: None,
             message: None,
             warnings: Vec::new(),
+            incomplete: None,
         }
     }
 
@@ -187,6 +194,12 @@ impl DispatchResult {
         self
     }
 
+    /// Attach an incomplete outcome after it has been durably persisted.
+    pub fn with_incomplete(mut self, incomplete: IncompleteSession) -> Self {
+        self.incomplete = Some(incomplete);
+        self
+    }
+
     /// Returns `true` if a change was recorded during this dispatch.
     pub fn was_recorded(&self) -> bool {
         self.change_recorded.is_some()
@@ -198,6 +211,9 @@ impl std::fmt::Display for DispatchResult {
         write!(f, "[{}] → {}", self.session_id, self.new_phase)?;
         if let Some(ref outcome) = self.change_recorded {
             write!(f, " ({})", outcome)?;
+        }
+        if let Some(ref incomplete) = self.incomplete {
+            write!(f, " (incomplete: {})", incomplete)?;
         }
         for warning in &self.warnings {
             write!(f, " ⚠ {}", warning)?;
@@ -246,6 +262,11 @@ pub struct TurnOrchestrator {
     /// Managed-run context when a governing lifecycle covers this hook;
     /// `None` for direct agent usage (behavior unchanged).
     pub(crate) managed_run: Option<ManagedRunContext>,
+
+    /// Refusal produced by the CLI's shared working-copy guard for this exact
+    /// turn/session boundary. This is independent of managed-run ownership so
+    /// unmanaged agent endings fail closed through the same durable path.
+    pub(crate) boundary_refusal: Option<IncompleteSession>,
 }
 
 impl TurnOrchestrator {
@@ -283,6 +304,7 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            boundary_refusal: None,
         })
     }
 
@@ -302,6 +324,7 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            boundary_refusal: None,
         }
     }
 
@@ -321,6 +344,14 @@ impl TurnOrchestrator {
         self.managed_run = Some(context);
     }
 
+    /// Supply a WIP-backed refusal from the CLI's shared boundary guard.
+    ///
+    /// Turn/session handlers consume this before watcher, status, alignment,
+    /// recording, provenance, or attestation work.
+    pub fn set_boundary_refusal(&mut self, refusal: IncompleteSession) {
+        self.boundary_refusal = Some(refusal);
+    }
+
     /// The view declared by the governing managed run, if any.
     pub(crate) fn managed_view(&self) -> Option<&str> {
         self.managed_run.as_ref().and_then(|m| m.view.as_deref())
@@ -329,6 +360,72 @@ impl TurnOrchestrator {
     /// The stamp to write onto sessions born under the managed run.
     pub(crate) fn managed_stamp(&self) -> Option<ManagedRunStamp> {
         self.managed_run.as_ref().map(|m| m.stamp.clone())
+    }
+
+    /// Persist and surface a CLI boundary refusal before any working-copy
+    /// interpretation or mutation runs. Existing incomplete state is the first
+    /// writer and remains authoritative across duplicate hooks and crash retry.
+    pub(crate) fn persist_boundary_incomplete(
+        &self,
+        session_id: &str,
+    ) -> AgentResult<Option<DispatchResult>> {
+        let existing = self.session_store.load(session_id)?;
+        let stored = existing
+            .as_ref()
+            .and_then(|session| session.incomplete())
+            .cloned();
+        let Some(candidate) = stored.or_else(|| self.boundary_refusal.clone()) else {
+            return Ok(None);
+        };
+
+        let mut session = existing.unwrap_or_else(|| {
+            let mut session =
+                AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+            if let Some(managed) = &self.managed_run {
+                session.managed_run = Some(managed.stamp.clone());
+                if let Some(view) = &managed.view {
+                    session.view_name = view.clone();
+                }
+            }
+            session
+        });
+
+        let persisted = session.mark_incomplete(candidate).clone();
+        // The mutable JSON runtime state is the crash-safe minimum. Save it
+        // before attempting the repository index so a storage-open failure can
+        // never let the boundary continue or erase the refusal.
+        self.session_store.save(&session)?;
+
+        let indexed =
+            match atomic_repository::Repository::open_existing(&self.repo_root).and_then(|repo| {
+                repo.mark_session_incomplete(
+                    session_id,
+                    Some(session.view_name.clone()),
+                    session.parent_view.clone(),
+                    &persisted,
+                )
+            }) {
+                Ok(indexed) => indexed,
+                Err(error) => {
+                    log::warn!(
+                    "Could not index incomplete agent session {}: {}; JSON refusal remains durable",
+                    session_id,
+                    error,
+                );
+                    persisted
+                }
+            };
+
+        if session.incomplete() != Some(&indexed) {
+            session.status = SessionStatus::Incomplete(indexed.clone());
+            self.session_store.save(&session)?;
+        }
+
+        Ok(Some(
+            DispatchResult::new(session_id, session.phase)
+                .with_view(&session.view_name)
+                .with_incomplete(indexed),
+        ))
     }
 
     /// Returns the repository root path.

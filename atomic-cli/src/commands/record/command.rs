@@ -1,5 +1,9 @@
 use super::*;
 
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
+
 impl Command for Record {
     /// Execute the record command.
     ///
@@ -8,15 +12,36 @@ impl Command for Record {
     /// 1. Find and open the repository
     /// 2. Get the commit message (from argument, editor, or prompt)
     /// 3. Detect changes in the working copy
-    /// 4. If --all, add untracked files
-    /// 5. If --dry-run, display preview and exit
-    /// 6. Create the change from modifications
-    /// 7. Save the change to the store
-    /// 8. Apply the change to the current view
-    /// 9. Display the result
+    /// 4. If --dry-run, display preview and exit
+    /// 5. Create the change from modifications (including untracked files for --all)
+    /// 6. Save the change to the store
+    /// 7. Apply the change to the current view
+    /// 8. Display the result
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
+
+        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Record)).map_err(
+            |error| match error {
+                GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                    reason: error.to_string(),
+                },
+                GuardError::Observation(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+                GuardError::Wip(error) => CliError::GitError {
+                    message: error.to_string(),
+                },
+            },
+        )? {
+            GuardOutcome::Pass(_) => {}
+            GuardOutcome::Refuse(refusal) => {
+                return Err(CliError::StaleBaseline {
+                    report: refusal.to_string(),
+                });
+            }
+        }
+
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         // Handle dry run
@@ -42,19 +67,8 @@ impl Command for Record {
         // Build record options
         let options = self.build_options()?;
 
-        // If --all, first add all untracked files
-        if self.all {
-            let status = repo
-                .status(StatusOptions::default())
-                .map_err(CliError::Repository)?;
-
-            for entry in status.untracked() {
-                let path = entry.path();
-                if let Err(e) = repo.add(path, Default::default()) {
-                    print_warning(&format!("Failed to add '{}': {}", path.display(), e));
-                }
-            }
-        }
+        // Repository::record owns --all inclusion so rename classification runs
+        // before any untracked destination could be staged as a fresh inode.
 
         // Record the changes.
         //

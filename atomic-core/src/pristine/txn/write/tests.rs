@@ -646,6 +646,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_inode_reset_cas_refuses_to_lower_concurrently_advanced_counter() {
+        let shared = AtomicU64::new(500);
+        let mut pending = PendingInodeReset::new(500, 1);
+
+        assert_eq!(pending.allocate().unwrap().get(), 1);
+        assert_eq!(pending.allocate().unwrap().get(), 2);
+
+        // Simulate another writer allocating after redb commit but before reset publication.
+        assert_eq!(allocate_shared_inode(&shared).unwrap().get(), 500);
+        assert_eq!(shared.load(Ordering::SeqCst), 501);
+        assert!(!pending.publish(&shared));
+        assert_eq!(shared.load(Ordering::SeqCst), 501);
+
+        assert_eq!(allocate_shared_inode(&shared).unwrap().get(), 501);
+        assert_eq!(shared.load(Ordering::SeqCst), 502);
+    }
+
+    #[test]
     fn test_abort_transaction() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
@@ -1070,5 +1088,64 @@ mod tests {
         }
 
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_mark_session_incomplete_is_first_writer_idempotent() {
+        use crate::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let first = IncompleteSession::new(
+            "checkout drift",
+            vec!["src/lib.rs".into()],
+            "refs/atomic/wip/first",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+        let later = IncompleteSession::new(
+            "later duplicate",
+            vec!["src/other.rs".into()],
+            "refs/atomic/wip/later",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+
+        let mut txn = pristine.write_txn().unwrap();
+        let persisted = txn
+            .mark_session_incomplete(
+                "sess-incomplete",
+                ".atomic/sessions/sess-incomplete.json",
+                Some("agent-view".into()),
+                Some("main".into()),
+                &first,
+            )
+            .unwrap();
+        assert_eq!(persisted, first);
+
+        let duplicate = txn
+            .mark_session_incomplete(
+                "sess-incomplete",
+                ".atomic/sessions/sess-incomplete.json",
+                Some("agent-view".into()),
+                Some("main".into()),
+                &later,
+            )
+            .unwrap();
+        assert_eq!(duplicate, first, "the original recovery object must win");
+
+        txn.upsert_session_lifecycle(
+            "sess-incomplete",
+            ".atomic/sessions/sess-incomplete.json",
+            None,
+            None,
+            Some(123),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let txn = pristine.read_txn().unwrap();
+        let record = txn.get_session_record("sess-incomplete").unwrap().unwrap();
+        assert_eq!(record.status, SessionStatus::Incomplete(first));
+        assert_eq!(record.turn_count, 0);
+        assert!(txn.get_session_turns("sess-incomplete").unwrap().is_empty());
     }
 }

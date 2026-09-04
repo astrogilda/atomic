@@ -152,6 +152,13 @@ impl TurnOrchestrator {
             TurnEndLock::Unavailable => None,
         };
 
+        // The CLI shared guard has already captured or reused the tracked bytes.
+        // Persist its refusal before the fast status gate, watcher cancellation,
+        // recording, provenance, or attestation can interpret those bytes.
+        if let Some(result) = self.persist_boundary_incomplete(session_id)? {
+            return Ok(result);
+        }
+
         // Fast gate: check if anything changed since the last record.
         // This bypasses the entire status machinery (TREE scan, filesystem
         // walk, etc.) and just checks the pristine database mtime.

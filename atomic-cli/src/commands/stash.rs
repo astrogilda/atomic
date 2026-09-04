@@ -81,6 +81,9 @@ use atomic_repository::record::RecordOptions;
 use atomic_repository::status::StatusOptions;
 use atomic_repository::Repository;
 
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 use crate::commands::{find_repository_root, format_timestamp_relative, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_blank, print_hint, print_success, print_warning, view as style_view};
@@ -278,6 +281,15 @@ impl Stash {
         // Dependencies flag is handled at the subcommand level;
         // this builder is provided for test convenience.
         self
+    }
+
+    fn uses_working_copy(&self) -> bool {
+        matches!(
+            &self.command,
+            None | Some(StashSubcommand::Push { .. })
+                | Some(StashSubcommand::Pop { .. })
+                | Some(StashSubcommand::Apply { .. })
+        )
     }
 
     /// List all stash views, sorted by creation time (newest first).
@@ -725,6 +737,29 @@ impl Command for Stash {
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
+
+        if self.uses_working_copy() {
+            match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
+                .map_err(|error| match error {
+                    GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                        reason: error.to_string(),
+                    },
+                    GuardError::Observation(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                    GuardError::Wip(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                })? {
+                GuardOutcome::Pass(_) => {}
+                GuardOutcome::Refuse(refusal) => {
+                    return Err(CliError::StaleBaseline {
+                        report: refusal.to_string(),
+                    });
+                }
+            }
+        }
+
         let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         match &self.command {
@@ -756,6 +791,18 @@ mod tests {
     use super::*;
 
     // Builder Tests
+
+    #[test]
+    fn test_working_copy_guard_selector() {
+        assert!(Stash::new().uses_working_copy());
+
+        let mut stash = Stash::new();
+        stash.command = Some(StashSubcommand::List);
+        assert!(!stash.uses_working_copy());
+
+        stash.command = Some(StashSubcommand::Apply { stash: None });
+        assert!(stash.uses_working_copy());
+    }
 
     #[test]
     fn test_stash_new() {

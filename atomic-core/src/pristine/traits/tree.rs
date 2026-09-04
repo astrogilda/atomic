@@ -119,6 +119,43 @@ pub trait TreeTxnT: GraphTxnT {
     /// This is the inverse of `inode_position`.
     fn position_inode(&self, pos: Position<NodeId>) -> Result<Option<Inode>, PristineError>;
 
+    /// Return every INODES row in deterministic key order.
+    fn snapshot_inodes(&self) -> Result<Vec<(Inode, Position<NodeId>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete INODES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every REV_INODES row in deterministic key order.
+    fn snapshot_rev_inodes(&self) -> Result<Vec<(Position<NodeId>, Inode)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete REV_INODES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every DIRECTORIES row in deterministic key order.
+    fn snapshot_directories(&self) -> Result<Vec<(Inode, u8)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete DIRECTORIES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every distinct INODE_GRAPH key in deterministic key order.
+    ///
+    /// Keys retain both inode ownership and the exact graph node, allowing
+    /// callers to recover and validate candidate inode roots without trusting
+    /// the potentially damaged INODES index.
+    fn snapshot_inode_graph_keys(&self) -> Result<Vec<(Inode, GraphNode<NodeId>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message:
+                "complete INODE_GRAPH key snapshots are unavailable for this transaction wrapper"
+                    .to_string(),
+        })
+    }
+
     /// Iterate over all files in the tree.
     ///
     /// Returns an iterator over (path, inode) pairs for all tracked files.

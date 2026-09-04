@@ -27,6 +27,7 @@
 //! - Diverged history warnings
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -38,6 +39,9 @@ use atomic_remote::{ChangelistEntry, HttpRemote, HttpRemoteConfig, StateResponse
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{InsertOptions, Repository, ViewManifest};
 
+use crate::commands::git::guard::{
+    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
+};
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -342,6 +346,10 @@ impl Pull {
         self
     }
 
+    fn may_materialize_working_copy(&self) -> bool {
+        !self.dry_run && !self.download_only
+    }
+
     // Internal Helper Methods
 
     /// Use the explicit remote first, then the repository default.
@@ -477,9 +485,8 @@ impl Pull {
     ///
     /// This is the main entry point for the pull operation. It coordinates
     /// all the steps required to download and apply remote changes.
-    async fn run_async(&self) -> CliResult<()> {
-        // Find and open repository
-        let repo_root = find_repository_root()?;
+    async fn run_async(&self, repo_root: PathBuf) -> CliResult<()> {
+        // Open repository after the synchronous command boundary has guarded it.
         let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         // Resolve remote name, URL, and identity hint
@@ -989,12 +996,36 @@ impl Command for Pull {
     /// - Network operations fail
     /// - Changes fail to download or save
     fn run(&self) -> CliResult<()> {
+        let repo_root = find_repository_root()?;
+
+        if self.may_materialize_working_copy() {
+            match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
+                .map_err(|error| match error {
+                    GuardError::Checkpoint(error) => CliError::InvalidRepository {
+                        reason: error.to_string(),
+                    },
+                    GuardError::Observation(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                    GuardError::Wip(error) => CliError::GitError {
+                        message: error.to_string(),
+                    },
+                })? {
+                GuardOutcome::Pass(_) => {}
+                GuardOutcome::Refuse(refusal) => {
+                    return Err(CliError::StaleBaseline {
+                        report: refusal.to_string(),
+                    });
+                }
+            }
+        }
+
         // Create a runtime for async operations
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
         })?;
 
-        rt.block_on(self.run_async())
+        rt.block_on(self.run_async(repo_root))
     }
 }
 
@@ -1019,6 +1050,17 @@ mod tests {
         assert!(!pull.insecure);
         assert_eq!(pull.timeout, DEFAULT_TIMEOUT_SECS);
         assert!(!pull.download_only);
+    }
+
+    #[test]
+    fn test_materialization_guard_selector() {
+        assert!(Pull::new().may_materialize_working_copy());
+        assert!(!Pull::new()
+            .with_dry_run(true)
+            .may_materialize_working_copy());
+        assert!(!Pull::new()
+            .with_download_only(true)
+            .may_materialize_working_copy());
     }
 
     /// Test Default trait implementation.

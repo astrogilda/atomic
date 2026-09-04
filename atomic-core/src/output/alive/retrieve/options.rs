@@ -3,9 +3,11 @@
 //! This module contains [`RetrieveOptions`] for configuring graph retrieval
 //! and [`RetrieveResult`] for returning the retrieved graph with statistics.
 
+use std::collections::HashMap;
+
 use super::super::graph::AliveGraph;
 use crate::pristine::{GraphTxnT, GraphVisibilityClosure, PristineError};
-use crate::types::{ForwardEdge, GraphNode, NodeId, ParentEdgeKind};
+use crate::types::{ForwardEdge, GraphNode, NodeId, ParentEdge, ParentEdgeKind};
 
 // RETRIEVE OPTIONS
 
@@ -248,48 +250,106 @@ impl RetrieveOptions {
             return Ok(true);
         }
 
-        // Include deleted parents so we can distinguish "deleted by us"
-        // from "deleted by someone outside our filter".
-        let parents = txn.iter_parents(vertex, true)?;
+        // Edge updates are additive. Keep only causally maximal visible parent
+        // states so A -> delete(A) -> undelete(delete) resolves to the final
+        // alive state without using view order. Sibling-only updates are ignored.
+        let parents: Vec<ParentEdge> = txn
+            .iter_parents(vertex, true)?
+            .into_iter()
+            .filter(|parent| self.passes_filter(parent.introduced_by))
+            .collect();
+        let mut memo = HashMap::new();
+        let mut visiting = Vec::new();
+        let mut maximal = Vec::new();
+        for (index, candidate) in parents.iter().enumerate() {
+            let mut superseded = false;
+            for (other_index, other) in parents.iter().enumerate() {
+                if index == other_index || candidate.introduced_by == other.introduced_by {
+                    continue;
+                }
+                if change_depends_on(
+                    txn,
+                    other.introduced_by,
+                    candidate.introduced_by,
+                    &mut memo,
+                    &mut visiting,
+                )? {
+                    superseded = true;
+                    break;
+                }
+            }
+            if !superseded {
+                maximal.push(*candidate);
+            }
+        }
 
         let mut has_live_parent = false;
-        let mut deleted_by_filter_change = false;
-
-        for parent in &parents {
-            let introduced_by = parent.introduced_by;
-            let in_filter = self.passes_filter(introduced_by);
-
+        let mut has_deleted_parent = false;
+        for parent in maximal {
             match parent.kind {
-                // Non-deleted parent edges — vertex is connected (alive)
-                ParentEdgeKind::Block | ParentEdgeKind::Folder => {
-                    has_live_parent = true;
-                }
-                // Pseudo parents count for empty vertices (inodes)
+                ParentEdgeKind::Block | ParentEdgeKind::Folder => has_live_parent = true,
                 ParentEdgeKind::PseudoBlock | ParentEdgeKind::PseudoFolder => {
                     if vertex.is_empty() {
                         has_live_parent = true;
                     }
                 }
-                // Deleted parent — check who deleted it
                 ParentEdgeKind::BlockDeleted | ParentEdgeKind::FolderDeleted => {
-                    if in_filter {
-                        // Deletion from a change in our filter → vertex is dead
-                        deleted_by_filter_change = true;
-                    } else {
-                        // Deletion from a change OUTSIDE our filter.
-                        // From our perspective that deletion hasn't happened yet,
-                        // so this edge still counts as a live connection.
-                        has_live_parent = true;
-                    }
+                    has_deleted_parent = true;
                 }
             }
         }
 
-        // Vertex is alive if it has at least one live parent (non-deleted
-        // or deleted-by-outside-change) AND was not explicitly deleted by
-        // a change in our filter.
-        Ok(has_live_parent && !deleted_by_filter_change)
+        // Concurrent maximal delete and alive states remain conservatively dead;
+        // conflict handling may surface surviving descendants separately.
+        Ok(has_live_parent && !has_deleted_parent)
     }
+}
+
+fn change_depends_on<T: GraphTxnT>(
+    txn: &T,
+    descendant: NodeId,
+    ancestor: NodeId,
+    memo: &mut HashMap<(NodeId, NodeId), bool>,
+    visiting: &mut Vec<NodeId>,
+) -> Result<bool, PristineError> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    if descendant.is_root() || ancestor.is_root() {
+        return Ok(false);
+    }
+    if let Some(result) = memo.get(&(descendant, ancestor)) {
+        return Ok(*result);
+    }
+    if let Some(start) = visiting.iter().position(|change| *change == descendant) {
+        let mut cycle: Vec<u64> = visiting[start..]
+            .iter()
+            .map(|change| change.get())
+            .collect();
+        cycle.push(descendant.get());
+        return Err(PristineError::DependencyCycle { cycle });
+    }
+    visiting.push(descendant);
+
+    let dependencies = txn.get_indexed_change_deps(descendant)?;
+    for dependency in dependencies {
+        let dependency_id = txn.get_internal(&dependency)?.ok_or_else(|| {
+            PristineError::MissingRegisteredDependency {
+                change_id: descendant.get(),
+                dependency: dependency.to_string(),
+            }
+        })?;
+        if dependency_id == ancestor
+            || change_depends_on(txn, dependency_id, ancestor, memo, visiting)?
+        {
+            visiting.pop();
+            memo.insert((descendant, ancestor), true);
+            return Ok(true);
+        }
+    }
+    visiting.pop();
+    memo.insert((descendant, ancestor), false);
+    Ok(false)
 }
 
 impl PartialEq for RetrieveOptions {
