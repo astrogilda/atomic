@@ -3,7 +3,10 @@ use super::*;
 use crate::tracking::{
     TreeProjectionError, TreeProjectionKind, TreeProjectionOperation, TreeProjectionPlan,
 };
-use atomic_core::pristine::{PathClaimMutTxnT, PathClaimTxnT};
+use atomic_core::operation::WorkingCopyStateRef;
+use atomic_core::pristine::{
+    PathClaimMutTxnT, PathClaimTxnT, WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -11,7 +14,6 @@ use std::io::Write;
 const DEFERRED_TREE_JOURNAL: &str = "deferred-tree-ops.json";
 const DEFERRED_TREE_JOURNAL_VERSION: u32 = 1;
 const DEFERRED_TREE_ALIGNMENT_PENDING: &str = "deferred-tree-alignment.pending";
-const DEFERRED_TREE_ALIGNMENT_LOCK: &str = "deferred-tree-alignment.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1233,19 +1235,6 @@ impl Repository {
         Ok(pending)
     }
 
-    fn lock_deferred_tree_alignment(&self) -> Result<std::fs::File, RepositoryError> {
-        use fs2::FileExt;
-
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.dot_dir.join(DEFERRED_TREE_ALIGNMENT_LOCK))?;
-        lock.lock_exclusive()?;
-        Ok(lock)
-    }
-
     fn clear_deferred_tree_alignment_pending(&self) -> Result<(), RepositoryError> {
         match std::fs::remove_file(self.deferred_tree_alignment_pending_path()) {
             Ok(()) => self.sync_dot_dir(),
@@ -1598,26 +1587,20 @@ impl Repository {
         Ok(affected_paths)
     }
 
-    /// Recover a switch interrupted between TREE alignment and publishing the
-    /// current-view pointer. The advisory lock is released by the OS on process
-    /// exit, so a concurrent opener waits for a live switch and only performs
-    /// recovery when the marker survives that lock handoff.
-    pub(super) fn recover_pending_deferred_tree_alignment(
+    pub(super) fn recover_pending_deferred_tree_alignment_locked(
         &mut self,
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
     ) -> Result<(), RepositoryError> {
         if self.is_sandbox || !self.has_pending_deferred_tree_alignment() {
             return Ok(());
         }
 
-        let _alignment_lock = self.lock_deferred_tree_alignment()?;
+        let write = operation_lock.begin_write_immediate()?;
+        let mut txn = write.try_lock_deferred_tree()?;
         if !self.has_pending_deferred_tree_alignment() {
             return Ok(());
         }
         let pending = self.load_deferred_tree_alignment_pending()?;
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let journal = self.load_deferred_tree_journal()?;
         let source_view = txn
             .get_view(&pending.source_view)
@@ -1625,88 +1608,136 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: pending.source_view.clone(),
             })?;
-        let full_visibility = graph_visibility_closure(&txn, &source_view)?;
+        let full_visibility = graph_visibility_closure(&*txn, &source_view)?;
         let visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
+            &*txn,
             &self.change_store,
             &source_view,
             &full_visibility,
         )?;
         self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &visibility)?;
         self.write_current_view(&pending.source_view)?;
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()?;
         self.current_view = pending.source_view;
         self.clear_deferred_tree_alignment_pending()?;
         Ok(())
     }
 
-    /// Align TREE and publish the view pointer as one recoverable transition.
-    /// The database write lock is held while the pointer is written, and the
-    /// pending marker lets the next writable open reconcile either side after
-    /// a process crash.
-    pub(super) fn align_deferred_tree_and_publish_view(
+    /// Apply an exact working-copy state while preserving the CB-1B lock order.
+    ///
+    /// For the canonical working copy this updates the record, deferred TREE
+    /// projection, and compatibility pointer under one immediate pristine write
+    /// followed by the final deferred-resource lock. Linked worktrees keep their
+    /// compatibility pointer local and do not rewrite the common TREE projection.
+    pub(super) fn apply_working_copy_state_locked(
         &mut self,
-        view_name: &str,
-        visibility: &GraphVisibilityClosure,
-    ) -> Result<HashSet<String>, RepositoryError> {
-        let _alignment_lock = self.lock_deferred_tree_alignment()?;
-        // `current_view` can intentionally be scoped to a background target
-        // via set_current_view_in_memory(). Read the persisted pointer only
-        // after taking the alignment lock: it owns the materialized TREE and
-        // is therefore the only valid rollback source for this transition.
-        let old_view = Self::read_current_view(&self.dot_dir)?;
-        let mut txn = match self.pristine.write_txn() {
-            Ok(txn) => txn,
-            Err(error) => return Err(RepositoryError::Database(error.to_string())),
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
+        state: &WorkingCopyStateRef,
+    ) -> Result<(), RepositoryError> {
+        if operation_lock.working_copy() != state.id {
+            return Err(RepositoryError::WorkingCopyIdentityMismatch {
+                requested: state.id,
+                actual: operation_lock.working_copy(),
+            });
+        }
+
+        let record = WorkingCopyRecord {
+            id: state.id,
+            location_fingerprint: state.location_fingerprint,
+            desired_view: state.desired_view,
+            desired_state: state.desired_state,
+            materialized_state: state.materialized_state,
+            materialized_manifest: state.materialized_manifest,
         };
-        let journal = self.load_deferred_tree_journal()?;
-        // Publish the marker only after taking the database write lock. Any
-        // opener that observes it must wait for this transaction. If the
-        // marker survives, recovery restores the source view.
-        self.write_deferred_tree_alignment_pending(&old_view, view_name)?;
-        let target_view = txn
-            .get_view(view_name)
+
+        if self.working_copy_dot_dir() != self.dot_dir {
+            let mut txn = operation_lock.begin_write_immediate()?;
+            let current = txn
+                .get_working_copy(state.id)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: state.id })?;
+            if current.location_fingerprint != state.location_fingerprint {
+                return Err(RepositoryError::WorkingCopyLocationMismatch { id: state.id });
+            }
+            let target_view = ViewTxnT::get_view_by_id(&*txn, state.desired_view)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "working-copy state {} references missing desired view {}",
+                        state.id, state.desired_view
+                    ),
+                })?;
+            let target_name = target_view.name.clone();
+            txn.put_working_copy(&record)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            txn.commit()?;
+            self.write_current_view(&target_name)?;
+            self.current_view = target_name;
+            return Ok(());
+        }
+
+        let mut write = operation_lock.begin_write_immediate()?;
+        let current = write
+            .get_working_copy(state.id)
             .map_err(|error| RepositoryError::Database(error.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: view_name.to_string(),
+            .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: state.id })?;
+        if current.location_fingerprint != state.location_fingerprint {
+            return Err(RepositoryError::WorkingCopyLocationMismatch { id: state.id });
+        }
+        let target_view = ViewTxnT::get_view_by_id(&*write, state.desired_view)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::InvalidRepository {
+                reason: format!(
+                    "working-copy state {} references missing desired view {}",
+                    state.id, state.desired_view
+                ),
             })?;
+        let target_name = target_view.name.clone();
+        let persisted_view = Self::read_current_view(&self.dot_dir)?;
+        if current.desired_view == state.desired_view
+            && persisted_view == target_name
+            && !self.has_pending_deferred_tree_alignment()
+        {
+            write
+                .put_working_copy(&record)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            write.commit()?;
+            self.current_view = target_name;
+            return Ok(());
+        }
+
+        let mut txn = write.try_lock_deferred_tree()?;
+        let full_visibility = graph_visibility_closure(&*txn, &target_view)?;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
+            &*txn,
             &self.change_store,
             &target_view,
-            visibility,
+            &full_visibility,
         )?;
-        let affected_paths =
-            match self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &claim_visibility) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    let _ = self.clear_deferred_tree_alignment_pending();
-                    return Err(error);
-                }
-            };
-
-        if let Err(error) = self.write_current_view(view_name) {
+        let journal = self.load_deferred_tree_journal()?;
+        let old_view = persisted_view;
+        self.write_deferred_tree_alignment_pending(&old_view, &target_name)?;
+        if let Err(error) =
+            self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &claim_visibility)
+        {
             let _ = self.clear_deferred_tree_alignment_pending();
             return Err(error);
         }
-
+        txn.put_working_copy(&record)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        if let Err(error) = self.write_current_view(&target_name) {
+            let _ = self.clear_deferred_tree_alignment_pending();
+            return Err(error);
+        }
         if let Err(error) = txn.commit() {
-            // The DB transaction did not publish. Restore the pointer while
-            // retaining the marker if restoration itself fails, so the next
-            // writable open can reconcile from the persisted pointer.
             if self.write_current_view(&old_view).is_ok() {
                 let _ = self.clear_deferred_tree_alignment_pending();
             }
-            return Err(RepositoryError::Database(error.to_string()));
+            return Err(error);
         }
-
-        self.current_view = view_name.to_string();
-        // Clearing the marker is the commit point for this recoverable
-        // transition. Propagate cleanup or directory-sync failures so a switch
-        // is never reported durable while recovery may still roll it back.
+        self.current_view = target_name;
         self.clear_deferred_tree_alignment_pending()?;
-        Ok(affected_paths)
+        Ok(())
     }
 }
 

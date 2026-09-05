@@ -897,6 +897,7 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
 mod embeddings;
 mod graph;
 mod native_derived;
+mod operation;
 mod path_claim;
 mod session_kg;
 mod tag;

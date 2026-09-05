@@ -13,6 +13,8 @@
 
 use redb::{MultimapTableDefinition, TableDefinition};
 
+use crate::types::{EffectReceiptId, OperationId};
+
 use super::path_claim::PATH_CLAIM_EVENT_SIZE;
 
 // ID Mapping Tables
@@ -84,6 +86,25 @@ pub const VIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
 /// record versions without changing the redb table schema.
 pub const WORKING_COPIES: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("working_copies");
+
+/// Immutable operations keyed by their domain-separated content address.
+///
+/// Values use the strict versioned canonical operation codec. The value omits
+/// the derived ID; reads recompute it and compare it with the table key.
+pub const OPERATIONS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("operations");
+
+/// Mutable versioned sorted operation-head sets keyed by operation scope.
+///
+/// Scope keys are a one-byte tag plus either zero padding for repository scope
+/// or a canonical 16-byte working-copy ULID.
+pub const OP_HEADS: TableDefinition<&[u8; 17], &[u8]> = TableDefinition::new("op_heads");
+
+/// Immutable effect receipts keyed by `(OperationId, EffectReceiptId)`.
+///
+/// The operation-first composite key permits efficient prefix range scans while
+/// the receipt ID keeps each row content-addressed and append-only.
+pub const EFFECT_RECEIPTS: TableDefinition<&[u8; 64], &[u8]> =
+    TableDefinition::new("effect_receipts");
 
 /// View change log: (view_id, sequence) → change_id
 ///
@@ -915,6 +936,23 @@ pub fn decode_view_seq(key: &[u8; 16]) -> (u64, u64) {
     let view_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
     (view_id, seq)
+}
+
+/// Encode an operation/receipt pair for operation-prefix range scans.
+#[inline]
+pub fn encode_effect_receipt_key(operation: OperationId, receipt: EffectReceiptId) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..OperationId::SIZE].copy_from_slice(operation.as_bytes());
+    key[OperationId::SIZE..].copy_from_slice(receipt.as_bytes());
+    key
+}
+
+/// Decode an operation/receipt composite key.
+#[inline]
+pub fn decode_effect_receipt_key(key: &[u8; 64]) -> (OperationId, EffectReceiptId) {
+    let operation = OperationId::from_bytes(key[..OperationId::SIZE].try_into().unwrap());
+    let receipt = EffectReceiptId::from_bytes(key[OperationId::SIZE..].try_into().unwrap());
+    (operation, receipt)
 }
 
 /// Encode a view-merkle pair as 40 bytes

@@ -1,6 +1,12 @@
 use super::*;
 use atomic_core::pristine::{PathClaimTxnT, StoredConflict, StoredConflictKind};
 
+pub(super) trait MaterializationEffectExecutor {
+    fn create_directory(&mut self, path: &str) -> Result<bool, RepositoryError>;
+    fn write_file(&mut self, path: &str, content: &[u8]) -> Result<bool, RepositoryError>;
+    fn remove_path(&mut self, path: &str) -> Result<bool, RepositoryError>;
+}
+
 /// Return the 1-based line number of the first Atomic conflict-start marker
 /// (`>>>>>>>`) in `content`, or `None` if the content has no markers.
 ///
@@ -20,19 +26,6 @@ pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
     None
 }
 
-/// True if a `try_lock*` error means the lock is currently held by someone else
-/// (as opposed to a genuine I/O failure).
-///
-/// On Unix a contended non-blocking lock surfaces as `WouldBlock`, but on
-/// Windows the OS returns `ERROR_LOCK_VIOLATION` (code 33), which maps to
-/// `ErrorKind::Uncategorized` rather than `WouldBlock`. Comparing the raw OS
-/// error against `fs2::lock_contended_error()` handles both platforms.
-pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
-        || (e.raw_os_error().is_some()
-            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
-}
-
 impl Repository {
     /// Return the first working-copy file that still contains an unresolved
     /// conflict marker, as `(path, 1-based line)`, or `None` if the working
@@ -47,23 +40,17 @@ impl Repository {
     /// Try to acquire the repo-scoped shadow-commit lock **without blocking**.
     ///
     /// Returns `Some(guard)` if acquired (the lock is held until the returned
-    /// file is dropped), or `None` if another shadow materialize/commit is
-    /// already in flight. This serializes the single shadow-commit pipeline
-    /// (SPEC §4.3 / Principle 5) so concurrent hooks/commands never interleave
-    /// partial staging. It is a distinct lock from the deferred-tree alignment
-    /// lock and is meant to be taken **outermost**, before any DB write txn.
-    pub fn try_lock_shadow_commit(&self) -> Result<Option<std::fs::File>, RepositoryError> {
-        use fs2::FileExt;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.dot_dir.join("shadow-commit.lock"))?;
-        match lock.try_lock_exclusive() {
-            Ok(()) => Ok(Some(lock)),
-            Err(e) if is_lock_contended(&e) => Ok(None),
-            Err(e) => Err(RepositoryError::Io(e)),
+    /// guard is dropped), or `None` if another common repository operation is
+    /// already in flight. Shadow projection uses the canonical `bridge.lock`
+    /// rather than an independent mutex, so it cannot interleave with a
+    /// working-copy operation that will later acquire pristine or shelf locks.
+    pub fn try_lock_shadow_commit(
+        &self,
+    ) -> Result<Option<RepositoryCommonLockGuard>, RepositoryError> {
+        match self.try_lock_common_operation() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(error) if error.is_lock_contended() => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -265,12 +252,83 @@ fn prepare_name_conflict_output<C: atomic_core::change::ChangeStore>(
 }
 
 impl Repository {
+    /// Render the exact file bytes a switch will materialize, including
+    /// operation-aware name-conflict markers, without mutating the worktree.
+    pub(super) fn switch_target_file_bytes(
+        &self,
+        path: &str,
+        view_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let normalized = normalize_path(Path::new(path));
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        if projection.name_conflicts.contains_key(&normalized) {
+            let mut external_hashes = std::collections::HashMap::new();
+            for node_id in visibility.iter_dependency_first().copied() {
+                if node_id.is_root() {
+                    continue;
+                }
+                let hash = txn
+                    .get_external(node_id)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "visible conflict change {} has no external hash",
+                            node_id.get()
+                        ))
+                    })?;
+                external_hashes.insert(node_id, hash);
+            }
+            let inode_graph_table = txn
+                .open_inode_graph_table()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let selected = std::collections::HashSet::from([normalized.clone()]);
+            let prepared = prepare_name_conflict_output(
+                &txn,
+                &self.change_store,
+                &inode_graph_table,
+                &visibility,
+                &external_hashes,
+                &projection.name_conflicts,
+                Some(&selected),
+            )?;
+            return match prepared.files.as_slice() {
+                [entry] => Ok(entry.bytes().map(ToOwned::to_owned)),
+                [] if prepared.directories == [normalized] => Ok(None),
+                _ => Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "switch conflict renderer produced an ambiguous result for '{path}'"
+                    ),
+                }),
+            };
+        }
+        drop(txn);
+        self.get_file_content_on_view(path, view_name)
+    }
+
     fn remove_absent_entries(
         &self,
         working_copy: WorkingCopyId,
         entries: &[MaterializedEntry],
         only_paths: Option<&std::collections::HashSet<String>>,
         prefix: Option<&str>,
+        mut effect_executor: Option<&mut dyn MaterializationEffectExecutor>,
     ) -> Result<usize, RepositoryError> {
         let selected = |path: &str| {
             !only_paths.is_some_and(|paths| !paths.contains(path))
@@ -282,30 +340,36 @@ impl Repository {
             .iter()
             .filter(|entry| !entry.is_directory() && selected(entry.path()))
         {
-            let absolute = self.root.join(entry.path());
-            match std::fs::symlink_metadata(&absolute) {
-                Ok(metadata)
-                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
-                {
-                    std::fs::remove_file(&absolute).map_err(|error| {
-                        RepositoryError::Output(format!(
-                            "failed to remove absent materialized path '{}': {}",
-                            entry.path(),
-                            error
-                        ))
-                    })?;
+            if let Some(executor) = effect_executor.as_deref_mut() {
+                if executor.remove_path(entry.path())? {
                     removed_files += 1;
                 }
-                Ok(_) => {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "cannot materialize absent file '{}': working-copy path is not a file",
-                            entry.path()
-                        ),
-                    });
+            } else {
+                let absolute = self.root.join(entry.path());
+                match std::fs::symlink_metadata(&absolute) {
+                    Ok(metadata)
+                        if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
+                    {
+                        std::fs::remove_file(&absolute).map_err(|error| {
+                            RepositoryError::Output(format!(
+                                "failed to remove absent materialized path '{}': {}",
+                                entry.path(),
+                                error
+                            ))
+                        })?;
+                        removed_files += 1;
+                    }
+                    Ok(_) => {
+                        return Err(RepositoryError::InvalidOperation {
+                            message: format!(
+                                "cannot materialize absent file '{}': working-copy path is not a file",
+                                entry.path()
+                            ),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(RepositoryError::Io(error)),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(RepositoryError::Io(error)),
             }
             self.delete_working_copy_file_index(working_copy, entry.path())?;
         }
@@ -316,28 +380,32 @@ impl Repository {
             .collect();
         directories.sort_by_key(|entry| std::cmp::Reverse(entry.path().matches('/').count()));
         for entry in directories {
-            let absolute = self.root.join(entry.path());
-            match std::fs::symlink_metadata(&absolute) {
-                Ok(metadata) if metadata.file_type().is_dir() => {
-                    std::fs::remove_dir(&absolute).map_err(|error| {
-                        RepositoryError::InvalidOperation {
+            if let Some(executor) = effect_executor.as_deref_mut() {
+                executor.remove_path(entry.path())?;
+            } else {
+                let absolute = self.root.join(entry.path());
+                match std::fs::symlink_metadata(&absolute) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        std::fs::remove_dir(&absolute).map_err(|error| {
+                            RepositoryError::InvalidOperation {
+                                message: format!(
+                                    "cannot remove absent directory '{}': {} (untracked children are never removed recursively)",
+                                    entry.path(), error
+                                ),
+                            }
+                        })?;
+                    }
+                    Ok(_) => {
+                        return Err(RepositoryError::InvalidOperation {
                             message: format!(
-                                "cannot remove absent directory '{}': {} (untracked children are never removed recursively)",
-                                entry.path(), error
+                                "cannot materialize absent directory '{}': working-copy path is not a directory",
+                                entry.path()
                             ),
-                        }
-                    })?;
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(RepositoryError::Io(error)),
                 }
-                Ok(_) => {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "cannot materialize absent directory '{}': working-copy path is not a directory",
-                            entry.path()
-                        ),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(RepositoryError::Io(error)),
             }
             self.delete_working_copy_file_index(working_copy, entry.path())?;
         }
@@ -647,6 +715,25 @@ impl Repository {
             visibility,
             view_id,
             true,
+            None,
+        )
+    }
+
+    pub(super) fn materialize_parallel_with_visibility_journaled(
+        &self,
+        working_copy: WorkingCopyId,
+        only_paths: Option<std::collections::HashSet<String>>,
+        visibility: GraphVisibilityClosure,
+        view_id: u64,
+        executor: &mut dyn MaterializationEffectExecutor,
+    ) -> Result<MaterializeResult, RepositoryError> {
+        self.materialize_parallel_with_visibility_mode(
+            working_copy,
+            only_paths,
+            visibility,
+            view_id,
+            true,
+            Some(executor),
         )
     }
 
@@ -664,6 +751,7 @@ impl Repository {
             visibility,
             view_id,
             false,
+            None,
         )
         .map(|_| ())
     }
@@ -675,6 +763,7 @@ impl Repository {
         visibility: GraphVisibilityClosure,
         view_id: u64,
         execute: bool,
+        mut effect_executor: Option<&mut dyn MaterializationEffectExecutor>,
     ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         use atomic_core::output::repo::OutputItem;
@@ -1098,14 +1187,18 @@ impl Repository {
         // Execution phase. From this point onward an external filesystem error
         // can leave partial effects; graph/render/preload errors cannot reach it.
         for path in &prepared_name_conflicts.directories {
-            let abs_dir = root.join(path);
-            if !abs_dir.exists() {
-                std::fs::create_dir_all(&abs_dir).map_err(|error| {
-                    RepositoryError::Output(format!(
-                        "failed to create conflicted directory '{}': {}",
-                        path, error
-                    ))
-                })?;
+            if let Some(executor) = effect_executor.as_deref_mut() {
+                executor.create_directory(path)?;
+            } else {
+                let abs_dir = root.join(path);
+                if !abs_dir.exists() {
+                    std::fs::create_dir_all(&abs_dir).map_err(|error| {
+                        RepositoryError::Output(format!(
+                            "failed to create conflicted directory '{}': {}",
+                            path, error
+                        ))
+                    })?;
+                }
             }
             result.record_directory();
         }
@@ -1124,14 +1217,18 @@ impl Repository {
                 result.record_skipped();
                 continue;
             }
-            let abs_dir = root.join(&item.path);
-            if !abs_dir.exists() {
-                std::fs::create_dir_all(&abs_dir).map_err(|error| {
-                    RepositoryError::Output(format!(
-                        "failed to create materialized directory '{}': {}",
-                        item.path, error
-                    ))
-                })?;
+            if let Some(executor) = effect_executor.as_deref_mut() {
+                executor.create_directory(&item.path)?;
+            } else {
+                let abs_dir = root.join(&item.path);
+                if !abs_dir.exists() {
+                    std::fs::create_dir_all(&abs_dir).map_err(|error| {
+                        RepositoryError::Output(format!(
+                            "failed to create materialized directory '{}': {}",
+                            item.path, error
+                        ))
+                    })?;
+                }
             }
             result.record_directory();
         }
@@ -1152,22 +1249,31 @@ impl Repository {
                 .bytes()
                 .expect("parallel renderer always produces a present entry");
             let abs_path = root.join(&path);
-            if let Some(parent) = abs_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
-                        RepositoryError::Output(format!(
-                            "failed to create parent for '{}': {}",
-                            path, error
-                        ))
-                    })?;
+            let wrote = if let Some(executor) = effect_executor.as_deref_mut() {
+                executor.write_file(&path, content)?
+            } else {
+                if let Some(parent) = abs_path.parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            RepositoryError::Output(format!(
+                                "failed to create parent for '{}': {}",
+                                path, error
+                            ))
+                        })?;
+                    }
                 }
-            }
-            std::fs::write(&abs_path, content).map_err(|error| {
-                RepositoryError::Output(format!("failed to write '{}': {}", path, error))
-            })?;
+                std::fs::write(&abs_path, content).map_err(|error| {
+                    RepositoryError::Output(format!("failed to write '{}': {}", path, error))
+                })?;
+                true
+            };
 
-            result.files_written += 1;
-            result.bytes_written += content.len() as u64;
+            if wrote {
+                result.files_written += 1;
+                result.bytes_written += content.len() as u64;
+            } else {
+                result.files_skipped += 1;
+            }
 
             let metadata = std::fs::metadata(&abs_path).map_err(|error| {
                 RepositoryError::Output(format!(
@@ -1199,8 +1305,13 @@ impl Repository {
         if !index_entries.is_empty() {
             self.update_working_copy_file_index(working_copy, &index_entries)?;
         }
-        result.files_deleted +=
-            self.remove_absent_entries(working_copy, &absent_entries, only_paths.as_ref(), None)?;
+        result.files_deleted += self.remove_absent_entries(
+            working_copy,
+            &absent_entries,
+            only_paths.as_ref(),
+            None,
+            effect_executor,
+        )?;
         self.persist_view_conflicts(
             view_id,
             &path_to_inode,

@@ -155,6 +155,9 @@ impl Pristine {
             // View tables
             write_txn.open_table(VIEWS)?;
             write_txn.open_table(WORKING_COPIES)?;
+            write_txn.open_table(OPERATIONS)?;
+            write_txn.open_table(OP_HEADS)?;
+            write_txn.open_table(EFFECT_RECEIPTS)?;
             write_txn.open_table(VIEW_CHANGES)?;
             write_txn.open_table(REV_VIEW_CHANGES)?;
             write_txn.open_table(CONFLICTS)?;
@@ -398,9 +401,10 @@ impl Pristine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::OperationScope;
     use crate::pristine::{
-        MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, PathClaimMutTxnT,
-        PathClaimTxnT, TreeTxnT, WorkingCopyTxnT, PATH_CLAIM_SCHEMA_VERSION,
+        MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, OperationTxnT,
+        PathClaimMutTxnT, PathClaimTxnT, TreeTxnT, WorkingCopyTxnT, PATH_CLAIM_SCHEMA_VERSION,
     };
     use tempfile::tempdir;
 
@@ -422,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_open_adds_working_copy_storage_to_legacy_schema() {
+    fn normal_open_adds_additive_storage_to_legacy_schema() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
 
@@ -455,18 +459,30 @@ mod tests {
                 txn.list_working_copies(),
                 Err(PristineError::WorkingCopySchemaUnavailable)
             ));
+            assert!(matches!(
+                txn.get_operation_heads(OperationScope::Repository),
+                Err(PristineError::OperationSchemaUnavailable)
+            ));
         }
 
         {
             let pristine = Pristine::open(&db_path).unwrap();
             let txn = pristine.read_txn().unwrap();
             assert!(txn.list_working_copies().unwrap().is_empty());
+            assert!(txn
+                .get_operation_heads(OperationScope::Repository)
+                .unwrap()
+                .is_empty());
         }
 
         {
             let pristine = Pristine::open_readonly(&db_path).unwrap();
             let txn = pristine.read_txn().unwrap();
             assert!(txn.list_working_copies().unwrap().is_empty());
+            assert!(txn
+                .get_operation_heads(OperationScope::Repository)
+                .unwrap()
+                .is_empty());
         }
     }
 

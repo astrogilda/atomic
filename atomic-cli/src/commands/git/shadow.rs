@@ -415,7 +415,7 @@ pub(crate) fn acquire_shadow_lock(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<Option<std::fs::File>> {
+) -> CliResult<Option<atomic_repository::RepositoryCommonLockGuard>> {
     match repo
         .try_lock_shadow_commit()
         .map_err(CliError::Repository)?

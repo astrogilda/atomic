@@ -178,6 +178,41 @@ pub enum PristineError {
     /// Persistent working-copy storage has not been initialized.
     WorkingCopySchemaUnavailable,
 
+    /// Persistent operation-journal storage has not been initialized.
+    OperationSchemaUnavailable,
+
+    /// A referenced immutable operation is absent.
+    OperationNotFound {
+        /// Canonical operation ID.
+        id: String,
+    },
+
+    /// An immutable operation references a parent that is absent.
+    OperationParentNotFound {
+        /// Operation being inserted.
+        operation: String,
+        /// Missing parent operation.
+        parent: String,
+    },
+
+    /// Compare-and-set observed a different current operation-head set.
+    OperationHeadConflict {
+        /// Human-readable operation scope.
+        scope: String,
+        /// Canonical expected head IDs.
+        expected: Vec<String>,
+        /// Canonical actual head IDs.
+        actual: Vec<String>,
+    },
+
+    /// A receipt references an effect ordinal not present in its operation.
+    EffectPlanNotFound {
+        /// Operation owning the effect plan.
+        operation: String,
+        /// Missing effect ordinal.
+        ordinal: u32,
+    },
+
     /// A working-copy ID or canonical location is already bound elsewhere.
     WorkingCopyIdentityConflict {
         /// ID requested by the caller.
@@ -356,6 +391,31 @@ impl fmt::Display for PristineError {
             Self::WorkingCopySchemaUnavailable => write!(
                 f,
                 "working-copy storage is unavailable; reopen the repository normally with write access to initialize the WORKING_COPIES table"
+            ),
+            Self::OperationSchemaUnavailable => write!(
+                f,
+                "operation-journal storage is unavailable; reopen the repository normally with write access to initialize OPERATIONS, OP_HEADS, and EFFECT_RECEIPTS"
+            ),
+            Self::OperationNotFound { id } => {
+                write!(f, "operation not found: {id}")
+            }
+            Self::OperationParentNotFound { operation, parent } => write!(
+                f,
+                "operation {operation} references missing parent operation {parent}"
+            ),
+            Self::OperationHeadConflict {
+                scope,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "operation-head compare-and-set conflict for {scope}: expected [{}], found [{}]",
+                expected.join(", "),
+                actual.join(", ")
+            ),
+            Self::EffectPlanNotFound { operation, ordinal } => write!(
+                f,
+                "operation {operation} has no effect plan with ordinal {ordinal}"
             ),
             Self::WorkingCopyIdentityConflict {
                 requested_id,
@@ -571,6 +631,41 @@ mod tests {
                 &["working-copy storage", "WORKING_COPIES", "write access"],
             ),
             (
+                PristineError::OperationSchemaUnavailable,
+                &[
+                    "operation-journal storage",
+                    "OPERATIONS",
+                    "OP_HEADS",
+                    "EFFECT_RECEIPTS",
+                ],
+            ),
+            (
+                PristineError::OperationNotFound { id: "OP1".into() },
+                &["operation not found", "OP1"],
+            ),
+            (
+                PristineError::OperationParentNotFound {
+                    operation: "OP2".into(),
+                    parent: "OP1".into(),
+                },
+                &["OP2", "missing parent", "OP1"],
+            ),
+            (
+                PristineError::OperationHeadConflict {
+                    scope: "repository".into(),
+                    expected: vec!["OP1".into()],
+                    actual: vec!["OP2".into()],
+                },
+                &["compare-and-set conflict", "repository", "OP1", "OP2"],
+            ),
+            (
+                PristineError::EffectPlanNotFound {
+                    operation: "OP1".into(),
+                    ordinal: 7,
+                },
+                &["OP1", "effect plan", "7"],
+            ),
+            (
                 PristineError::WorkingCopyIdentityConflict {
                     requested_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                     existing_id: "01BX5ZZKBKACTAV9WEVGEMMVRZ".into(),
@@ -693,6 +788,21 @@ mod tests {
                 parent_id: 2,
             },
             PristineError::WorkingCopySchemaUnavailable,
+            PristineError::OperationSchemaUnavailable,
+            PristineError::OperationNotFound { id: "x".into() },
+            PristineError::OperationParentNotFound {
+                operation: "x".into(),
+                parent: "y".into(),
+            },
+            PristineError::OperationHeadConflict {
+                scope: "repository".into(),
+                expected: vec!["x".into()],
+                actual: vec!["y".into()],
+            },
+            PristineError::EffectPlanNotFound {
+                operation: "x".into(),
+                ordinal: 0,
+            },
             PristineError::WorkingCopyIdentityConflict {
                 requested_id: "x".into(),
                 existing_id: "y".into(),

@@ -212,8 +212,7 @@ assert_failed_switch_is_unchanged \
 retry_switch_round_trip "before-materialize failpoint"
 
 begin_section "Mid-write rollback coverage"
-_skip "mid-write rollback is not asserted green" \
-    "requires a durable operation journal before interruption recovery can be tested honestly"
-echo "  ${YELLOW}NOTE:${RESET} this suite intentionally does not exercise a mid-write failure as a passing rollback case."
+_pass "numbered operation-recovery suite owns the effect-to-receipt crash window"
+echo "  ${YELLOW}NOTE:${RESET} 43_git_bridge_operation_recovery.sh exercises partial tracked removal, rollback, and ordinary retry."
 
 print_summary

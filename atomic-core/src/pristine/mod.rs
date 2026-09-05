@@ -175,10 +175,10 @@ pub use traits::{
     decode_working_copy_record, encode_working_copy_record, CrdtTxnT, EmbeddingsMutTxnT,
     EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GitShaIndexMutTxnT, GitShaIndexTxnT,
     GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes,
-    NativeDerivedIndexesMutTxnT, PathClaimMutTxnT, PathClaimTxnT, StoredConflict,
-    StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
-    VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
-    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
+    NativeDerivedIndexesMutTxnT, OperationMutTxnT, OperationTxnT, PathClaimMutTxnT, PathClaimTxnT,
+    StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
+    VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState,
+    ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
     WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};

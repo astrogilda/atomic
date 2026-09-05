@@ -44,11 +44,10 @@ use std::sync::Arc;
 use atomic_core::change::{Change, ChangeHeader, GraphOp};
 pub use atomic_core::output::repo::MaterializedEntry;
 use atomic_core::output::repo::{MaterializeResult, OutputItem};
-use atomic_core::output::FileSystem;
-use atomic_core::output::WorkingCopy;
+
 use atomic_core::pristine::{
     GraphTxnT, GraphVisibilityClosure, MutTxnT, Pristine, TreeTxnT, ViewMembershipSet, ViewScope,
-    ViewTxnT,
+    ViewTxnT, WorkingCopyTxnT,
 };
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position, WorkingCopyId};
@@ -81,9 +80,11 @@ use crate::RepositoryError;
 
 mod deferred_tree;
 mod filter;
+mod locks;
 mod materialize;
 mod migration;
 mod name_resolution;
+mod operation;
 mod repair;
 mod sandbox;
 mod semantic_materialize;
@@ -99,6 +100,7 @@ pub use filter::{
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
     view_membership_at_sequence, view_set_id,
 };
+pub use locks::RepositoryCommonLockGuard;
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
@@ -387,7 +389,7 @@ default = "{}"
             &change_store,
             &migration_view,
         )?;
-        let (_working_copy_id, current_view) =
+        let (working_copy_id, current_view) =
             working_copy::migrate_identity(&pristine, &layout, &migration_view)?;
         let pristine = Arc::new(pristine);
 
@@ -399,9 +401,12 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        repository.recover_pending_deferred_tree_alignment()?;
+        let operation_lock = repository.try_lock_operation(working_copy_id)?;
+        repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.recover_incomplete_operation(&operation_lock)?;
+        drop(operation_lock);
 
-        // Deferred TREE recovery is legacy code and may rewrite the compatibility
+        // Deferred TREE or operation recovery may rewrite the compatibility
         // pointer. Reassert the persistent record as the sole authority.
         let (_id, authoritative_view) =
             working_copy::load_registered_identity(&repository.pristine, &layout)?;
@@ -434,7 +439,7 @@ default = "{}"
             Pristine::open_existing(dot_dir.join("pristine.redb"))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
-        let (_working_copy_id, current_view) =
+        let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -448,7 +453,10 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        repository.recover_pending_deferred_tree_alignment()?;
+        let operation_lock = repository.try_lock_operation(working_copy_id)?;
+        repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.recover_incomplete_operation(&operation_lock)?;
+        drop(operation_lock);
         let (_id, authoritative_view) =
             working_copy::load_registered_identity(&repository.pristine, &layout)?;
         repository.current_view = authoritative_view;
@@ -499,7 +507,7 @@ default = "{}"
             Pristine::open_readonly(dot_dir.join("pristine.redb"))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
-        let (_working_copy_id, current_view) =
+        let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
 
         // Open the change store without creating missing paths.
@@ -515,9 +523,11 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        if repository.has_pending_deferred_tree_alignment() {
+        if repository.has_pending_deferred_tree_alignment()
+            || repository.working_copy_operation_requires_recovery(working_copy_id)?
+        {
             return Err(RepositoryError::InvalidOperation {
-                message: "repository view switch is still completing; retry with a writable repository open"
+                message: "repository operation is still completing; retry with a writable repository open"
                     .to_string(),
             });
         }
@@ -603,7 +613,7 @@ default = "{}"
         let dot_dir = layout.common_dot_dir.clone();
         let initial_view =
             Self::read_legacy_current_view(&layout.working_copy_dot_dir, &layout.common_dot_dir)?;
-        let (_working_copy_id, current_view) =
+        let (working_copy_id, current_view) =
             working_copy::migrate_identity(&pristine, &layout, &initial_view)?;
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -617,7 +627,10 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        repository.recover_pending_deferred_tree_alignment()?;
+        let operation_lock = repository.try_lock_operation(working_copy_id)?;
+        repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.recover_incomplete_operation(&operation_lock)?;
+        drop(operation_lock);
         let (_id, authoritative_view) =
             working_copy::load_registered_identity(&repository.pristine, &layout)?;
         repository.current_view = authoritative_view.clone();
@@ -792,33 +805,31 @@ default = "{}"
         working_copy: WorkingCopyId,
         view: &str,
     ) -> Result<(), RepositoryError> {
-        let visibility = {
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        self.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        let (record, target_view) = {
             let txn = self
                 .pristine
                 .read_txn()
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            let view_state = txn
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let record = txn
+                .get_working_copy(working_copy)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: working_copy })?;
+            let target_view = txn
                 .get_view(view)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view.to_string(),
                 })?;
-            graph_visibility_closure(&txn, &view_state)?
+            (record, target_view)
         };
-        self.update_working_copy_desired_view(working_copy, view)?;
-
-        // Linked Git worktrees have local compatibility metadata but share the
-        // canonical pristine. The legacy deferred-TREE journal is common-dir
-        // scoped, so do not let it consult or publish another working copy's
-        // pointer in this construction-only slice.
-        if self.working_copy_dot_dir() != self.dot_dir {
-            self.write_current_view(view)?;
-            self.current_view = view.to_string();
-            return Ok(());
-        }
-
-        self.align_deferred_tree_and_publish_view(view, &visibility)
-            .map(|_| ())
+        let mut target = operation::working_copy_state_ref(record);
+        target.desired_view = target_view.id;
+        target.desired_state = target_view.state;
+        target.materialized_state = None;
+        target.materialized_manifest = None;
+        self.apply_working_copy_state_locked(&operation_lock, &target)
     }
 
     /// Set the current view on this handle only.

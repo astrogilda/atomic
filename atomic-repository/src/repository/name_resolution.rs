@@ -380,6 +380,9 @@ where
                 }
                 if (candidate.event_change == other.event_change
                     && candidate.operation_index < other.operation_index)
+                    || (candidate.event_change == candidate.claim.introduced_by
+                        && other.event_change != candidate.event_change
+                        && other.claim == candidate.claim)
                     || (candidate.event_change != other.event_change
                         && change_depends_on(
                             txn,
@@ -1058,6 +1061,62 @@ mod tests {
         let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership).unwrap();
         let reduced = reduce_path_claim_entries(&txn, &visibility, &entries).unwrap();
         assert!(reduced.present.is_empty());
+        assert_eq!(reduced.absent.len(), 1);
+        txn.abort().unwrap();
+    }
+
+    #[test]
+    fn exact_claim_update_supersedes_its_introduction_without_dependency_metadata() {
+        use atomic_core::pristine::{MutTxnT, Pristine, ViewMembershipSet};
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let introduction = txn
+            .register_change(&Hash::of(b"claim introduction"))
+            .unwrap();
+        let deletion = txn
+            .register_change(&Hash::of(b"exact claim deletion"))
+            .unwrap();
+        txn.put_change_deps(introduction, &[]).unwrap();
+        txn.put_change_deps(deletion, &[]).unwrap();
+        let inode = txn.alloc_inode().unwrap();
+        let position = Position::new(introduction, ChangePosition::new(9));
+        txn.put_inode(inode, position).unwrap();
+        let claim = PathClaimId::new(
+            position,
+            GraphNode::root(),
+            GraphNode::new(introduction, ChangePosition::new(0), ChangePosition::new(4)),
+            introduction,
+        );
+        let entries = vec![
+            PathClaimEntry::new(
+                "name",
+                PathClaimEvent::new(
+                    introduction,
+                    0,
+                    PathClaimKind::File,
+                    PathClaimState::Alive,
+                    claim,
+                ),
+            ),
+            PathClaimEntry::new(
+                "name",
+                PathClaimEvent::new(
+                    deletion,
+                    0,
+                    PathClaimKind::File,
+                    PathClaimState::Dead,
+                    claim,
+                ),
+            ),
+        ];
+        let membership = ViewMembershipSet::from_ordered([introduction, deletion]);
+        let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership).unwrap();
+        let reduced = reduce_path_claim_entries(&txn, &visibility, &entries).unwrap();
+        assert!(reduced.present.is_empty());
+        assert!(reduced.conflicts.is_empty());
         assert_eq!(reduced.absent.len(), 1);
         txn.abort().unwrap();
     }

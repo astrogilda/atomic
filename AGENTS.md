@@ -363,10 +363,16 @@ This simplifies the codebase while maintaining semantic clarity.
 ├── changes/               # Content-addressed change files
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration
+├── bridge.lock            # Common outer operation lock
 ├── working_copy_id        # Canonical 26-character WorkingCopyId (ULID)
 ├── current_view           # Derived compatibility output; never authoritative
+├── operation-recovery/    # Same-filesystem staging/tombstones for this worktree
 └── working-copies/
     └── <working-copy-id>/
+        ├── operation.lock  # Per-working-copy operation lock
+        ├── shelf.lock      # Final-rank shelf effect lock
+        ├── operation-recovery/
+        │   └── <operation-id>/ # Immutable expected-old recovery bytes
         └── workspaces/
             └── <view_name>/ # Per-working-copy shelved artifacts
 ```
@@ -378,6 +384,54 @@ and agent sandboxes have distinct IDs. Linked worktrees keep local
 `.atomic/repository` pointer to the common Atomic directory. Working-copy-aware
 repository APIs require an explicit `WorkingCopyId`; view-scoped graph APIs remain
 usable without one.
+
+### Operation and Effect Journal
+
+`OPERATIONS` stores immutable, versioned operation payloads under typed,
+domain-separated `OperationId` hashes. The hash covers the complete canonical
+immutable payload and excludes only the derived ID, mutable head sets, receipts,
+and execution phase. `OP_HEADS` stores a sorted multi-head set per repository or
+working-copy scope and changes only through compare-and-set. `EFFECT_RECEIPTS`
+appends immutable, content-addressed outcomes keyed by operation and receipt ID.
+
+Each `EffectPlan` has a stable ordinal, typed target, `expected_old`, and
+`expected_new`. A resource is mutated only when its observation equals one of
+those leases:
+
+- `observed == expected_old`: apply the transition.
+- `observed == expected_new`: the effect already landed; append/reuse the
+  deterministic recovery receipt without repeating the mutation.
+- Any third value: record lease rejection and fail closed rather than overwrite
+  newer external work.
+
+Prepared operations and receipts use immediate redb durability. Incomplete
+non-recovery heads produce an immutable inverse `Recover` child; incomplete
+recovery heads resume in place. Filesystem and shelf old values are retained at
+`.atomic/working-copies/<id>/operation-recovery/<operation-id>/` until later GC.
+Worktree directory staging and rollback tombstones use the working-copy-local
+`.atomic/operation-recovery/<operation-id>/` so linked worktrees remain safe even
+when the common Atomic directory is on another filesystem.
+Writable repository open performs the same idempotent recovery before accepting a
+new operation.
+
+Operation resources are nonblocking cross-process locks acquired only in this
+order:
+
+```
+common .atomic/bridge.lock
+  → working-copies/<id>/operation.lock
+    → pristine write transaction
+      → working-copies/<id>/shelf.lock or deferred-tree-alignment.lock
+```
+
+Contention returns a typed retry error before operation or filesystem mutation.
+The shadow Git pipeline shares `bridge.lock`; it is not an independent lock
+namespace.
+
+Relevant code: `atomic-core/src/operation/`,
+`atomic-core/src/pristine/traits/operation.rs`,
+`atomic-repository/src/repository/operation.rs`, and
+`atomic-repository/src/repository/locks.rs`.
 
 ### Workspace Shelving
 
@@ -474,6 +528,9 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `INODE_GRAPH` | (Inode, GraphNode) ([u8; 32]) | [GraphEdge] | File-scoped index |
 | `VIEWS` | name (str) | ViewState (var) | View metadata (scope, parent, merkle) |
 | `WORKING_COPIES` | WorkingCopyId ([u8; 16]) | WorkingCopyRecord (versioned bytes) | Desired/materialized state per physical working directory or Git worktree |
+| `OPERATIONS` | OperationId ([u8; 32]) | Operation payload (versioned bytes) | Append-only immutable operation plans |
+| `OP_HEADS` | OperationScope ([u8; 17]) | OperationHeads (versioned bytes) | CAS-updated sorted heads per repository/working copy |
+| `EFFECT_RECEIPTS` | (OperationId, EffectReceiptId) ([u8; 64]) | EffectReceipt payload (versioned bytes) | Append-only leased effect outcomes |
 | `VIEW_CHANGES` | (view_id, seq) ([u8; 16]) | change_id (u64) | Change log per view |
 | `REV_VIEW_CHANGES` | (view_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
 | `TREE` | path (str) | inode (u64) | Path → inode |

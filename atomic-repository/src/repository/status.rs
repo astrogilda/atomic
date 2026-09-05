@@ -196,6 +196,13 @@ impl Repository {
         // an undelete of the original inode rather than an untracked new file.
         for absent in &projected_absent {
             let normalized = PathBuf::from(&absent.path);
+            // A projected deletion is already the recorded state. Reintroduce
+            // it only when an entry actually reappears on disk, where it must
+            // be classified as an undelete of the stable inode rather than as
+            // an untracked add.
+            if std::fs::symlink_metadata(self.root.join(&normalized)).is_err() {
+                continue;
+            }
             if !options.path_filters.is_empty() {
                 let matches = options
                     .path_filters

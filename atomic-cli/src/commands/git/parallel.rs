@@ -1721,10 +1721,7 @@ fn build_graph_first_change(
             }
             FileOperation::Deleted => {
                 let Some(indexed) = line_index.files.get(&file.path) else {
-                    skips.push(GraphFirstSkip::new(
-                        file,
-                        "delete_missing_line_index_cleanup_only",
-                    ));
+                    skips.push(GraphFirstSkip::new(file, "delete_missing_line_index"));
                     deleted_paths.push(file.path.clone());
                     pending.push(PendingLineIndexUpdate::Delete {
                         path: file.path.clone(),
@@ -1994,12 +1991,7 @@ fn build_graph_first_change(
         return Err(skips);
     }
 
-    let fatal_skips: Vec<GraphFirstSkip> = skips
-        .iter()
-        .filter(|skip| skip.reason != "delete_missing_line_index_cleanup_only")
-        .cloned()
-        .collect();
-    if !fatal_skips.is_empty() {
+    if !skips.is_empty() {
         return Err(skips);
     }
 
@@ -2038,12 +2030,10 @@ fn build_graph_first_skip_reasons(
                 }
             }
             FileOperation::Deleted => {
-                if !line_index.files.contains_key(&file.path) {
-                    skips.push(GraphFirstSkip::new(
-                        file,
-                        "delete_missing_line_index_cleanup_only",
-                    ));
-                }
+                skips.push(GraphFirstSkip::new(
+                    file,
+                    "delete_requires_structural_file_del",
+                ));
             }
             FileOperation::Renamed => {
                 if file.old_path.is_none() {
@@ -3098,8 +3088,11 @@ impl ParallelImporter {
             .map_err(|e| CliError::Internal(e.into()))?;
         line_index.seed_missing_modified_files(repo, parsed);
         let graph_first_skips = build_graph_first_skip_reasons(parsed, line_index);
-        let graph_first_result =
-            build_graph_first_change(header.clone(), parsed, line_index, self.options.graph_only);
+        let graph_first_result = if graph_first_skips.is_empty() {
+            build_graph_first_change(header.clone(), parsed, line_index, self.options.graph_only)
+        } else {
+            Err(graph_first_skips.clone())
+        };
 
         if let Ok((mut graph_change, pending_updates, graph_deleted_paths)) = graph_first_result {
             graph_change.unhashed = Some(self.build_git_metadata(parsed, false, false));
@@ -3473,82 +3466,33 @@ impl ParallelImporter {
                 }
 
                 FileOperation::Deleted => {
-                    // Use old content from Phase 1 (captured from git parent
-                    // tree) so the diff can show deleted lines — avoids O(N)
-                    // graph scan.
-                    let old_content = file.old_content.as_deref().unwrap_or(&[]).to_vec();
-
-                    if !old_content.is_empty() {
-                        // Record as a modification that removes all content:
-                        // old_content = the file's current bytes, new_content = empty.
-                        // This produces proper BranchOp::Delete entries with line content
-                        // so that `atomic diff -c` can show what was deleted.
-                        let del_wc = Memory::new();
-                        // Empty new content — the file is being deleted.
-                        del_wc.add_file(&file.path, b"");
-
-                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
-                            let mut detected = DetectedFile::modified(&file.path);
-                            detected.inode = Some(inode);
-                            detected.position = Some(pos);
-                            match record_modified_file(
-                                &del_wc,
-                                &detected,
-                                &old_content,
-                                None, // no separate CRDT old content
-                                &core_options,
-                                None, // git-import path has no existing trunk binding here
-                                None, // git-import path overrides CRDT ops below
-                            ) {
-                                Ok(mut rec) if !rec.is_empty() => {
-                                    // Override CRDT ops with git's exact diff lines
-                                    // so `atomic diff -c` shows what git shows.
-                                    if let Some(ref diff_lines) = file.diff_lines {
-                                        use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
-                                        let (git_file_ops, _) =
-                                            build_crdt_ops_from_git_diff(&file.path, diff_lines);
-                                        rec.set_crdt_ops(git_file_ops);
-                                    }
-                                    recorded_files.push(rec);
-                                }
-                                _ => {
-                                    // Fall back to simple delete if modified recording fails
-                                    let mut det = DetectedFile::deleted(&file.path);
-                                    if let Ok(Some((inode, pos))) =
-                                        repo.get_inode_and_position(&file.path)
-                                    {
-                                        det.inode = Some(inode);
-                                        det.position = Some(pos);
-                                    }
-                                    if let Ok(rec) = record_deleted_file(&det, &core_options) {
-                                        if !rec.is_empty() {
-                                            recorded_files.push(rec);
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // No inode — try simple delete
-                            let det = DetectedFile::deleted(&file.path);
-                            if let Ok(rec) = record_deleted_file(&det, &core_options) {
-                                if !rec.is_empty() {
-                                    recorded_files.push(rec);
-                                }
-                            }
-                        }
-                    } else {
-                        // Empty old content — just record a simple deletion
-                        let mut det = DetectedFile::deleted(&file.path);
-                        if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
-                            det.inode = Some(inode);
-                            det.position = Some(pos);
-                        }
-                        if let Ok(rec) = record_deleted_file(&det, &core_options) {
-                            if !rec.is_empty() {
-                                recorded_files.push(rec);
-                            }
-                        }
+                    let (inode, position) = repo
+                        .get_inode_and_position(&file.path)
+                        .map_err(|error| CliError::Internal(error.into()))?
+                        .ok_or_else(|| {
+                            CliError::Internal(anyhow::anyhow!(
+                                "cannot import deletion '{}': no stable inode binding",
+                                file.path
+                            ))
+                        })?;
+                    let mut detected = DetectedFile::deleted(&file.path);
+                    detected.inode = Some(inode);
+                    detected.position = Some(position);
+                    let mut recorded = record_deleted_file(&detected, &core_options)
+                        .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
+                    if let Some(ref diff_lines) = file.diff_lines {
+                        use atomic_core::record::workflow::build_crdt_ops_from_git_diff;
+                        let (git_file_ops, _) =
+                            build_crdt_ops_from_git_diff(&file.path, diff_lines);
+                        recorded.set_crdt_ops(git_file_ops);
                     }
+                    if recorded.is_empty() {
+                        return Err(CliError::Internal(anyhow::anyhow!(
+                            "cannot import deletion '{}': canonical FileDel is empty",
+                            file.path
+                        )));
+                    }
+                    recorded_files.push(recorded);
                 }
             }
         }
@@ -3594,6 +3538,7 @@ impl ParallelImporter {
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
+
         // Index git SHA → Atomic change in GIT_SHA_INDEX
         let _ = repo.index_git_sha(&parsed.git_sha, &write_outcome.hash);
         let write_ms = write_start.elapsed().as_millis();
@@ -3621,12 +3566,9 @@ impl ParallelImporter {
             }
         }
 
-        // Files deleted via record_modified_file (the "show diff lines" path)
-        // produce GraphOp::Replacement, not GraphOp::FileDel, so insert_change
-        // never removes their TREE entries.  Explicitly untrack them now so that
-        // `atomic status` after import matches the git working copy.
-        // Also remove from FILE_INDEX so status doesn't show them as deleted.
-        // Batch-remove deleted files from TREE and FILE_INDEX in single write txns.
+        // The immutable change carries FileDel for every deleted path. Remove
+        // stale FILE_INDEX rows after applying that canonical graph operation so
+        // status cannot reuse a pre-delete cache entry.
         if !self.options.preserve_working_copy && !deleted_paths.is_empty() {
             let cleanup_start = Instant::now();
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();

@@ -31,6 +31,7 @@
 pub mod change;
 pub mod crdt;
 pub mod diff;
+pub mod operation;
 pub mod pristine;
 pub mod types;
 
@@ -50,6 +51,16 @@ pub mod merge;
 // Re-export commonly used types
 pub use types::*;
 
+// Re-export operation types
+pub use operation::{
+    ActorRef, CheckpointKind, DigestKind, EffectPlan, EffectReceipt, EffectReceiptKind,
+    EffectReceiptPayload, EffectTarget, EffectValue, FileKind, FileState, GitHashAlgorithm,
+    GitHeadState, GitIndexState, GitObjectId, GitRefObservation, GitRefTarget, GitStateRef,
+    Operation, OperationCodecError, OperationHeads, OperationKind, OperationLossNote,
+    OperationPayload, OperationScope, RepoStateDelta, RepoStateRef, VerificationScope,
+    ViewStateRef, WorkingCopyStateRef,
+};
+
 // Re-export change types
 pub use change::{
     AITool, AIVendor, Atom, Author, Change, ChangeError, ChangeHeader, Cost, Credit, CreditRange,
@@ -61,9 +72,10 @@ pub use change::{
 pub use pristine::ontology;
 pub use pristine::{EmbeddingRecord, KgEdge, KgNode, KgQueryResponse, KgSubgraph, SearchResult};
 pub use pristine::{
-    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, Pristine,
-    PristineError, PristineResult, ReadTxn, TreeTxnT, VaultEntry, VaultEntryMeta, VaultEntryType,
-    VaultManifest, VaultMutTxnT, VaultTxnT, VertexExt, ViewState, ViewTxnT, WriteTxn,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, OperationMutTxnT,
+    OperationTxnT, Pristine, PristineError, PristineResult, ReadTxn, TreeTxnT, VaultEntry,
+    VaultEntryMeta, VaultEntryType, VaultManifest, VaultMutTxnT, VaultTxnT, VertexExt, ViewState,
+    ViewTxnT, WriteTxn,
 };
 
 // Re-export diff types

@@ -1,5 +1,6 @@
 //! Error types for repository operations
 
+use std::fmt;
 use std::path::PathBuf;
 
 use atomic_core::WorkingCopyId;
@@ -9,6 +10,30 @@ use crate::remote::RemoteError;
 
 /// Result type for repository operations
 pub type Result<T> = std::result::Result<T, RepositoryError>;
+
+/// A cross-process lock participating in the repository operation hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryLockKind {
+    /// Repository-common refs, bindings, and operation state.
+    Common,
+    /// Index and materialization state for one persistent working copy.
+    WorkingCopy { id: WorkingCopyId },
+    /// Shelved filesystem state for one persistent working copy.
+    Shelf { id: WorkingCopyId },
+    /// Repository-common deferred TREE journal and alignment state.
+    DeferredTree,
+}
+
+impl fmt::Display for RepositoryLockKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Common => formatter.write_str("common repository operation lock"),
+            Self::WorkingCopy { id } => write!(formatter, "working-copy operation lock for {id}"),
+            Self::Shelf { id } => write!(formatter, "working-copy shelf lock for {id}"),
+            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),
+        }
+    }
+}
 
 /// Errors that can occur during repository operations
 #[derive(Debug, Error)]
@@ -173,7 +198,14 @@ pub enum RepositoryError {
     #[error("Unrecord error: {0}")]
     Unrecord(String),
 
-    /// Lock error (another process holds the lock)
+    /// An ordered operation lock is held by another process.
+    #[error("{lock} at '{}' is held by another process; retry the operation", path.display())]
+    LockContended {
+        lock: RepositoryLockKind,
+        path: PathBuf,
+    },
+
+    /// Legacy unscoped lock error.
     #[error("Repository is locked by another process")]
     Locked,
 
@@ -259,6 +291,11 @@ pub enum RepositoryError {
 }
 
 impl RepositoryError {
+    /// Whether retrying after the competing operation completes can succeed.
+    pub fn is_lock_contended(&self) -> bool {
+        matches!(self, RepositoryError::LockContended { .. })
+    }
+
     /// Check if this error indicates the repository doesn't exist
     pub fn is_not_found(&self) -> bool {
         matches!(

@@ -1,5 +1,11 @@
 use super::*;
 
+use atomic_core::operation::{
+    ActorRef, EffectPlan, EffectReceiptKind, EffectTarget, EffectValue, FileKind, FileState,
+    Operation, RepoStateRef, ViewStateRef,
+};
+use atomic_core::pristine::OperationTxnT;
+
 /// Return the workspace directory path for a given view.
 ///
 /// The path is `.atomic/workspaces/<view_name>/`.  View names may
@@ -57,32 +63,304 @@ fn ensure_working_copy_workspace_dir(
 /// Extracting this into a standalone helper keeps `switch_view` at the
 /// orchestration level and makes the cleanup logic reusable for other
 /// operations (e.g. `atomic clean`).
-fn cleanup_empty_ancestors<'a>(
-    _working_copy: WorkingCopyId,
-    root: &Path,
-    removed_paths: impl Iterator<Item = &'a str>,
-) {
-    let mut dirs: HashSet<PathBuf> = HashSet::new();
-    for path in removed_paths {
-        let p = PathBuf::from(path);
-        let mut ancestor = p.parent();
-        while let Some(dir) = ancestor {
-            if dir == Path::new("") || dir == Path::new(".") {
-                break;
-            }
-            dirs.insert(dir.to_path_buf());
-            ancestor = dir.parent();
+fn rename_and_sync(source: &Path, destination: &Path) -> Result<(), RepositoryError> {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| RepositoryError::InvalidOperation {
+            message: format!("rename source has no parent: {}", source.display()),
+        })?;
+    let destination_parent =
+        destination
+            .parent()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!(
+                    "rename destination has no parent: {}",
+                    destination.display()
+                ),
+            })?;
+    std::fs::rename(source, destination)?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(source_parent)?.sync_all()?;
+        if source_parent != destination_parent {
+            std::fs::File::open(destination_parent)?.sync_all()?;
         }
     }
-    // Sort deepest-first so children are removed before parents.
-    let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
-    sorted.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
-    for dir in sorted {
-        let abs = root.join(&dir);
-        if abs.is_dir() {
-            // Only succeeds if the directory is empty — safe by construction.
-            let _ = std::fs::remove_dir(&abs);
+    Ok(())
+}
+
+fn operation_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[cfg(unix)]
+fn default_regular_mode() -> u32 {
+    0o644
+}
+
+#[cfg(not(unix))]
+fn default_regular_mode() -> u32 {
+    0o666
+}
+
+#[cfg(unix)]
+fn default_directory_mode() -> u32 {
+    0o755
+}
+
+#[cfg(not(unix))]
+fn default_directory_mode() -> u32 {
+    0o666
+}
+
+struct SwitchMaterializationExecutor<'a> {
+    repository: &'a Repository,
+    operation_lock: &'a super::locks::WorkingCopyOperationLockGuard,
+    operation: Operation,
+}
+
+impl SwitchMaterializationExecutor<'_> {
+    fn effect_for_expected_new(
+        &self,
+        path: &str,
+        predicate: impl Fn(&EffectValue) -> bool,
+    ) -> Option<&EffectPlan> {
+        self.operation
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .rev()
+            .find(|effect| {
+                matches!(
+                    &effect.target,
+                    EffectTarget::FilesystemPath { path: target } if target == path
+                ) && predicate(&effect.expected_new)
+            })
+    }
+
+    fn execute_effect(
+        &self,
+        effect: &EffectPlan,
+        content: Option<&[u8]>,
+    ) -> Result<super::operation::PendingFilesystemEffect, RepositoryError> {
+        self.repository.execute_filesystem_effect(
+            self.operation_lock,
+            self.operation.id(),
+            effect.ordinal,
+            content,
+        )
+    }
+
+    fn execute_absence(
+        &self,
+        path: &str,
+    ) -> Result<super::operation::PendingFilesystemEffect, RepositoryError> {
+        let effect = self
+            .effect_for_expected_new(path, |value| *value == EffectValue::Absent)
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted removal lease for '{path}'"),
+            })?;
+        self.execute_effect(effect, None)
+    }
+
+    fn execute_directory(
+        &self,
+        path: &str,
+    ) -> Result<super::operation::PendingFilesystemEffect, RepositoryError> {
+        let effect = self
+            .effect_for_expected_new(path, |value| {
+                matches!(value, EffectValue::File(state) if state.kind == FileKind::Directory)
+            })
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted directory lease for '{path}'"),
+            })?;
+        self.execute_effect(effect, None)
+    }
+
+    fn execute_file(
+        &self,
+        path: &str,
+        content: &[u8],
+    ) -> Result<super::operation::PendingFilesystemEffect, RepositoryError> {
+        let content_hash = Hash::of(content);
+        let effect = self
+            .effect_for_expected_new(path, |value| {
+                matches!(
+                    value,
+                    EffectValue::File(state)
+                        if state.kind == FileKind::Regular && state.content == content_hash
+                )
+            })
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted file lease for '{path}'"),
+            })?;
+        self.execute_effect(effect, Some(content))
+    }
+
+    fn record(
+        &self,
+        pending: super::operation::PendingFilesystemEffect,
+    ) -> Result<bool, RepositoryError> {
+        self.repository.record_pending_filesystem_effect(
+            self.operation_lock,
+            self.operation.id(),
+            pending,
+        )
+    }
+
+    fn complete_remaining(&mut self, target_view: &str) -> Result<(), RepositoryError> {
+        let completed: HashSet<u32> = {
+            let txn = self
+                .repository
+                .pristine
+                .read_txn()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            txn.get_effect_receipts(self.operation.id())
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .into_iter()
+                .filter_map(|receipt| match receipt.payload().kind {
+                    EffectReceiptKind::Applied
+                    | EffectReceiptKind::Recovered
+                    | EffectReceiptKind::RolledBack => receipt.payload().effect_ordinal,
+                    EffectReceiptKind::Verified | EffectReceiptKind::LeaseRejected => None,
+                })
+                .collect()
+        };
+        let effects: Vec<EffectPlan> = self
+            .operation
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.target, EffectTarget::FilesystemPath { .. }))
+            .cloned()
+            .collect();
+        for effect in effects {
+            if completed.contains(&effect.ordinal) {
+                continue;
+            }
+            let EffectTarget::FilesystemPath { path } = &effect.target else {
+                continue;
+            };
+            let observed = self
+                .repository
+                .observe_filesystem_effect(self.operation_lock.working_copy(), &effect.target)?;
+            let pending = if observed == effect.expected_old {
+                let content = match &effect.expected_new {
+                    EffectValue::File(state) if state.kind == FileKind::Regular => Some(
+                        self.repository
+                            .switch_target_file_bytes(path, target_view)?
+                            .ok_or_else(|| RepositoryError::InvalidOperation {
+                                message: format!(
+                                    "target view '{target_view}' has no bytes for leased path '{path}'"
+                                ),
+                            })?,
+                    ),
+                    _ => None,
+                };
+                self.repository.execute_filesystem_effect(
+                    self.operation_lock,
+                    self.operation.id(),
+                    effect.ordinal,
+                    content.as_deref(),
+                )?
+            } else if observed == effect.expected_new {
+                self.repository.execute_filesystem_effect(
+                    self.operation_lock,
+                    self.operation.id(),
+                    effect.ordinal,
+                    None,
+                )?
+            } else {
+                self.repository.record_effect_outcome(
+                    self.operation_lock,
+                    self.operation.id(),
+                    effect.ordinal,
+                    observed.clone(),
+                    observed,
+                )?;
+                unreachable!("divergent receipt recording always returns an error")
+            };
+            self.record(pending)?;
         }
+        Ok(())
+    }
+}
+
+impl super::materialize::MaterializationEffectExecutor for SwitchMaterializationExecutor<'_> {
+    fn create_directory(&mut self, path: &str) -> Result<bool, RepositoryError> {
+        if self
+            .effect_for_expected_new(path, |value| {
+                matches!(value, EffectValue::File(state) if state.kind == FileKind::Directory)
+            })
+            .is_none()
+        {
+            return match std::fs::symlink_metadata(self.repository.root().join(path)) {
+                Ok(metadata) if metadata.is_dir() => Ok(false),
+                Ok(_) => Err(RepositoryError::InvalidOperation {
+                    message: format!("unleased non-directory entry blocks '{path}'"),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(RepositoryError::InvalidOperation {
+                        message: format!("switch operation omitted directory lease for '{path}'"),
+                    })
+                }
+                Err(error) => Err(RepositoryError::Io(error)),
+            };
+        }
+        let pending = self.execute_directory(path)?;
+        self.record(pending)
+    }
+
+    fn write_file(&mut self, path: &str, content: &[u8]) -> Result<bool, RepositoryError> {
+        let content_hash = Hash::of(content);
+        if self
+            .effect_for_expected_new(path, |value| {
+                matches!(
+                    value,
+                    EffectValue::File(state)
+                        if state.kind == FileKind::Regular && state.content == content_hash
+                )
+            })
+            .is_none()
+        {
+            return match std::fs::read(self.repository.root().join(path)) {
+                Ok(current) if current == content => Ok(false),
+                Ok(_) => Err(RepositoryError::InvalidOperation {
+                    message: format!("unleased filesystem content changed at '{path}'"),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(RepositoryError::InvalidOperation {
+                        message: format!("switch operation omitted file lease for '{path}'"),
+                    })
+                }
+                Err(error) => Err(RepositoryError::Io(error)),
+            };
+        }
+        let pending = self.execute_file(path, content)?;
+        self.record(pending)
+    }
+
+    fn remove_path(&mut self, path: &str) -> Result<bool, RepositoryError> {
+        if self
+            .effect_for_expected_new(path, |value| *value == EffectValue::Absent)
+            .is_none()
+        {
+            return match std::fs::symlink_metadata(self.repository.root().join(path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Ok(_) => Err(RepositoryError::InvalidOperation {
+                    message: format!("switch operation omitted removal lease for '{path}'"),
+                }),
+                Err(error) => Err(RepositoryError::Io(error)),
+            };
+        }
+        let pending = self.execute_absence(path)?;
+        self.record(pending)
     }
 }
 
@@ -123,12 +401,47 @@ impl Repository {
         working_copy: WorkingCopyId,
         view: &str,
     ) -> Result<MaterializeResult, RepositoryError> {
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        self.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        self.recover_incomplete_operation(&operation_lock)?;
+
+        match self.switch_view_journaled(&operation_lock, working_copy, view) {
+            Ok(result) => Ok(result),
+            Err(operation_error) => match self.recover_incomplete_operation(&operation_lock) {
+                Ok(_) => Err(operation_error),
+                Err(recovery_error) => Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "switch failed ({operation_error}); lease-safe recovery also failed ({recovery_error})"
+                    ),
+                }),
+            },
+        }
+    }
+
+    fn switch_view_journaled(
+        &mut self,
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
+        working_copy: WorkingCopyId,
+        view: &str,
+    ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         let old_view_name = self.desired_view_name(working_copy)?;
+        let before_record = self.working_copy_record(working_copy)?;
 
         // Resolve both views and validate both dependency closures before the
         // switch publishes a pointer or mutates TREE-derived state.
-        let (old_files, new_files, new_visibility, new_view_id) = {
+        let (
+            old_files,
+            new_files,
+            old_directories,
+            new_directories,
+            new_absent_files,
+            new_absent_directories,
+            new_visibility,
+            new_view_id,
+            old_state,
+            new_state,
+        ) = {
             let txn = self
                 .pristine
                 .read_txn()
@@ -152,19 +465,70 @@ impl Repository {
             let new_visibility = graph_visibility_from_membership(&txn, &new_membership)?;
             let old_projection = self.project_tree_for_visibility(&txn, &old_visibility)?;
             let new_projection = self.project_tree_for_visibility(&txn, &new_visibility)?;
-            let old_files: HashSet<String> = old_projection
-                .present
-                .into_iter()
-                .filter_map(|(path, item)| (!item.is_directory).then_some(path))
+            let mut old_files = HashSet::new();
+            let mut old_directories = HashSet::new();
+            for (path, item) in old_projection.present {
+                if item.is_directory {
+                    old_directories.insert(path);
+                } else {
+                    old_files.insert(path);
+                }
+            }
+            for (path, conflict) in old_projection.name_conflicts {
+                if conflict.sides.iter().all(|side| side.is_directory()) {
+                    old_directories.insert(path);
+                } else {
+                    old_files.insert(path);
+                }
+            }
+            let new_absent_files: HashSet<String> = new_projection
+                .absent_metadata
+                .values()
+                .filter(|entry| !entry.directory)
+                .map(|entry| entry.path.clone())
                 .collect();
-            let new_files: HashSet<String> = new_projection
-                .present
-                .into_iter()
-                .filter_map(|(path, item)| (!item.is_directory).then_some(path))
+            let new_absent_directories: HashSet<String> = new_projection
+                .absent_metadata
+                .values()
+                .filter(|entry| entry.directory)
+                .map(|entry| entry.path.clone())
                 .collect();
+            let mut new_files = HashSet::new();
+            let mut new_directories = HashSet::new();
+            for (path, item) in new_projection.present {
+                if item.is_directory {
+                    new_directories.insert(path);
+                } else {
+                    new_files.insert(path);
+                }
+            }
+            for (path, conflict) in new_projection.name_conflicts {
+                if conflict.sides.iter().all(|side| side.is_directory()) {
+                    new_directories.insert(path);
+                } else {
+                    new_files.insert(path);
+                }
+            }
 
-            (old_files, new_files, new_visibility, new_view.id)
+            (
+                old_files,
+                new_files,
+                old_directories,
+                new_directories,
+                new_absent_files,
+                new_absent_directories,
+                new_visibility,
+                new_view.id,
+                old_view.state,
+                new_view.state,
+            )
         };
+        if old_view_name == view
+            && before_record.desired_state == new_state
+            && before_record.materialized_state == Some(new_state)
+        {
+            return Ok(MaterializeResult::default());
+        }
 
         // Render the complete target before publishing the target pointer,
         // shelving ignored files, or removing tracked paths. This does not make
@@ -177,10 +541,306 @@ impl Repository {
             new_view_id,
         )?;
 
-        // Apply only the small set of view-scoped TREE operations and publish
-        // the new pointer while holding the same database write lock. A marker
-        // makes the transition recoverable if the process exits mid-switch.
-        self.align_to_view(working_copy, view)?;
+        let mut tracked_paths: HashSet<String> = old_files.union(&new_files).cloned().collect();
+        tracked_paths.extend(old_directories.iter().cloned());
+        tracked_paths.extend(new_directories.iter().cloned());
+        let ignored_paths = self.collect_switch_ignored_paths(&tracked_paths);
+        let new_ws = working_copy_workspace_path(&self.dot_dir, working_copy, view);
+        let restore_paths = if new_ws.is_dir() {
+            self.collect_ignored_paths_in_workspace(&new_ws)
+        } else {
+            Vec::new()
+        };
+
+        let before_working_copy = super::operation::working_copy_state_ref(before_record);
+        let mut target_unmaterialized = before_working_copy.clone();
+        target_unmaterialized.desired_view = new_view_id;
+        target_unmaterialized.desired_state = new_state;
+        target_unmaterialized.materialized_state = None;
+        target_unmaterialized.materialized_manifest = None;
+        let mut target_materialized = target_unmaterialized.clone();
+        target_materialized.materialized_state = Some(new_state);
+
+        let before_state = RepoStateRef {
+            view: Some(ViewStateRef {
+                name: old_view_name.clone(),
+                state: old_state,
+                set_id: None,
+            }),
+            working_copy: Some(before_working_copy.clone()),
+            git: None,
+        };
+        let after_state = RepoStateRef {
+            view: Some(ViewStateRef {
+                name: view.to_string(),
+                state: new_state,
+                set_id: None,
+            }),
+            working_copy: Some(target_materialized.clone()),
+            git: None,
+        };
+
+        let working_copy_target = EffectTarget::WorkingCopy { working_copy };
+        let before_working_value = EffectValue::WorkingCopy(before_working_copy);
+        let target_unmaterialized_value = EffectValue::WorkingCopy(target_unmaterialized.clone());
+        let mut effects = Vec::new();
+        if before_working_value != target_unmaterialized_value {
+            effects.push(EffectPlan {
+                ordinal: 0,
+                target: working_copy_target.clone(),
+                expected_old: before_working_value.clone(),
+                expected_new: target_unmaterialized_value.clone(),
+            });
+        }
+
+        for path in &ignored_paths {
+            let source = EffectTarget::WorkspacePath {
+                working_copy,
+                path: path.clone(),
+            };
+            let source_old = self.observe_filesystem_effect(working_copy, &source)?;
+            if source_old == EffectValue::Absent {
+                continue;
+            }
+            let shelf = EffectTarget::ShelfPath {
+                working_copy,
+                view: old_view_name.clone(),
+                path: path.clone(),
+            };
+            let shelf_old = self.observe_filesystem_effect(working_copy, &shelf)?;
+            if shelf_old == source_old {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: source,
+                    expected_old: source_old,
+                    expected_new: EffectValue::Absent,
+                });
+                continue;
+            }
+            if shelf_old != EffectValue::Absent {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: shelf.clone(),
+                    expected_old: shelf_old,
+                    expected_new: EffectValue::Absent,
+                });
+            }
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: source,
+                expected_old: source_old.clone(),
+                expected_new: EffectValue::Absent,
+            });
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: shelf,
+                expected_old: EffectValue::Absent,
+                expected_new: source_old,
+            });
+        }
+
+        let mut removal_paths: HashSet<String> = old_files
+            .difference(&new_files)
+            .cloned()
+            .chain(old_directories.difference(&new_directories).cloned())
+            .chain(new_absent_files.iter().cloned())
+            .chain(new_absent_directories.iter().cloned())
+            .collect();
+        removal_paths.extend(old_files.intersection(&new_directories).cloned());
+        removal_paths.extend(old_directories.intersection(&new_files).cloned());
+        let mut removal_paths: Vec<String> = removal_paths.into_iter().collect();
+        removal_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+        for path in removal_paths {
+            let target = EffectTarget::FilesystemPath { path };
+            let expected_old = self.observe_filesystem_effect(working_copy, &target)?;
+            if expected_old != EffectValue::Absent {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target,
+                    expected_old,
+                    expected_new: EffectValue::Absent,
+                });
+            }
+        }
+
+        let mut directories_to_create: Vec<String> = new_directories
+            .difference(&old_directories)
+            .cloned()
+            .collect();
+        directories_to_create.sort_by_key(|path| path.matches('/').count());
+        for path in directories_to_create {
+            let target = EffectTarget::FilesystemPath { path };
+            let mut expected_old = effects
+                .iter()
+                .rev()
+                .find(|effect| effect.target == target)
+                .map(|effect| effect.expected_new.clone())
+                .unwrap_or(self.observe_filesystem_effect(working_copy, &target)?);
+            if matches!(
+                &expected_old,
+                EffectValue::File(state) if state.kind != FileKind::Directory
+            ) {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: target.clone(),
+                    expected_old,
+                    expected_new: EffectValue::Absent,
+                });
+                expected_old = EffectValue::Absent;
+            }
+            let mode = match &expected_old {
+                EffectValue::File(state) if state.kind == FileKind::Directory => state.mode,
+                _ => default_directory_mode(),
+            };
+            let expected_new = super::operation::filesystem_directory_value(mode);
+            if expected_old != expected_new {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target,
+                    expected_old,
+                    expected_new,
+                });
+            }
+        }
+
+        let mut files_to_write: Vec<String> = new_files.iter().cloned().collect();
+        files_to_write.sort();
+        for path in files_to_write {
+            let target = EffectTarget::FilesystemPath { path: path.clone() };
+            let mut expected_old = effects
+                .iter()
+                .rev()
+                .find(|effect| effect.target == target)
+                .map(|effect| effect.expected_new.clone())
+                .unwrap_or(self.observe_filesystem_effect(working_copy, &target)?);
+            if matches!(
+                &expected_old,
+                EffectValue::File(state) if state.kind == FileKind::Directory
+            ) {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: target.clone(),
+                    expected_old,
+                    expected_new: EffectValue::Absent,
+                });
+                expected_old = EffectValue::Absent;
+            }
+            let bytes = self
+                .switch_target_file_bytes(&path, view)?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "target view '{view}' projects '{path}' as a file without materialized content"
+                    ),
+                })?;
+            let mode = match &expected_old {
+                EffectValue::File(state) if state.kind == FileKind::Regular => state.mode,
+                _ => default_regular_mode(),
+            };
+            let expected_new = EffectValue::File(FileState {
+                kind: FileKind::Regular,
+                mode,
+                content: Hash::of(&bytes),
+            });
+            if expected_old != expected_new {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target,
+                    expected_old,
+                    expected_new,
+                });
+            }
+        }
+
+        for path in &restore_paths {
+            let shelf = EffectTarget::ShelfPath {
+                working_copy,
+                view: view.to_string(),
+                path: path.clone(),
+            };
+            let shelf_old = effects
+                .iter()
+                .rev()
+                .find(|effect| effect.target == shelf)
+                .map(|effect| effect.expected_new.clone())
+                .unwrap_or(self.observe_filesystem_effect(working_copy, &shelf)?);
+            if shelf_old == EffectValue::Absent {
+                continue;
+            }
+            let destination = EffectTarget::WorkspacePath {
+                working_copy,
+                path: path.clone(),
+            };
+            let destination_old = effects
+                .iter()
+                .rev()
+                .find(|effect| effect.target == destination)
+                .map(|effect| effect.expected_new.clone())
+                .unwrap_or(self.observe_filesystem_effect(working_copy, &destination)?);
+            if destination_old != EffectValue::Absent {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "cannot restore shelf path '{path}': working-copy destination has unexplained content"
+                    ),
+                });
+            }
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: shelf,
+                expected_old: shelf_old.clone(),
+                expected_new: EffectValue::Absent,
+            });
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: destination,
+                expected_old: EffectValue::Absent,
+                expected_new: shelf_old,
+            });
+        }
+
+        effects.push(EffectPlan {
+            ordinal: effects.len() as u32,
+            target: working_copy_target.clone(),
+            expected_old: EffectValue::WorkingCopy(target_unmaterialized.clone()),
+            expected_new: EffectValue::WorkingCopy(target_materialized.clone()),
+        });
+
+        let prepared = self.prepare_switch_operation(
+            operation_lock,
+            before_state,
+            after_state,
+            effects,
+            ActorRef::System {
+                name: "repository-switch".to_string(),
+            },
+            operation_timestamp_ms(),
+        )?;
+        let operation_id = prepared.operation().id();
+        let initial_effect = prepared
+            .operation()
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .find(|effect| {
+                effect.target == working_copy_target
+                    && effect.expected_old == before_working_value
+                    && effect.expected_new == target_unmaterialized_value
+            })
+            .cloned();
+        if let Some(initial_effect) = initial_effect {
+            let observed_before =
+                self.observe_operation_effect(working_copy, &initial_effect.target)?;
+            self.apply_working_copy_state_locked(operation_lock, &target_unmaterialized)?;
+            let observed_after =
+                self.observe_operation_effect(working_copy, &initial_effect.target)?;
+            self.record_effect_outcome(
+                operation_lock,
+                operation_id,
+                initial_effect.ordinal,
+                observed_before,
+                observed_after,
+            )?;
+        }
 
         if std::env::var_os("ATOMIC_TRACE_SWITCH").is_some() {
             eprintln!("[switch] {} -> {}", old_view_name, view);
@@ -195,9 +855,19 @@ impl Repository {
             for f in new_files.difference(&old_files) {
                 eprintln!("[switch] ADD (new only): {}", f);
             }
+            for effect in &prepared.operation().payload().delta.effects {
+                eprintln!(
+                    "[switch] EFFECT {} {:?}: {:?} -> {:?}",
+                    effect.ordinal, effect.target, effect.expected_old, effect.expected_new
+                );
+            }
         }
 
-        let filesystem_working_copy = FileSystem::from_root(&self.root);
+        let mut filesystem_executor = SwitchMaterializationExecutor {
+            repository: self,
+            operation_lock,
+            operation: prepared.operation().clone(),
+        };
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
         //
@@ -213,71 +883,10 @@ impl Repository {
         //   - Untracked, ignored, exposed  → left alone (persists across views)
         //   - Untracked, ignored, NOT exposed → shelved/restored per-view (phases 1 & 5)
         //   - Untracked, novel   → user's undecided work, left alone
-        let old_ws = working_copy_workspace_path(&self.dot_dir, working_copy, &old_view_name);
-        ensure_working_copy_workspace_dir(&self.dot_dir, working_copy, &old_view_name)?;
-
-        let repo_expose = atomic_config::RepoConfig::load(&self.config_path())
-            .unwrap_or_default()
-            .workspace
-            .expose;
-        let global_expose = atomic_config::GlobalConfig::load()
-            .map(|c| c.workspace.expose)
-            .unwrap_or_default();
-
-        // Merge global + repo-local expose patterns (deduplicated)
-        let mut expose_patterns = global_expose;
-        for p in repo_expose {
-            if !expose_patterns.contains(&p) {
-                expose_patterns.push(p);
-            }
-        }
-
-        // Collect tracked file paths so we never shelve them — tracked
-        // files are managed by the graph (phases 2–4), not by shelving.
-        let tracked_paths: HashSet<String> = old_files.union(&new_files).cloned().collect();
-
-        let ignored_paths: Vec<String> = self
-            .collect_ignored_paths_on_disk()
-            .into_iter()
-            .filter(|path| {
-                // Never shelve tracked files — they belong to the graph
-                if tracked_paths.contains(path) {
-                    return false;
-                }
-                // Never shelve files under a tracked directory
-                if tracked_paths
-                    .iter()
-                    .any(|t| t.starts_with(&format!("{}/", path)))
-                {
-                    return false;
-                }
-                // Keep paths that are NOT exposed (those get shelved)
-                !expose_patterns
-                    .iter()
-                    .any(|pattern| path == pattern || path.starts_with(&format!("{}/", pattern)))
-            })
-            .collect();
         if !ignored_paths.is_empty() {
-            // Clear old workspace content, then move current ignored files in.
-            // We clear first because the workspace may contain stale state
-            // from a previous shelve.
+            ensure_working_copy_workspace_dir(&self.dot_dir, working_copy, &old_view_name)?;
             for path in &ignored_paths {
-                let ws_dest = old_ws.join(path);
-                // Remove stale entry in workspace if it exists
-                if ws_dest.is_dir() {
-                    std::fs::remove_dir_all(&ws_dest)?;
-                } else if ws_dest.exists() {
-                    std::fs::remove_file(&ws_dest)?;
-                }
-                // Ensure parent dirs exist in workspace
-                if let Some(parent) = ws_dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                // Move from working copy → workspace (O(1) rename)
-                let src = self.root.join(path);
-                if src.exists() {
-                    std::fs::rename(&src, &ws_dest)?;
-                }
+                self.execute_shelve_path(operation_lock, &prepared, &old_view_name, path)?;
             }
         }
 
@@ -285,23 +894,26 @@ impl Repository {
         //
         // Files visible on the old view but NOT on the new view are
         // removed from disk.
-        let mut removed_paths: Vec<String> = Vec::new();
-        let mut paths_to_remove: Vec<String> = old_files.difference(&new_files).cloned().collect();
-        paths_to_remove.sort();
+        let mut removed_paths = 0usize;
+        let paths_to_remove: Vec<String> = prepared
+            .operation()
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .filter_map(|effect| match (&effect.target, &effect.expected_new) {
+                (EffectTarget::FilesystemPath { path }, EffectValue::Absent) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
         for path in paths_to_remove {
-            let abs_path = self.root.join(&path);
-            if abs_path.exists()
-                && !abs_path.is_dir()
-                && filesystem_working_copy.remove_path(&path, false).is_ok()
-            {
-                removed_paths.push(path);
-
-                // Deterministic expected-red failpoint for the bridge recovery
-                // contract. Release builds contain no environment-variable
-                // branch; the operation journal will eventually recover this
-                // deliberately partial transition.
-                #[cfg(debug_assertions)]
-                if removed_paths.len() == 1
+            let pending = filesystem_executor.execute_absence(&path)?;
+            if pending.mutated() {
+                removed_paths += 1;
+                // This failpoint intentionally sits in the effect→receipt crash
+                // window. Recovery must infer the landed removal from the new
+                // lease even though no receipt exists yet.
+                if removed_paths == 1
                     && std::env::var_os("ATOMIC_FAIL_SWITCH_AFTER_FIRST_TRACKED_REMOVAL").is_some()
                 {
                     return Err(RepositoryError::Io(std::io::Error::other(
@@ -309,102 +921,464 @@ impl Repository {
                     )));
                 }
             }
+            filesystem_executor.record(pending)?;
         }
-
-        // ── Phase 3: Clean up empty ancestor directories ────────────────
-        let all_removed = removed_paths
-            .iter()
-            .map(|s| s.as_str())
-            .chain(ignored_paths.iter().map(|s| s.as_str()));
-        cleanup_empty_ancestors(working_copy, &self.root, all_removed);
 
         // ── Phase 4: Materialize the new view's tracked files from graph ─
         //
         // Run a complete target materialization. Scoped FILE_INDEX entries let
         // unchanged files skip writes while still proving the whole desired view
         // was output successfully before its materialized state is recorded.
-        let result = self.materialize_parallel_with_visibility(
+        let result = self.materialize_parallel_with_visibility_journaled(
             working_copy,
             None,
             new_visibility.clone(),
             new_view_id,
+            &mut filesystem_executor,
         )?;
+        filesystem_executor.complete_remaining(view)?;
+        drop(filesystem_executor);
 
         // ── Phase 5: Restore ignored files from the NEW view's workspace ─
         //
         // Move artifacts from the working-copy-scoped workspace back into the
         // working copy. Again O(1) renames, no data copying.
-        let new_ws = working_copy_workspace_path(&self.dot_dir, working_copy, view);
         if new_ws.is_dir() {
-            self.restore_workspace_to_working_copy(&new_ws)?;
+            for path in &restore_paths {
+                self.execute_restore_path(operation_lock, &prepared, view, path)?;
+            }
         }
 
-        self.mark_working_copy_materialized(working_copy, view)?;
+        let final_effect = prepared
+            .operation()
+            .payload()
+            .delta
+            .effects
+            .last()
+            .cloned()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: "switch operation contains no final working-copy effect".to_string(),
+            })?;
+        let observed_before = self.observe_operation_effect(working_copy, &final_effect.target)?;
+        self.apply_working_copy_state_locked(operation_lock, &target_materialized)?;
+        let observed_after = self.observe_operation_effect(working_copy, &final_effect.target)?;
+        self.record_effect_outcome(
+            operation_lock,
+            operation_id,
+            final_effect.ordinal,
+            observed_before,
+            observed_after,
+        )?;
+        self.finalize_operation_verified(operation_lock, operation_id)?;
         Ok(result)
     }
 
-    /// Restore entries from a workspace directory into the working copy.
-    ///
-    /// Walks the top-level entries in `ws_dir` and moves each into the
-    /// project root via `rename()`.  Skips the `.atomic` directory if
-    /// present.
-    fn restore_workspace_to_working_copy(&self, ws_dir: &Path) -> Result<(), RepositoryError> {
-        for entry in std::fs::read_dir(ws_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            // Never move VCS administrative directories into the working copy.
-            // `.git` belongs to Git's checkout and must not be view-scoped.
-            if name_str == DOT_DIR || name_str == ".git" {
-                continue;
-            }
-
-            let src = entry.path();
-            let dst = self.root.join(&*name_str);
-
-            // If the destination already exists (e.g. a directory that
-            // was created by materialize for tracked content),
-            // merge by recursing into it rather than replacing it.
-            if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst)?;
-                std::fs::remove_dir_all(&src)?;
-            } else {
-                // Ensure parent exists
-                if let Some(parent) = dst.parent() {
+    fn execute_shelve_path(
+        &self,
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
+        prepared: &super::operation::PreparedSwitchOperation,
+        old_view: &str,
+        path: &str,
+    ) -> Result<(), RepositoryError> {
+        let working_copy = operation_lock.working_copy();
+        let source_target = EffectTarget::WorkspacePath {
+            working_copy,
+            path: path.to_string(),
+        };
+        let shelf_target = EffectTarget::ShelfPath {
+            working_copy,
+            view: old_view.to_string(),
+            path: path.to_string(),
+        };
+        let effects = &prepared.operation().payload().delta.effects;
+        let source_effect = effects
+            .iter()
+            .find(|effect| {
+                effect.target == source_target && effect.expected_new == EffectValue::Absent
+            })
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted workspace shelving lease for '{path}'"),
+            })?;
+        let final_shelf = effects.iter().find(|effect| {
+            effect.target == shelf_target && effect.expected_new == source_effect.expected_old
+        });
+        if final_shelf.is_none() {
+            let write = operation_lock.begin_write_immediate()?;
+            let mut txn = write.try_lock_shelf()?;
+            let before = self.observe_filesystem_effect(working_copy, &source_effect.target)?;
+            if before == source_effect.expected_old {
+                let source = self.root.join(path);
+                let tombstone = self
+                    .working_copy_dot_dir()
+                    .join("operation-recovery")
+                    .join(prepared.operation().id().to_string())
+                    .join("duplicate-workspace")
+                    .join(format!("{:010}", source_effect.ordinal));
+                if let Some(parent) = tombstone.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::rename(&src, &dst)?;
+                rename_and_sync(&source, &tombstone)?;
+            } else if before != source_effect.expected_new {
+                self.append_rejected_effect_outcome(
+                    &mut txn,
+                    prepared.operation(),
+                    source_effect.ordinal,
+                    before,
+                    None,
+                )?;
+                txn.commit()?;
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("duplicate workspace lease diverged for '{path}'"),
+                });
             }
+            let after = self.observe_filesystem_effect(working_copy, &source_effect.target)?;
+            if after != source_effect.expected_new {
+                self.append_rejected_effect_outcome(
+                    &mut txn,
+                    prepared.operation(),
+                    source_effect.ordinal,
+                    before,
+                    Some(after),
+                )?;
+                txn.commit()?;
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "duplicate workspace effect diverged after mutation for '{path}'"
+                    ),
+                });
+            }
+            self.append_successful_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                source_effect.ordinal,
+                before,
+                after,
+            )?;
+            return txn.commit();
         }
-        Ok(())
+        let final_shelf = final_shelf.expect("checked above");
+        let stale_shelf = effects.iter().find(|effect| {
+            effect.target == shelf_target
+                && effect.ordinal < source_effect.ordinal
+                && effect.expected_new == EffectValue::Absent
+        });
+
+        if let Some(stale) = stale_shelf {
+            let write = operation_lock.begin_write_immediate()?;
+            let mut txn = write.try_lock_shelf()?;
+            let before = self.observe_filesystem_effect(working_copy, &stale.target)?;
+            if before == stale.expected_old {
+                let stale_path =
+                    working_copy_workspace_path(&self.dot_dir, working_copy, old_view).join(path);
+                let trash = prepared
+                    .backup_root()
+                    .join("superseded-shelf")
+                    .join(format!("{:010}", stale.ordinal));
+                if let Some(parent) = trash.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if trash.exists() {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "stale shelf recovery path already exists: {}",
+                            trash.display()
+                        ),
+                    });
+                }
+                rename_and_sync(&stale_path, &trash)?;
+            } else if before != stale.expected_new {
+                self.append_rejected_effect_outcome(
+                    &mut txn,
+                    prepared.operation(),
+                    stale.ordinal,
+                    before,
+                    None,
+                )?;
+                txn.commit()?;
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("stale shelf lease diverged for '{path}'"),
+                });
+            }
+            let after = self.observe_filesystem_effect(working_copy, &stale.target)?;
+            if after != stale.expected_new {
+                self.append_rejected_effect_outcome(
+                    &mut txn,
+                    prepared.operation(),
+                    stale.ordinal,
+                    before,
+                    Some(after),
+                )?;
+                txn.commit()?;
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("stale shelf effect diverged after mutation for '{path}'"),
+                });
+            }
+            self.append_successful_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                stale.ordinal,
+                before,
+                after,
+            )?;
+            txn.commit()?;
+        }
+
+        let write = operation_lock.begin_write_immediate()?;
+        let mut txn = write.try_lock_shelf()?;
+        let source_before = self.observe_filesystem_effect(working_copy, &source_effect.target)?;
+        let shelf_before = self.observe_filesystem_effect(working_copy, &final_shelf.target)?;
+        if source_before == source_effect.expected_old && shelf_before == final_shelf.expected_old {
+            let source = self.root.join(path);
+            let destination =
+                working_copy_workspace_path(&self.dot_dir, working_copy, old_view).join(path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            rename_and_sync(&source, &destination)?;
+        } else if source_before != source_effect.expected_new
+            || shelf_before != final_shelf.expected_new
+        {
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                source_effect.ordinal,
+                source_before,
+                None,
+            )?;
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                final_shelf.ordinal,
+                shelf_before,
+                None,
+            )?;
+            txn.commit()?;
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("shelf transfer lease diverged for '{path}'"),
+            });
+        }
+        let source_after = self.observe_filesystem_effect(working_copy, &source_effect.target)?;
+        let shelf_after = self.observe_filesystem_effect(working_copy, &final_shelf.target)?;
+        if source_after != source_effect.expected_new || shelf_after != final_shelf.expected_new {
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                source_effect.ordinal,
+                source_before,
+                Some(source_after),
+            )?;
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                final_shelf.ordinal,
+                shelf_before,
+                Some(shelf_after),
+            )?;
+            txn.commit()?;
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("shelf transfer diverged after mutation for '{path}'"),
+            });
+        }
+        self.append_successful_effect_outcome(
+            &mut txn,
+            prepared.operation(),
+            source_effect.ordinal,
+            source_before,
+            source_after,
+        )?;
+        self.append_successful_effect_outcome(
+            &mut txn,
+            prepared.operation(),
+            final_shelf.ordinal,
+            shelf_before,
+            shelf_after,
+        )?;
+        txn.commit()
     }
 
-    /// Recursively merge the contents of `src_dir` into `dst_dir`.
-    ///
-    /// Files in `src_dir` are moved into `dst_dir`.  If a subdirectory
-    /// exists in both, the merge recurses.  This is used when restoring
-    /// workspace artifacts into a directory that already contains tracked
-    /// files (e.g. `src/` might have tracked `.ts` files from the graph
-    /// AND ignored `.cache/` from the workspace).
-    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) -> Result<(), RepositoryError> {
-        for entry in std::fs::read_dir(src_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let src = entry.path();
-            let dst = dst_dir.join(&name);
+    fn execute_restore_path(
+        &self,
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
+        prepared: &super::operation::PreparedSwitchOperation,
+        target_view: &str,
+        path: &str,
+    ) -> Result<(), RepositoryError> {
+        let working_copy = operation_lock.working_copy();
+        let shelf_target = EffectTarget::ShelfPath {
+            working_copy,
+            view: target_view.to_string(),
+            path: path.to_string(),
+        };
+        let destination_target = EffectTarget::WorkspacePath {
+            working_copy,
+            path: path.to_string(),
+        };
+        let effects = &prepared.operation().payload().delta.effects;
+        let shelf_effect = effects
+            .iter()
+            .rev()
+            .find(|effect| {
+                effect.target == shelf_target && effect.expected_new == EffectValue::Absent
+            })
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted shelf restore source for '{path}'"),
+            })?;
+        let destination_effect = effects
+            .iter()
+            .rev()
+            .find(|effect| {
+                effect.target == destination_target
+                    && effect.expected_new == shelf_effect.expected_old
+            })
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("switch operation omitted shelf restore destination for '{path}'"),
+            })?;
+        let write = operation_lock.begin_write_immediate()?;
+        let mut txn = write.try_lock_shelf()?;
+        let shelf_before = self.observe_filesystem_effect(working_copy, &shelf_effect.target)?;
+        let destination_before =
+            self.observe_filesystem_effect(working_copy, &destination_effect.target)?;
+        if shelf_before == shelf_effect.expected_old
+            && destination_before == destination_effect.expected_old
+        {
+            let source =
+                working_copy_workspace_path(&self.dot_dir, working_copy, target_view).join(path);
+            let destination = self.root.join(path);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("shelf restore destination has no parent: '{path}'"),
+                })?;
+            if !parent.is_dir() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "shelf restore parent '{}' is not materialized",
+                        parent.display()
+                    ),
+                });
+            }
+            rename_and_sync(&source, &destination)?;
+        } else if shelf_before != shelf_effect.expected_new
+            || destination_before != destination_effect.expected_new
+        {
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                shelf_effect.ordinal,
+                shelf_before,
+                None,
+            )?;
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                destination_effect.ordinal,
+                destination_before,
+                None,
+            )?;
+            txn.commit()?;
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("shelf restore lease diverged for '{path}'"),
+            });
+        }
+        let shelf_after = self.observe_filesystem_effect(working_copy, &shelf_effect.target)?;
+        let destination_after =
+            self.observe_filesystem_effect(working_copy, &destination_effect.target)?;
+        if shelf_after != shelf_effect.expected_new
+            || destination_after != destination_effect.expected_new
+        {
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                shelf_effect.ordinal,
+                shelf_before,
+                Some(shelf_after),
+            )?;
+            self.append_rejected_effect_outcome(
+                &mut txn,
+                prepared.operation(),
+                destination_effect.ordinal,
+                destination_before,
+                Some(destination_after),
+            )?;
+            txn.commit()?;
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("shelf restore diverged after mutation for '{path}'"),
+            });
+        }
+        self.append_successful_effect_outcome(
+            &mut txn,
+            prepared.operation(),
+            shelf_effect.ordinal,
+            shelf_before,
+            shelf_after,
+        )?;
+        self.append_successful_effect_outcome(
+            &mut txn,
+            prepared.operation(),
+            destination_effect.ordinal,
+            destination_before,
+            destination_after,
+        )?;
+        txn.commit()
+    }
 
-            if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst)?;
-                std::fs::remove_dir_all(&src)?;
-            } else {
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::rename(&src, &dst)?;
+    fn collect_switch_ignored_paths(&self, tracked_paths: &HashSet<String>) -> Vec<String> {
+        let repo_expose = atomic_config::RepoConfig::load(&self.config_path())
+            .unwrap_or_default()
+            .workspace
+            .expose;
+        let mut expose_patterns = atomic_config::GlobalConfig::load()
+            .map(|config| config.workspace.expose)
+            .unwrap_or_default();
+        for pattern in repo_expose {
+            if !expose_patterns.contains(&pattern) {
+                expose_patterns.push(pattern);
             }
         }
-        Ok(())
+        self.collect_ignored_paths_on_disk()
+            .into_iter()
+            .filter(|path| {
+                !tracked_paths.contains(path)
+                    && !tracked_paths
+                        .iter()
+                        .any(|tracked| tracked.starts_with(&format!("{path}/")))
+                    && !expose_patterns
+                        .iter()
+                        .any(|pattern| path == pattern || path.starts_with(&format!("{pattern}/")))
+            })
+            .collect()
+    }
+
+    fn collect_ignored_paths_in_workspace(&self, root: &Path) -> Vec<String> {
+        let rules = self.load_ignore_rules();
+        let mut result = Vec::new();
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            rules: &crate::ignore::IgnoreRules,
+            out: &mut Vec<String>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let is_directory = path.is_dir();
+                if rules.is_ignored(relative, is_directory) {
+                    if let Some(relative) = relative.to_str() {
+                        out.push(relative.to_string());
+                    }
+                } else if is_directory {
+                    walk(root, &path, rules, out);
+                }
+            }
+        }
+        walk(root, root, &rules, &mut result);
+        result.sort();
+        result
     }
 
     /// Walk the working copy and collect relative paths of files and

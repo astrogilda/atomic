@@ -2,7 +2,7 @@
 
 Source: [`RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md`](RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md)
 
-Last audited: 2026-09-04
+Last audited: 2026-09-05
 
 This file is the operational backlog for the RFC. The RFC remains the normative
 architecture and acceptance contract; this tracker answers what is done, what is
@@ -30,15 +30,15 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-1B: Durable operation/effect journal, ordered locks, crash recovery**
-  Intent: pending · Priority: high · Prerequisites: CB-1A, CB-N2 (done)
-  Add versioned operation/effect storage, enforce common→working-copy→pristine→shelf lock order, and make interrupted external effects recover idempotently.
+- [ ] **READY — CB-1C: Operation commands, head consolidation, undo/restore, and native command routing**
+  Intent: pending · Priority: high · Prerequisite: CB-1B (done)
+  Add `atomic op log|show|undo|restore`, consolidate commuting heads, surface incompatible heads as `Diverged`, and route native mutating commands through the operation substrate.
 
 ### Parallel safety workstream
 
 Phase 0 and Phase N are complete; no additional safety prerequisite is ready in parallel.
 
-Phase 1 continues with CB-1B. CB-1C remains blocked until CB-1B completes.
+Phase 1 continues with CB-1C. The shared format foundation remains blocked until CB-1C completes.
 
 ---
 
@@ -50,7 +50,7 @@ Phase 1 continues with CB-1B. CB-1C remains blocked until CB-1B completes.
 | [x] DONE | Clean bidirectional bridge MVP | `ATOM::continuouslee::56` / `01M1HRR0W212QBEMNBV041SBQN` | Regular UTF-8 attached-branch prototype; attestation currently needs refresh. |
 | [x] DONE | Foreground bridge switch and raw Git switch adoption | `ATOM::continuouslee::58` / `01M1HSSHDW3FED05GDR67DWTMT` | Prototype evidence for later Phases 7–8. |
 | [x] DONE | Pre-write collision/failure safety | `ATOM::continuouslee::59` / `01M1HTZW5RTYVG5005S2JN51R8` | Does not prove mid-write recovery. |
-| [ ] FIXTURE | Expected-red mid-materialization recovery contract | `ATOM::continuouslee::60` / `01M1HVG6H346QG22R3C08486S1` | Becomes completion evidence only when unchanged assertions pass. |
+| [x] DONE | Mid-materialization effect→receipt recovery contract | `ATOM::continuouslee::60` / `01M1HVG6H346QG22R3C08486S1` | Original expected-red assertions are promoted unchanged as numbered harness 43; with native-index repair checks it passes 21/21 under CB-1B. |
 | [x] DONE | N5 typed absent/present materialization | `ATOM::continuouslee::61` / `01M1HXJDQRNSXXNK66290EYR1B` | Covers zero-byte files and all output modes. |
 | [x] DONE | N7 canonical graph visibility closure | `ATOM::continuouslee::62` / `01M1J49E5GE48SZNP0249BPY46` | Membership and dependency-expanded visibility are typed separately. |
 | [x] DONE | Fail-closed graph iterator/retrieval errors | `ATOM::continuouslee::63` / `01M1KJP3MTRNKNEXMTB8BG88DX` | Supporting integrity prerequisite. |
@@ -65,6 +65,7 @@ Phase 1 continues with CB-1B. CB-1C remains blocked until CB-1B completes.
 | [x] DONE | N8 native rename-plus-edit identity and explicit move evidence | `ATOM::continuouslee::75` / `01M1PBEFQ779K72YF5YAW6RS9W` | Authoritative staged moves retain inode/trunk through arbitrary edits; similarity is `ProbableMove`; ambiguous candidates remain delete+add with `RenameUnresolved`. |
 | [x] DONE | N9 native derived-index verification and atomic repair | `ATOM::continuouslee::76` / `01M1PH46D0HDWEJWNZYAS2EEY7` | Cache-independent all-view oracle, deterministic diagnostics, ambiguity/staging preservation, immediate all-or-nothing replacement, and read-only doctor checks. |
 | [x] DONE | 1A persistent working-copy identity and API boundary | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` | Versioned pristine records, safe legacy/copy migration, distinct linked worktrees and sandboxes, explicit working-copy capabilities, scoped caches/shelves, and derived `current_view`. |
+| [x] DONE | 1B durable operation/effect journal, ordered locks, and crash recovery | `ATOM::continuouslee::79` / `01M1QA9RZQ5RA0HG3HDST78R1J` | Canonical append-only operation/receipt storage, CAS heads, common→working-copy→pristine→shelf locking, per-effect leases, inverse/startup recovery, canonical imported deletes, and harnesses 05/43. |
 
 ---
 
@@ -148,8 +149,8 @@ execution.
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
 | [x] DONE | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` |
-| [ ] READY | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | pending |
-| [ ] BLOCKED | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
+| [x] DONE | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | `ATOM::continuouslee::79` / `01M1QA9RZQ5RA0HG3HDST78R1J` |
+| [ ] READY | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
 
 ### CB-1A definition of done
 
@@ -506,7 +507,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-1B.
+1. **Now:** CB-1C.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation substrate:** CB-1A is done; CB-1B → CB-1C → CB-FMT1.
@@ -522,5 +523,5 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-1B intent next with CB-1A and CB-N2 encoded in `blocked_by` frontmatter.
-- When an intent is created, replace `pending` in this tracker with its human key and UID.
+- Allocate the CB-1C intent next with CB-1B encoded in `blocked_by` frontmatter.
+- When the CB-1C intent is created, replace `pending` in this tracker with its human key and UID.

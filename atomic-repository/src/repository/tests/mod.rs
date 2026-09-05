@@ -21,6 +21,8 @@ mod materialize_fail_closed_tests;
 mod merge_property_tests;
 mod native_index_repair_tests;
 mod nested_parent_tests;
+mod operation_lock_tests;
+mod operation_recovery_tests;
 mod path_claim_migration_tests;
 mod record_duplication_tests;
 mod record_tests;

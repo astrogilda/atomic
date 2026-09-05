@@ -33,7 +33,12 @@ use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
 pub trait MutTxnT:
-    ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PathClaimMutTxnT + super::WorkingCopyMutTxnT
+    ViewTxnT
+    + TreeTxnT
+    + super::CrdtTxnT
+    + super::OperationMutTxnT
+    + super::PathClaimMutTxnT
+    + super::WorkingCopyMutTxnT
 {
     // ── Change Registration ─────────────────────────────────────
 

@@ -1,5 +1,28 @@
 use super::*;
 
+fn validate_import_deleted_paths(
+    change: &Change,
+    deleted_paths: &[String],
+) -> Result<(), RepositoryError> {
+    for path in deleted_paths {
+        let structural_delete = change.hunks().iter().any(|operation| {
+            matches!(
+                operation,
+                GraphOp::FileDel { path: deleted, .. } | GraphOp::DirDel { path: deleted, .. }
+                    if deleted == path
+            )
+        });
+        if !structural_delete {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "imported deletion '{path}' must be encoded as a canonical FileDel or DirDel before persistence"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 use crate::apply::{
     filter_missing_in_view, get_missing_changes, get_view_changes as get_view_changes_fn,
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
@@ -813,6 +836,7 @@ impl Repository {
             }
         };
         timings.assemble_ms = assemble_start.elapsed().as_millis();
+        validate_import_deleted_paths(&change, deleted_paths)?;
 
         change.unhashed = Some(unhashed);
 
@@ -903,6 +927,7 @@ impl Repository {
         preserve_existing_tree_paths: bool,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
+        validate_import_deleted_paths(&change, deleted_paths)?;
         let mut timings = ImportWriteTimings::default();
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
 

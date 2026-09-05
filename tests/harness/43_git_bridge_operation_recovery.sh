@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Red regression contract for interruption-safe bridge switching.
+# Regression contract for interruption-safe bridge switching.
 #
-# This filename intentionally has no numeric prefix, so run_all.sh excludes it.
-# The current implementation is expected to fail these desired-future assertions.
+# The assertions are the original expected-red CB-1B contract, now promoted
+# unchanged into the numbered integration harness.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
 echo ""
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-echo "${BOLD}  RED: bridge switch recovers after partial tracked removal${RESET}"
+echo "${BOLD}  Bridge switch recovers after partial tracked removal${RESET}"
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
 begin_section "Prerequisites"
@@ -92,6 +92,8 @@ create_file "source-only/02-second.txt" "second source-only tracked file\n"
 git add -A
 git commit --quiet -m "Feature projection with two source-only files"
 assert_success "project feature through the experimental bridge" atomic git bridge reconcile
+assert_success "imported deletion passes native index verification" atomic doctor check
+assert_success "native index repair reconstructs the imported deletion" atomic doctor repair-native-indexes
 assert_clean_statuses "source projection before interrupted switch"
 assert_success "source projection verifies" atomic git bridge verify
 
@@ -123,7 +125,7 @@ ACTUAL_GIT_STATUS="$(git status --short)"
 ACTUAL_ATOMIC_STATUS="$(atomic status --short 2>/dev/null || true)"
 snapshot_complete_state "$AFTER_FAILURE_STATE"
 
-begin_section "Desired future rollback contract"
+begin_section "Rollback contract"
 assert_equal "source Git HEAD is restored" "$SOURCE_HEAD" "$ACTUAL_HEAD"
 assert_equal "source Git branch is restored" "$SOURCE_BRANCH" "$ACTUAL_BRANCH"
 assert_equal "source Atomic view is restored" "$SOURCE_VIEW" "$ACTUAL_VIEW"
@@ -135,7 +137,7 @@ else
         "$(diff -u "$SOURCE_STATE" "$AFTER_FAILURE_STATE" || true)"
 fi
 
-begin_section "Desired future automatic recovery on ordinary retry"
+begin_section "Automatic recovery on ordinary retry"
 set +e
 RETRY_OUTPUT="$(atomic git bridge switch "$MAIN" 2>&1)"
 RETRY_RC=$?
@@ -152,7 +154,7 @@ assert_success "bridge verify succeeds after retry" atomic git bridge verify
 
 if [[ "$TESTS_FAILED" -gt 0 ]]; then
     echo ""
-    echo "${BOLD}${RED}EXPECTED RED:${RESET} current bridge switch does not roll back or journal a mid-materialization failure."
+    echo "${BOLD}${RED}RECOVERY FAILURE:${RESET} bridge switch did not satisfy the interruption-safe contract."
     echo "${RED}  Actual state immediately after failpoint:${RESET}"
     echo "    Git:    branch=${ACTUAL_BRANCH:-<detached>} head=$ACTUAL_HEAD"
     echo "    Atomic: view=${ACTUAL_VIEW:-<unknown>}"
@@ -161,7 +163,7 @@ if [[ "$TESTS_FAILED" -gt 0 ]]; then
     printf '%s\n' "${ACTUAL_GIT_STATUS:-<clean>}" | sed 's/^/      /'
     echo "    Atomic status:"
     printf '%s\n' "${ACTUAL_ATOMIC_STATUS:-<clean>}" | sed 's/^/      /'
-    echo "${RED}  This is the known target-pointer/mixed-worktree state; assertions intentionally remain the desired future contract.${RESET}"
+    echo "${RED}  The operation journal must restore or safely resume this partial transition.${RESET}"
 fi
 
 print_summary

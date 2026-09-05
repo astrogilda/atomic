@@ -5,6 +5,10 @@
 
 use redb::{ReadTransaction, ReadableMultimapTable, ReadableTable, ReadableTableMetadata};
 
+use crate::operation::{
+    decode_effect_receipt, decode_operation, decode_operation_heads, decode_operation_scope,
+    EffectReceipt, Operation, OperationHeads, OperationScope,
+};
 use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
 use crate::pristine::traits::tag::GitShaIndexTxnT;
 use crate::pristine::traits::tag::TagRecord;
@@ -12,8 +16,8 @@ use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, V
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
 use crate::types::{
-    ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
-    SerializedGraphEdge, WorkingCopyId,
+    ChangePosition, EdgeFlags, EffectReceiptId, GraphNode, Hash, Inode, Merkle, NodeId,
+    OperationId, Position, SerializedGraphEdge, WorkingCopyId,
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
@@ -24,8 +28,8 @@ use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
     decode_working_copy_record, FileIndexEntry, FileIndexMetadata, GraphTxnT,
-    GraphVisibilityClosure, PathClaimTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
-    WorkingCopyRecord, WorkingCopyTxnT,
+    GraphVisibilityClosure, OperationTxnT, PathClaimTxnT, StoredConflict, TreeTxnT, ViewState,
+    ViewTxnT, WorkingCopyRecord, WorkingCopyTxnT,
 };
 
 use super::helpers::{
@@ -39,6 +43,42 @@ use super::helpers::{
 /// can be active simultaneously.
 pub struct ReadTxn {
     pub(crate) txn: ReadTransaction,
+}
+
+fn operation_serialization_error(error: impl std::fmt::Display) -> PristineError {
+    PristineError::Serialization {
+        message: error.to_string(),
+    }
+}
+
+fn decode_operation_row(key: &[u8; OperationId::SIZE], bytes: &[u8]) -> PristineResult<Operation> {
+    let key_id = OperationId::from_bytes(*key);
+    let operation = decode_operation(bytes).map_err(operation_serialization_error)?;
+    if operation.id() != key_id {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "OPERATIONS key {} contains canonical operation {}",
+                key_id,
+                operation.id()
+            ),
+        });
+    }
+    Ok(operation)
+}
+
+fn decode_effect_receipt_row(key: &[u8; 64], bytes: &[u8]) -> PristineResult<EffectReceipt> {
+    let (key_operation, key_receipt) = decode_effect_receipt_key(key);
+    let receipt = decode_effect_receipt(bytes).map_err(operation_serialization_error)?;
+    if receipt.id() != key_receipt || receipt.payload().operation != key_operation {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "EFFECT_RECEIPTS key ({key_operation}, {key_receipt}) contains receipt ({}, {})",
+                receipt.payload().operation,
+                receipt.id()
+            ),
+        });
+    }
+    Ok(receipt)
 }
 
 fn decode_working_copy_row(
@@ -530,6 +570,99 @@ impl ViewTxnT for ReadTxn {
         }
 
         Ok(Box::new(results.into_iter()))
+    }
+}
+
+// OperationTxnT Implementation
+
+impl OperationTxnT for ReadTxn {
+    fn get_operation(&self, id: OperationId) -> PristineResult<Option<Operation>> {
+        let table = match self.txn.open_table(OPERATIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match table.get(id.as_bytes())? {
+            Some(value) => decode_operation_row(id.as_bytes(), value.value()).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn get_operation_heads(&self, scope: OperationScope) -> PristineResult<OperationHeads> {
+        let table = match self.txn.open_table(OP_HEADS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let key = crate::operation::encode_operation_scope(scope);
+        let heads = match table.get(&key)? {
+            Some(value) => {
+                decode_operation_heads(value.value()).map_err(operation_serialization_error)?
+            }
+            None => OperationHeads::new(Vec::new()),
+        };
+        for head in heads.as_slice() {
+            if OperationTxnT::get_operation(self, *head)?.is_none() {
+                return Err(PristineError::OperationNotFound {
+                    id: head.to_string(),
+                });
+            }
+        }
+        Ok(heads)
+    }
+
+    fn list_operation_heads(&self) -> PristineResult<Vec<(OperationScope, OperationHeads)>> {
+        let table = match self.txn.open_table(OP_HEADS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let scope =
+                decode_operation_scope(key.value()).map_err(operation_serialization_error)?;
+            let heads =
+                decode_operation_heads(value.value()).map_err(operation_serialization_error)?;
+            for head in heads.as_slice() {
+                if OperationTxnT::get_operation(self, *head)?.is_none() {
+                    return Err(PristineError::OperationNotFound {
+                        id: head.to_string(),
+                    });
+                }
+            }
+            rows.push((scope, heads));
+        }
+        Ok(rows)
+    }
+
+    fn get_effect_receipts(&self, operation: OperationId) -> PristineResult<Vec<EffectReceipt>> {
+        if OperationTxnT::get_operation(self, operation)?.is_none() {
+            return Err(PristineError::OperationNotFound {
+                id: operation.to_string(),
+            });
+        }
+        let table = match self.txn.open_table(EFFECT_RECEIPTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let start = encode_effect_receipt_key(operation, EffectReceiptId::from_bytes([0; 32]));
+        let end = encode_effect_receipt_key(operation, EffectReceiptId::from_bytes([u8::MAX; 32]));
+        let mut receipts = Vec::new();
+        for entry in table.range::<&[u8; 64]>(&start..=&end)? {
+            let (key, value) = entry?;
+            receipts.push(decode_effect_receipt_row(key.value(), value.value())?);
+        }
+        Ok(receipts)
     }
 }
 
