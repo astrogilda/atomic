@@ -2634,7 +2634,16 @@ impl Repository {
     ) -> Result<Option<PathBuf>, RepositoryError> {
         match target {
             EffectTarget::FilesystemPath { path } => {
-                let relative = validate_relative_path(path, false)?;
+                let content_store_effect =
+                    Path::new(path).starts_with(Path::new(".atomic/changes"));
+                let relative = validate_relative_path(path, content_store_effect)?;
+                if relative.starts_with(Path::new(".atomic"))
+                    && !relative.starts_with(Path::new(".atomic/changes"))
+                {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!("operation filesystem effect cannot target '{path}'"),
+                    });
+                }
                 resolve_without_symlink_parents(&self.root, &relative).map(Some)
             }
             EffectTarget::WorkspacePath {

@@ -568,6 +568,13 @@ impl ChangeStore {
         Ok(count)
     }
 
+    /// Evict one cached object after an externally journaled deletion.
+    pub fn evict(&self, hash: &Hash) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(hash);
+        }
+    }
+
     /// Clear the in-memory cache.
     ///
     /// This is useful for testing or when memory pressure is high.

@@ -38,6 +38,43 @@ use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
 
+fn write_recorded_in_txn(
+    repository: &Repository,
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    outcome: &RecordOutcome,
+    view_name: &str,
+) -> Result<InsertOutcome, RepositoryError> {
+    let change = outcome.change();
+    let hash = outcome.hash();
+    repository.ensure_change_allowed_in_view(txn, view_name, change)?;
+    let change_id = txn
+        .register_change(hash)
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    txn.put_change_deps(change_id, change.dependencies())
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let preserve_existing_tree_paths = view_name != repository.current_view;
+    let tree_projection = repository.plan_tree_projection(
+        txn,
+        change_id,
+        *hash,
+        change,
+        outcome.deleted_files(),
+        preserve_existing_tree_paths,
+    )?;
+    tree_projection.apply_prerequisites(txn)?;
+    let mut options = InsertOptions::default().view(view_name);
+    options.track_conflicts = false;
+    let inserted = write_change_to_graph(txn, view_name, change_id, hash, change, &options, false)
+        .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    repository.apply_tree_projection(
+        txn,
+        &tree_projection,
+        view_name,
+        preserve_existing_tree_paths,
+    )?;
+    Ok(inserted)
+}
+
 /// Timing details for the git-import fresh-write path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportWriteTimings {
@@ -2269,6 +2306,61 @@ impl Repository {
         }
 
         Ok(apply_outcome)
+    }
+
+    pub(super) fn write_split_recorded(
+        &self,
+        index: &RecordOutcome,
+        remainder: &RecordOutcome,
+        baseline_view: &str,
+        snapshot_view: &str,
+        snapshot: Hash,
+    ) -> Result<(InsertOutcome, InsertOutcome), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+
+        let index_outcome = write_recorded_in_txn(self, &mut txn, index, baseline_view)?;
+
+        let mut private_view = txn
+            .get_view(snapshot_view)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: snapshot_view.to_string(),
+            })?;
+        let snapshot_id = txn
+            .get_internal(&snapshot)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: snapshot.to_base32(),
+            })?;
+        txn.del_change(&mut private_view, snapshot_id, &snapshot)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotInView {
+                hash: snapshot.to_base32(),
+                view: snapshot_view.to_string(),
+            })?;
+        txn.update_view(&private_view)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        self.realign_tree_projection_in_txn(&mut txn, snapshot_view)?;
+
+        // The remainder was assembled against the new durable index, so remove
+        // the old snapshot from visibility before resolving/applying its contexts.
+        let mut remainder_outcome =
+            write_recorded_in_txn(self, &mut txn, remainder, snapshot_view)?;
+        let private_view = txn
+            .get_view(snapshot_view)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: snapshot_view.to_string(),
+            })?;
+        remainder_outcome.new_state = private_view.state;
+        remainder_outcome.sequence = private_view.change_count;
+
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok((index_outcome, remainder_outcome))
     }
 
     // Cross-View Insert Methods

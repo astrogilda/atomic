@@ -30,16 +30,18 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-2B: Graph-safe staged/remainder snapshot split, retention, and snapshot UX**
-  Intent: pending · Priority: high · Prerequisites: CB-2A, CB-3A, and CB-3C (done)
-  Split snapshots into independently materializable staged and remainder changes, add structured inseparability refusal, retention, status, and `diff --snapshot`.
+- [ ] **READY — CB-4B: Stage/worktree observation and complete equivalence integration**
+  Intent: pending · Priority: high · Prerequisite: CB-4A (done)
+  Add stage-aware index/worktree builders, structured mismatch reports, and full push/import equivalence enforcement.
 
 ### Recently completed critical path
 
 - [x] **DONE — CB-2A:** `ATOM::continuouslee::82` / `01M1W0QE1PVXN2PQC03AF25A69`
+- [x] **DONE — CB-2B:** `ATOM::continuouslee::86` / `01M1WCCHZCMVATCVKVFMBAQM8M`
 - [x] **DONE — CB-3A:** `ATOM::continuouslee::83` / `01M1W0QG4GVT4ZNJ37PB661P7G`
 - [x] **DONE — CB-3B:** `ATOM::continuouslee::84` / `01M1W7NBBVSRG97GY0Y6AVYD8C`
 - [x] **DONE — CB-3C:** `ATOM::continuouslee::85` / `01M1W7NBQA8CJRMQAC84T58X6G`
+- [x] **DONE — CB-4A:** `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B`
 
 Phase 1, the shared CB-FMT1 format foundation, and the Phase 2/3 prerequisites for CB-2B are complete.
 
@@ -210,7 +212,7 @@ bounds; and strict workspace clippy with `-D warnings`.
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
 | [x] DONE | CB-2A | Complete baseline-relative snapshot lifecycle and promotion | FMT1, 1C | `ATOM::continuouslee::82` / `01M1W0QE1PVXN2PQC03AF25A69` |
-| [ ] READY | CB-2B | Graph-safe staged/remainder snapshot split, retention, and snapshot UX | 2A, 3A, 3C | pending |
+| [x] DONE | CB-2B | Graph-safe staged/remainder snapshot split, retention, and snapshot UX | 2A, 3A, 3C | `ATOM::continuouslee::86` / `01M1WCCHZCMVATCVKVFMBAQM8M` |
 
 ### CB-2A definition of done
 
@@ -263,8 +265,8 @@ away with explicit `LossNote::EmptyDirectory`.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-4A | Canonical manifest model and Atomic/Git tree builders | 2B, 3B, 3C, N9 | pending |
-| [ ] BLOCKED | CB-4B | Stage/worktree observation and complete equivalence integration | 4A | pending |
+| [x] DONE | CB-4A | Canonical manifest model and Atomic/Git tree builders | 2B, 3B, 3C, N9 | `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B` |
+| [ ] READY | CB-4B | Stage/worktree observation and complete equivalence integration | 4A | pending |
 | [ ] BLOCKED | CB-4C | `FILE_INDEX_V2`, change-source tiers, and performance gates | 4A, 4B | pending |
 
 ### CB-4A definition of done
@@ -522,7 +524,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-2B; CB-2A and CB-3A/3B/3C are complete.
+1. **Now:** CB-4B; CB-2A/2B, CB-3A/3B/3C, and CB-4A are complete.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation and format substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1 are done.
@@ -538,4 +540,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-2B intent next with CB-2A, CB-3A, and CB-3C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
+- Allocate the CB-4B intent next with CB-4A encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.

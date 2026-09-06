@@ -78,6 +78,10 @@ pub struct Diff {
     #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
     pub view: Option<String>,
 
+    /// Show the active private snapshot or durable remainder.
+    #[arg(long, conflicts_with_all = ["change", "view"])]
+    pub snapshot: bool,
+
     /// Enable token-level diff highlighting (CRDT-powered).
     ///
     /// Shows exactly which tokens changed within a line, not just
@@ -102,6 +106,7 @@ impl Diff {
             untracked: false,
             cached: false,
             view: None,
+            snapshot: false,
             word_diff: false,
         }
     }
@@ -164,6 +169,12 @@ impl Diff {
         self
     }
 
+    /// Builder: show the active snapshot or remainder.
+    pub fn with_snapshot(mut self, snapshot: bool) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
     /// Builder: set the word-diff flag.
     pub fn with_word_diff(mut self, word_diff: bool) -> Self {
         self.word_diff = word_diff;
@@ -209,7 +220,7 @@ impl Diff {
     }
 
     fn guard_operation(&self) -> GuardOperation {
-        if self.change.is_some() {
+        if self.change.is_some() || self.snapshot {
             GuardOperation::HistoryOnlyDiff
         } else {
             GuardOperation::Diff
@@ -271,6 +282,20 @@ impl Command for Diff {
         // If --change is specified, show the content of that specific change
         if let Some(change_ref) = &self.change {
             return self.show_change_diff(&repo, change_ref, &config);
+        }
+        if self.snapshot {
+            let working_copy = repo
+                .require_working_copy_id()
+                .map_err(|error| CliError::Internal(error.into()))?;
+            let snapshot = repo
+                .snapshot_status(working_copy)
+                .map_err(|error| CliError::Internal(error.into()))?;
+            let hash = snapshot.snapshot.or(snapshot.remainder).ok_or_else(|| {
+                CliError::InvalidArgument {
+                    message: "this working copy has no active snapshot or remainder".to_string(),
+                }
+            })?;
+            return self.show_change_diff(&repo, &hash.to_base32(), &config);
         }
 
         // Get status to find modified files
@@ -496,6 +521,14 @@ mod guard_tests {
         assert_eq!(Diff::new().guard_operation(), GuardOperation::Diff);
         assert_eq!(
             Diff::new().with_change("change").guard_operation(),
+            GuardOperation::HistoryOnlyDiff
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_is_history_only() {
+        assert_eq!(
+            Diff::new().with_snapshot(true).guard_operation(),
             GuardOperation::HistoryOnlyDiff
         );
     }

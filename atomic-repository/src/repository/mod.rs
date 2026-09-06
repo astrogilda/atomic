@@ -85,12 +85,14 @@ mod materialize;
 mod migration;
 mod name_resolution;
 mod operation;
+mod project_tree;
 mod projection;
 mod repair;
 mod sandbox;
 mod semantic_materialize;
 mod set_id;
 mod snapshot;
+mod snapshot_split;
 mod split;
 mod switch;
 mod views;
@@ -108,10 +110,24 @@ pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedRemoteOperation,
 };
+pub use project_tree::{
+    ConversionPolicy, ExclusionPolicy, ExclusionReason, GitIndexEntry, GitIndexState, GitObject,
+    GitObjectDatabase, GitObjectKind, GitTree, GitTreeEntry, LossPolicy, ManifestDisposition,
+    ManifestRoot, PhysicalKind, PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath,
+    RepositoryEntry, RepositoryManifest, WorktreeEntry, WorktreeObservation,
+    CONVERSION_POLICY_VERSION, GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION,
+    REPO_PATH_VERSION, WORKTREE_OBSERVATION_VERSION,
+};
 pub use projection::effective_projection_closure;
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use set_id::{effective_projection_identity, view_set_id, ViewIdentity};
-pub use snapshot::SnapshotState;
+pub use snapshot::{
+    SnapshotRetentionOutcome, SnapshotRetentionPolicy, SnapshotState, SnapshotStatus,
+};
+pub use snapshot_split::{
+    IndexEntryState, IndexManifest, IndexManifestEntry, SnapshotSplitRefusal, SplitSnapshotError,
+    SplitSnapshotOutcome, INDEX_MANIFEST_VERSION,
+};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 

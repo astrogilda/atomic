@@ -51,6 +51,9 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
+        if view_name.starts_with("wc/") {
+            return Ok(Vec::new());
+        }
 
         // For draft views, build a set of ancestor change NodeIds so we
         // can filter out inherited entries.  This makes `atomic log` on a
@@ -172,6 +175,9 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
+        if view_name.starts_with("wc/") {
+            return Ok(Vec::new());
+        }
 
         let mut entries = crate::history::reverse_log(&txn, &view, &options)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

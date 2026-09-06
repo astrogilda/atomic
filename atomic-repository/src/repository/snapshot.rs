@@ -1,5 +1,9 @@
 use super::*;
 use atomic_core::change::{CausalFrontier, ChangeKind, ChangeOrigin};
+use atomic_core::operation::{
+    ActorRef, EffectPlan, EffectTarget, EffectValue, FileKind, FileState, OperationKind,
+    RepoStateRef,
+};
 
 /// Repository state for a working copy's private snapshot view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7,6 +11,39 @@ pub struct SnapshotState {
     pub view: String,
     pub baseline_view: String,
     pub head: Option<Hash>,
+    pub remainder: Option<Hash>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotStatus {
+    pub view: String,
+    pub baseline_view: String,
+    pub snapshot: Option<Hash>,
+    pub remainder: Option<Hash>,
+    pub superseded_snapshots: usize,
+}
+
+impl SnapshotStatus {
+    pub fn is_active(&self) -> bool {
+        self.snapshot.is_some() || self.remainder.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotRetentionPolicy {
+    pub keep_superseded: usize,
+}
+
+impl Default for SnapshotRetentionPolicy {
+    fn default() -> Self {
+        Self { keep_superseded: 8 }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotRetentionOutcome {
+    pub retained: Vec<Hash>,
+    pub deleted: Vec<Hash>,
 }
 
 #[derive(Clone, Debug)]
@@ -15,7 +52,8 @@ pub(super) enum RecordLifecycle {
     Snapshot {
         working_copy: WorkingCopyId,
         view: String,
-        previous: Option<Hash>,
+        supersedes: Option<Hash>,
+        replaces: Option<Hash>,
     },
     Promotion {
         snapshot_view: String,
@@ -36,10 +74,10 @@ impl RecordLifecycle {
             Self::Durable => None,
             Self::Snapshot {
                 view,
-                previous: Some(previous),
+                replaces: Some(previous),
                 ..
             } => Some((view, *previous)),
-            Self::Snapshot { previous: None, .. } => None,
+            Self::Snapshot { replaces: None, .. } => None,
             Self::Promotion {
                 snapshot_view,
                 snapshot,
@@ -52,13 +90,13 @@ impl RecordLifecycle {
             Self::Durable | Self::Promotion { .. } => (ChangeKind::Durable, None),
             Self::Snapshot {
                 working_copy,
-                previous,
+                supersedes,
                 ..
             } => (
                 ChangeKind::Snapshot {
                     working_copy: *working_copy,
                 },
-                *previous,
+                *supersedes,
             ),
         };
         change
@@ -153,7 +191,7 @@ impl Repository {
                 .map_err(|error| RepositoryError::Database(error.to_string()))?,
         };
 
-        let mut head = None;
+        let mut direct = None;
         for row in txn
             .iter_changes(&snapshot_view, 0)
             .map_err(|error| RepositoryError::Database(error.to_string()))?
@@ -166,7 +204,7 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ChangeNotFound {
                     hash: node_id.to_string(),
                 })?;
-            if head.replace(hash).is_some() {
+            if direct.replace(hash).is_some() {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "snapshot view '{}' contains more than one direct change",
@@ -178,17 +216,24 @@ impl Repository {
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
 
-        if let Some(hash) = head {
+        let mut head = None;
+        let mut remainder = None;
+        if let Some(hash) = direct {
             let change = self.load_change(&hash)?;
-            if change.kind().working_copy() != Some(working_copy) {
-                return Err(RepositoryError::InvalidOperation {
-                    message: format!(
-                        "snapshot view '{}' contains change {} not owned by working copy {}",
-                        view_name,
-                        hash.to_base32(),
-                        working_copy
-                    ),
-                });
+            if change.kind().is_snapshot() {
+                if change.kind().working_copy() != Some(working_copy) {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "snapshot view '{}' contains change {} not owned by working copy {}",
+                            view_name,
+                            hash.to_base32(),
+                            working_copy
+                        ),
+                    });
+                }
+                head = Some(hash);
+            } else {
+                remainder = Some(hash);
             }
         }
 
@@ -196,6 +241,7 @@ impl Repository {
             view: view_name,
             baseline_view,
             head,
+            remainder,
         })
     }
 
@@ -219,7 +265,8 @@ impl Repository {
             RecordLifecycle::Snapshot {
                 working_copy,
                 view: state.view,
-                previous: state.head,
+                supersedes: state.head,
+                replaces: state.head.or(state.remainder),
             },
         )
     }
@@ -251,6 +298,208 @@ impl Repository {
                 snapshot,
             },
         )
+    }
+
+    /// Read snapshot/remainder lifecycle state without creating or mutating its private view.
+    pub fn snapshot_status(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<SnapshotStatus, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let baseline_view = self.desired_view_name(working_copy)?;
+        let view_name = Self::snapshot_view_name(working_copy);
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let Some(view) = txn
+            .get_view(&view_name)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+        else {
+            return Ok(SnapshotStatus {
+                view: view_name,
+                baseline_view,
+                snapshot: None,
+                remainder: None,
+                superseded_snapshots: 0,
+            });
+        };
+        let mut direct = Vec::new();
+        for row in txn
+            .iter_changes(&view, 0)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+        {
+            let (_, node_id, _) =
+                row.map_err(|error| RepositoryError::Database(error.to_string()))?;
+            direct.push(
+                txn.get_external(node_id)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| RepositoryError::ChangeNotFound {
+                        hash: node_id.to_string(),
+                    })?,
+            );
+        }
+        drop(txn);
+        if direct.len() > 1 {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "private view '{}' contains multiple direct changes",
+                    view_name
+                ),
+            });
+        }
+        let mut snapshot = None;
+        let mut remainder = None;
+        if let Some(hash) = direct.first().copied() {
+            if self.load_change(&hash)?.kind().is_snapshot() {
+                snapshot = Some(hash);
+            } else {
+                remainder = Some(hash);
+            }
+        }
+        let mut superseded_snapshots = 0;
+        let mut cursor = snapshot
+            .and_then(|hash| self.load_change(&hash).ok())
+            .and_then(|change| change.supersedes().copied());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(hash) = cursor {
+            if !seen.insert(hash) {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("snapshot supersedes cycle at {}", hash.to_base32()),
+                });
+            }
+            superseded_snapshots += 1;
+            cursor = self
+                .load_change(&hash)
+                .ok()
+                .and_then(|change| change.supersedes().copied());
+        }
+        Ok(SnapshotStatus {
+            view: view_name,
+            baseline_view,
+            snapshot,
+            remainder,
+            superseded_snapshots,
+        })
+    }
+
+    /// Delete superseded snapshot objects beyond the retention window through leased effects.
+    pub fn prune_superseded_snapshots(
+        &self,
+        working_copy: WorkingCopyId,
+        policy: SnapshotRetentionPolicy,
+    ) -> Result<SnapshotRetentionOutcome, RepositoryError> {
+        let status = self.snapshot_status(working_copy)?;
+        let Some(head) = status.snapshot else {
+            return Ok(SnapshotRetentionOutcome::default());
+        };
+        let mut chain = Vec::new();
+        let mut cursor = self.load_change(&head)?.supersedes().copied();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(hash) = cursor {
+            if !seen.insert(hash) {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("snapshot supersedes cycle at {}", hash.to_base32()),
+                });
+            }
+            let change = self.load_change(&hash)?;
+            cursor = change.supersedes().copied();
+            chain.push(hash);
+        }
+        let retained = chain
+            .iter()
+            .take(policy.keep_superseded)
+            .copied()
+            .collect::<Vec<_>>();
+        let candidates = chain
+            .iter()
+            .skip(policy.keep_superseded)
+            .copied()
+            .filter(|hash| {
+                self.views_containing_change(hash)
+                    .map(|views| views.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(SnapshotRetentionOutcome {
+                retained,
+                deleted: Vec::new(),
+            });
+        }
+
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy)
+                    .to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let record = self.working_copy_record(working_copy)?;
+        let state = RepoStateRef {
+            view: None,
+            working_copy: Some(super::operation::working_copy_state_ref(record)),
+            git: None,
+        };
+        let mut effects = Vec::with_capacity(candidates.len());
+        for (ordinal, hash) in candidates.iter().enumerate() {
+            let path = self.change_store().change_path(hash);
+            let bytes = std::fs::read(&path)?;
+            let relative = path
+                .strip_prefix(&self.root)
+                .map_err(|error| RepositoryError::InvalidOperation {
+                    message: error.to_string(),
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&path)?.permissions().mode() & 0o7777
+            };
+            #[cfg(not(unix))]
+            let mode = 0o644;
+            effects.push(EffectPlan {
+                ordinal: ordinal as u32,
+                target: EffectTarget::FilesystemPath { path: relative },
+                expected_old: EffectValue::File(FileState {
+                    kind: FileKind::Regular,
+                    mode,
+                    content: Hash::of(&bytes),
+                }),
+                expected_new: EffectValue::Absent,
+            });
+        }
+        let prepared = self.prepare_working_copy_transition(
+            &operation_lock,
+            OperationKind::Record,
+            None,
+            state.clone(),
+            state,
+            effects,
+            ActorRef::System {
+                name: "repository-snapshot-retention".to_string(),
+            },
+            super::operation::current_operation_timestamp_ms(),
+        )?;
+        let operation_id = prepared.operation().id();
+        let mut deleted = Vec::new();
+        for (ordinal, hash) in candidates.iter().enumerate() {
+            let pending = self.execute_filesystem_effect(
+                &operation_lock,
+                operation_id,
+                ordinal as u32,
+                None,
+            )?;
+            self.record_pending_filesystem_effect(&operation_lock, operation_id, pending)?;
+            self.change_store().evict(hash);
+            deleted.push(*hash);
+        }
+        self.finalize_operation_verified(&operation_lock, operation_id)?;
+        Ok(SnapshotRetentionOutcome { retained, deleted })
     }
 
     pub(super) fn ensure_change_allowed_in_view<T: ViewTxnT>(

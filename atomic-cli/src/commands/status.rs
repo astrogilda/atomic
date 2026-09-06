@@ -106,7 +106,7 @@ use clap::Parser;
 
 use atomic_core::types::Base32;
 use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
-use atomic_repository::Repository;
+use atomic_repository::{Repository, SnapshotStatus};
 
 use crate::commands::git::bridge::read_checkpoint_observation;
 use crate::commands::git::guard::{
@@ -267,6 +267,21 @@ impl Status {
         }
 
         options
+    }
+
+    fn print_snapshot_status(&self, status: &SnapshotStatus) {
+        if let Some(snapshot) = status.snapshot {
+            println!(
+                "Snapshot: {} ({} superseded retained)",
+                hash(&snapshot.to_base32()[..DEFAULT_HASH_LENGTH]),
+                status.superseded_snapshots
+            );
+        } else if let Some(remainder) = status.remainder {
+            println!(
+                "Snapshot remainder: {}",
+                hash(&remainder.to_base32()[..DEFAULT_HASH_LENGTH])
+            );
+        }
     }
 
     /// Print the status in long (human-readable) format.
@@ -608,6 +623,10 @@ impl Command for Status {
         if self.short {
             self.print_short_format(&status)
         } else {
+            let snapshot = repo
+                .snapshot_status(working_copy)
+                .map_err(|error| CliError::Internal(error.into()))?;
+            self.print_snapshot_status(&snapshot);
             self.print_long_format(&status)
         }
     }

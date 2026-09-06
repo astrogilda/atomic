@@ -734,6 +734,11 @@ impl Repository {
     /// The exported manifest is verified before it is returned, so a
     /// corrupted log surfaces here rather than on the receiving end.
     pub fn view_manifest(&self, name: &str) -> Result<ViewManifest, RepositoryError> {
+        if name.starts_with("wc/") {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("private working-copy view '{}' cannot be exported", name),
+            });
+        }
         let txn = self
             .pristine
             .read_txn()

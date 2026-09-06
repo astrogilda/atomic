@@ -13,6 +13,7 @@ atomic-core = { workspace = true }
 atomic-canonical = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
+atomic-objects = { workspace = true }
 atomic-semantic = { workspace = true }
 
 serde = { workspace = true }
@@ -38,6 +39,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
+sha1 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
 
