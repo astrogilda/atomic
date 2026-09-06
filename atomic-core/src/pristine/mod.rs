@@ -125,7 +125,7 @@
 //! | `VIEWS` | name | ViewState | View metadata |
 //! | `VIEW_CHANGES` | (view_id, seq) | change_id | Change log |
 //! | `REV_VIEW_CHANGES` | (view_id, change_id) | seq | Reverse change log |
-//! | `PRISTINE_META` | schema key | version | Completed derived-index migrations |
+//! | `PRISTINE_META` | metadata key | version | Derived-index completion and required capabilities |
 //! | `PATH_CLAIMS` | path | fixed claim event | Additive, unfiltered path transitions |
 //! | `TREE` | path | inode | Unambiguous path → inode projection |
 //! | `REV_TREE` | inode | path | Exact inverse of TREE |
@@ -149,6 +149,7 @@
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
+mod capability;
 mod error;
 mod inode_graph;
 pub mod ontology;
@@ -160,6 +161,10 @@ mod txn;
 pub mod vault;
 pub mod view_graph;
 
+pub use capability::{
+    RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
+    CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SUPPORTED_REPOSITORY_CAPABILITIES,
+};
 pub use error::{PristineError, PristineResult};
 pub use inode_graph::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,

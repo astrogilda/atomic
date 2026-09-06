@@ -45,6 +45,8 @@
 
 use std::fmt;
 
+use super::UnsupportedRepositoryCapability;
+
 /// Errors that can occur in pristine operations
 ///
 /// This enum covers all error conditions that can arise when interacting
@@ -282,6 +284,12 @@ pub enum PristineError {
     /// this is unreachable (requires 2^64 allocations).
     IdSpaceExhausted,
 
+    /// The repository requires capabilities unsupported by this build.
+    UnsupportedRequiredCapabilities {
+        /// Unsupported capability requirements in stable identifier order.
+        capabilities: Vec<UnsupportedRepositoryCapability>,
+    },
+
     // Data Errors
     /// Invalid span structure
     ///
@@ -443,6 +451,15 @@ impl fmt::Display for PristineError {
                 working_copy_ids.join(", ")
             ),
             Self::IdSpaceExhausted => write!(f, "internal ID space exhausted (u64::MAX reached)"),
+            Self::UnsupportedRequiredCapabilities { capabilities } => write!(
+                f,
+                "repository requires unsupported capabilities: {}; upgrade Atomic to a version that supports every required repository capability before reopening",
+                capabilities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
             Self::UnindexedChangeDependencies { change_id } => write!(
                 f,

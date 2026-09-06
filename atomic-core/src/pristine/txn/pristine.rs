@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Builder, Database, ReadTransaction, ReadableMultimapTable, ReadableTable};
 
+use crate::pristine::capability::{
+    unsupported_requirements, RepositoryCapability, RequiredRepositoryCapability,
+};
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::path_claim::{
     path_claim_schema_error, PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
@@ -38,6 +41,43 @@ use super::write::WriteTxn;
 /// Return `max_id + 1`, or error if the ID space is exhausted.
 fn next_id(max_id: u64) -> PristineResult<u64> {
     max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
+}
+
+fn collect_required_repository_capabilities(
+    db: &Database,
+) -> PristineResult<Vec<RequiredRepositoryCapability>> {
+    let read_txn = db.begin_read()?;
+    let metadata = match read_txn.open_table(PRISTINE_META) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut requirements = Vec::new();
+    for row in metadata.iter()? {
+        let (key, version) = row?;
+        if let Some(requirement) =
+            RequiredRepositoryCapability::from_metadata(key.value(), version.value())
+        {
+            requirements.push(requirement);
+        }
+    }
+    requirements.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(requirements)
+}
+
+fn ensure_supported_repository_capabilities(
+    requirements: &[RequiredRepositoryCapability],
+) -> PristineResult<()> {
+    let capabilities = unsupported_requirements(requirements);
+    if capabilities.is_empty() {
+        Ok(())
+    } else {
+        Err(PristineError::UnsupportedRequiredCapabilities { capabilities })
+    }
+}
+
+fn require_supported_repository_capabilities(db: &Database) -> PristineResult<()> {
+    ensure_supported_repository_capabilities(&collect_required_repository_capabilities(db)?)
 }
 
 fn require_path_claim_schema(db: &Database) -> PristineResult<()> {
@@ -140,9 +180,30 @@ impl Pristine {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
 
-        // Initialize all tables
+        // Existing repositories must be checked before the additive table-init
+        // transaction starts. Binaries predating this generic fence cannot honor
+        // an additive marker; fence-aware binaries always fail closed here.
+        if !is_new_database {
+            require_supported_repository_capabilities(&db)?;
+        }
+
+        // Initialize all tables. Re-check in the write transaction so a
+        // concurrently raised requirement cannot race additive initialization.
         let write_txn = db.begin_write()?;
         {
+            let metadata = write_txn.open_table(PRISTINE_META)?;
+            let mut requirements = Vec::new();
+            for row in metadata.iter()? {
+                let (key, version) = row?;
+                if let Some(requirement) =
+                    RequiredRepositoryCapability::from_metadata(key.value(), version.value())
+                {
+                    requirements.push(requirement);
+                }
+            }
+            ensure_supported_repository_capabilities(&requirements)?;
+            drop(metadata);
+
             // ID mapping tables
             write_txn.open_table(EXTERNAL)?;
             write_txn.open_table(INTERNAL)?;
@@ -293,6 +354,7 @@ impl Pristine {
     /// skip the table-init write transaction and only need a read pass to
     /// discover the max allocated node, view, and inode IDs.
     fn scan_ids(db: Database, require_complete_path_claims: bool) -> PristineResult<Self> {
+        require_supported_repository_capabilities(&db)?;
         if require_complete_path_claims {
             require_path_claim_schema(&db)?;
         }
@@ -327,6 +389,71 @@ impl Pristine {
             next_view_id,
             next_inode,
         })
+    }
+
+    /// Return repository capability requirements in stable identifier order.
+    pub fn required_repository_capabilities(
+        &self,
+    ) -> PristineResult<Vec<RequiredRepositoryCapability>> {
+        collect_required_repository_capabilities(&self.db)
+    }
+
+    /// Reject requirements unsupported by this Atomic build.
+    pub fn ensure_supported_repository_capabilities(&self) -> PristineResult<()> {
+        require_supported_repository_capabilities(&self.db)
+    }
+
+    /// Durably declare or raise repository capability requirements.
+    ///
+    /// Existing requirements are revalidated in the same write transaction
+    /// before any marker is changed. The immediate commit completes before this
+    /// method returns, allowing callers to order object persistence after it.
+    pub fn require_repository_capabilities(
+        &self,
+        capabilities: &[RepositoryCapability],
+    ) -> PristineResult<()> {
+        let requested = capabilities
+            .iter()
+            .map(|capability| RequiredRepositoryCapability {
+                id: capability.id().to_string(),
+                minimum_version: capability.minimum_version(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(redb::Durability::Immediate);
+        let mut metadata = write_txn.open_table(PRISTINE_META)?;
+
+        let mut existing_requirements = Vec::new();
+        for row in metadata.iter()? {
+            let (key, version) = row?;
+            if let Some(requirement) =
+                RequiredRepositoryCapability::from_metadata(key.value(), version.value())
+            {
+                existing_requirements.push(requirement);
+            }
+        }
+        ensure_supported_repository_capabilities(&existing_requirements)?;
+        ensure_supported_repository_capabilities(&requested)?;
+
+        for capability in capabilities {
+            let key = capability.metadata_key();
+            let existing = metadata.get(key.as_str())?.map(|version| version.value());
+            if existing.is_none_or(|version| version < capability.minimum_version()) {
+                metadata.insert(key.as_str(), capability.minimum_version())?;
+            }
+        }
+        drop(metadata);
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Durably declare or raise one repository capability requirement.
+    pub fn require_repository_capability(
+        &self,
+        capability: RepositoryCapability,
+    ) -> PristineResult<()> {
+        self.require_repository_capabilities(&[capability])
     }
 
     /// Return the completed path-claim schema version, if any.
@@ -404,7 +531,8 @@ mod tests {
     use crate::operation::OperationScope;
     use crate::pristine::{
         MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, OperationTxnT,
-        PathClaimMutTxnT, PathClaimTxnT, TreeTxnT, WorkingCopyTxnT, PATH_CLAIM_SCHEMA_VERSION,
+        PathClaimMutTxnT, PathClaimTxnT, TreeTxnT, WorkingCopyTxnT, CHANGE_FORMAT_VNEXT_CAPABILITY,
+        PATH_CLAIM_SCHEMA_VERSION, REQUIRED_CAPABILITY_PREFIX,
     };
     use tempfile::tempdir;
 
@@ -423,6 +551,158 @@ mod tests {
         // Should be able to create transactions
         let _read = pristine.read_txn().unwrap();
         let _write = pristine.write_txn().unwrap();
+    }
+
+    fn metadata_only_repository_with_requirement(db_path: &Path, capability: &str, version: u32) {
+        let db = Database::create(db_path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
+            let key = format!("{REQUIRED_CAPABILITY_PREFIX}{capability}");
+            metadata.insert(key.as_str(), version).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    fn expect_unsupported(result: PristineResult<Pristine>) -> PristineError {
+        match result {
+            Ok(_) => panic!("open must reject unsupported repository capabilities"),
+            Err(error @ PristineError::UnsupportedRequiredCapabilities { .. }) => error,
+            Err(error) => panic!("expected unsupported capability error, got {error}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_capability_rejects_all_open_modes_before_table_initialization() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        metadata_only_repository_with_requirement(&db_path, "future-format", 1);
+
+        let error = expect_unsupported(Pristine::open(&db_path));
+        assert!(error.to_string().contains("future-format"));
+        assert!(error.to_string().contains("upgrade Atomic"));
+
+        // An unsupported existing repository is rejected before additive table
+        // initialization commits any mutation.
+        let db = Database::open(&db_path).unwrap();
+        let read_txn = db.begin_read().unwrap();
+        assert!(matches!(
+            read_txn.open_table(EXTERNAL),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        drop(read_txn);
+        drop(db);
+
+        expect_unsupported(Pristine::open_existing(&db_path));
+        expect_unsupported(Pristine::open_readonly(&db_path));
+        expect_unsupported(Pristine::open_existing_for_repair(&db_path));
+        expect_unsupported(Pristine::open_readonly_for_repair(&db_path));
+    }
+
+    #[test]
+    fn higher_known_capability_version_is_rejected() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        metadata_only_repository_with_requirement(
+            &db_path,
+            CHANGE_FORMAT_VNEXT_CAPABILITY.id(),
+            CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version() + 1,
+        );
+
+        let error = expect_unsupported(Pristine::open_readonly(&db_path));
+        let message = error.to_string();
+        assert!(message.contains("change-format-vnext"));
+        assert!(message.contains("version 2"));
+        assert!(message.contains("supports through version 1"));
+    }
+
+    #[test]
+    fn capability_declaration_is_durable_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+
+        pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .unwrap();
+        pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .unwrap();
+        assert_eq!(
+            pristine.required_repository_capabilities().unwrap(),
+            vec![RequiredRepositoryCapability {
+                id: CHANGE_FORMAT_VNEXT_CAPABILITY.id().to_string(),
+                minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
+            }]
+        );
+        drop(pristine);
+
+        let reopened = Pristine::open_readonly(&db_path).unwrap();
+        assert_eq!(
+            reopened.required_repository_capabilities().unwrap(),
+            vec![RequiredRepositoryCapability {
+                id: "change-format-vnext".to_string(),
+                minimum_version: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn capability_declaration_raises_a_lower_requirement() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let write_txn = pristine.db.begin_write().unwrap();
+        {
+            let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
+            metadata
+                .insert("required-capability/change-format-vnext", 0)
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .unwrap();
+        assert_eq!(
+            pristine.required_repository_capabilities().unwrap(),
+            vec![RequiredRepositoryCapability {
+                id: "change-format-vnext".to_string(),
+                minimum_version: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn capability_declaration_revalidates_existing_requirements() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let write_txn = pristine.db.begin_write().unwrap();
+        {
+            let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
+            metadata
+                .insert("required-capability/future-format", 1)
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let error = pristine
+            .ensure_supported_repository_capabilities()
+            .expect_err("a pre-opened pristine handle must revalidate requirements");
+        assert!(matches!(
+            error,
+            PristineError::UnsupportedRequiredCapabilities { .. }
+        ));
+
+        let error = match pristine.require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY) {
+            Ok(()) => panic!("declaration must reject existing unknown requirements"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            PristineError::UnsupportedRequiredCapabilities { .. }
+        ));
     }
 
     #[test]

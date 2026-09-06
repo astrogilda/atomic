@@ -154,7 +154,7 @@ impl Repository {
 
         let pristine = Arc::new(
             Pristine::open_existing(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                .map_err(RepositoryError::from)?,
         );
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

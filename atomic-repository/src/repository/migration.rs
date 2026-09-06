@@ -26,13 +26,11 @@ pub(super) fn migrate_path_claims_if_required(
 
     drop(pristine);
     let recovered_inodes = inode_graph_position_index(pristine_path)?;
-    let pristine = Pristine::open(pristine_path)
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let pristine = Pristine::open(pristine_path).map_err(RepositoryError::from)?;
     let plan = prepare_migration(&pristine, change_store, current_view, &recovered_inodes)?;
     drop(pristine);
     commit_migration(pristine_path, plan)?;
-    Pristine::open_existing(pristine_path)
-        .map_err(|error| RepositoryError::Database(error.to_string()))
+    Pristine::open_existing(pristine_path).map_err(RepositoryError::from)
 }
 
 struct MigrationPlan {

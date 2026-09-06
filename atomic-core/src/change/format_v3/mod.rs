@@ -199,7 +199,9 @@ pub mod writer;
 //   use atomic_core::change::format_v3::types::CompactPosition;
 
 // Error types
-pub use error::{FormatError, FormatResult, FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES};
+pub use error::{
+    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
+};
 
 // Core types
 pub use types::{
@@ -257,7 +259,8 @@ mod tests {
 
         // Constants
         assert_eq!(MAGIC, *b"ATOM");
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(LEGACY_FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
         assert_eq!(MAX_HASH_TABLE_ENTRIES, 65534);
 
         // Hash index types

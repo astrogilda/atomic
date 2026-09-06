@@ -162,6 +162,17 @@ impl ReadSection {
     pub fn deserialize<T: DeserializeOwned + 'static>(&self) -> FormatResult<T> {
         match postcard::from_bytes(&self.payload) {
             Ok(value) => Ok(value),
+            Err(current_error) if self.section_type == SectionType::Header => {
+                if let Ok(header) =
+                    super::types::envelope::decode_change_header_only_v2(&self.payload)
+                {
+                    let value: Box<dyn Any> = Box::new(header);
+                    if let Ok(value) = value.downcast::<T>() {
+                        return Ok(*value);
+                    }
+                }
+                Err(current_error.into())
+            }
             Err(current_error) if self.section_type == SectionType::Provenance => {
                 if let Ok(provenance) =
                     super::compatibility::deserialize_july_2026_provenance(&self.payload)

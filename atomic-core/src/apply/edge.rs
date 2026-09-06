@@ -42,7 +42,7 @@
 //!
 //! These are tracked in the workspace for later resolution.
 
-use crate::change::{Change, EdgeUpdate, NewEdge};
+use crate::change::{Change, EdgeUpdate, NewEdge, VerifiedCausalFrontier};
 use crate::pristine::GraphTxnT;
 use crate::types::{ChangePosition, EdgeKind, GraphNode, Hash, NodeId, Position};
 
@@ -85,6 +85,32 @@ pub fn write_edge_map(
     change: &Change,
     detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
+    if !change.causal_frontier().is_empty() {
+        return Err(LocalApplyError::CausalFrontierInvalid {
+            reason: "frontier-bearing edge application requires a verified closure".to_string(),
+        });
+    }
+    write_edge_map_with_frontier(
+        txn,
+        workspace,
+        change_id,
+        edge_update,
+        change,
+        &VerifiedCausalFrontier::empty(),
+        detect_conflicts,
+    )
+}
+
+/// Write an edge update using repository-verified causal knowledge.
+pub fn write_edge_map_with_frontier(
+    txn: &mut CachedWriteGraphTxn<'_, '_>,
+    workspace: &mut Workspace,
+    change_id: NodeId,
+    edge_update: &EdgeUpdate<Option<Hash>>,
+    change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
+    detect_conflicts: bool,
+) -> Result<(), LocalApplyError> {
     // Process each edge in the map
     for edge in &edge_update.edges {
         write_new_edge(
@@ -94,6 +120,7 @@ pub fn write_edge_map(
             &edge_update.inode,
             edge,
             change,
+            verified_frontier,
             detect_conflicts,
         )?;
     }
@@ -141,6 +168,7 @@ pub(super) fn resolve_vertex<T: GraphTxnT>(
 /// * `inode` - File inode position for indexing
 /// * `edge` - The edge to write
 /// * `change` - Full change for dependency checking
+#[allow(clippy::too_many_arguments)]
 fn write_new_edge(
     txn: &mut CachedWriteGraphTxn<'_, '_>,
     workspace: &mut Workspace,
@@ -148,6 +176,7 @@ fn write_new_edge(
     inode: &Position<Option<Hash>>,
     edge: &NewEdge<Option<Hash>>,
     change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
     detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
     log::debug!(
@@ -228,7 +257,7 @@ fn write_new_edge(
     // For non-folder deletions, check for zombie context
     if detect_conflicts && kind.is_some_and(|k| k.is_deleted() && !k.is_folder()) {
         log::debug!("write_new_edge: collect_zombie_context starting");
-        collect_zombie_context(txn, workspace, change, edge, change_id)?;
+        collect_zombie_context(txn, workspace, change, verified_frontier, edge, change_id)?;
         log::debug!("write_new_edge: collect_zombie_context complete");
     }
 
@@ -412,6 +441,7 @@ fn collect_zombie_context<T: GraphTxnT>(
     txn: &T,
     workspace: &mut Workspace,
     change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
     edge: &NewEdge<Option<Hash>>,
     change_id: NodeId,
 ) -> Result<(), LocalApplyError> {
@@ -423,7 +453,7 @@ fn collect_zombie_context<T: GraphTxnT>(
     let mut pos = start_pos;
     while let Ok(node) = txn.find_block(pos) {
         // Check for non-deleted edges that we don't know about
-        check_vertex_for_zombies(txn, workspace, change, node, change_id)?;
+        check_vertex_for_zombies(txn, workspace, change, verified_frontier, node, change_id)?;
 
         // Move to next span in range
         if node.end < end_pos.pos {
@@ -457,6 +487,7 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
     txn: &T,
     workspace: &mut Workspace,
     change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
     node: GraphNode<NodeId>,
     change_id: NodeId,
 ) -> Result<(), LocalApplyError> {
@@ -479,7 +510,7 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
         }
 
         if let Ok(Some(hash)) = txn.get_external(edge.introduced_by) {
-            if !change.knows(&hash) {
+            if !change.knows_with_frontier(&hash, verified_frontier) {
                 // Unknown live edge - this is a zombie
                 workspace.add_zombie_vertex(node);
                 return Ok(());
@@ -500,7 +531,7 @@ fn check_vertex_for_zombies<T: GraphTxnT>(
         }
 
         if let Ok(Some(hash)) = txn.get_external(edge.introduced_by) {
-            if !change.knows(&hash) {
+            if !change.knows_with_frontier(&hash, verified_frontier) {
                 // Unknown live edge - this is a zombie
                 workspace.add_zombie_vertex(node);
                 return Ok(());

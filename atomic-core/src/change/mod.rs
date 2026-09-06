@@ -92,6 +92,7 @@ mod atom;
 pub mod attestation;
 #[allow(clippy::module_inception)]
 mod change;
+mod classification;
 mod credit;
 mod encoding;
 pub mod format_v3;
@@ -113,6 +114,10 @@ pub use attestation::{
     ATTESTATION_EXTENSION,
 };
 pub use change::{Change, ChangeError, HashedChange};
+pub use classification::{
+    CausalFrontier, ChangeKind, ChangeOrigin, ChangeValidationError, Derivation, GitDerivation,
+    VerifiedCausalFrontier,
+};
 pub use credit::{Credit, CreditRange, CreditStats, CreditType, FileCredits, LineCredit};
 pub use encoding::Encoding;
 pub use header::{Author, ChangeHeader};

@@ -30,15 +30,17 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-FMT1: Change-object format vNext for snapshots and Git origin/frontier**
-  Intent: pending · Priority: high · Prerequisites: CB-1A and CB-1C (done)
-  Add lossless versioned `ChangeKind`, snapshot owner/supersession, `ChangeOrigin`, `CausalFrontier`, and capability fencing without rewriting legacy object bytes.
+- [ ] **READY — CB-2A: Complete baseline-relative snapshot lifecycle and promotion**
+  Intent: pending · Priority: high · Prerequisites: CB-FMT1 and CB-1C (done)
+  Add working-copy-private snapshot views, complete baseline-relative replacement, promotion reassembly, and snapshot exclusion from Shared views, ordinary log, and push.
 
 ### Parallel safety workstream
 
-Phase 0 and Phase N are complete; no additional safety prerequisite is ready in parallel.
+- [ ] **READY — CB-3A: Causal inode attributes and native mode/kind lifecycle**
+  Intent: pending · Priority: high · Prerequisites: CB-FMT1 and CB-N34 (done)
+  Add additive attribute registers, semantic mode/kind operations, graph-backed conflicts, and materialization/status parity.
 
-Phase 1 is complete through CB-1C. The shared format foundation is now ready.
+Phase 1 and the shared CB-FMT1 format foundation are complete.
 
 ---
 
@@ -67,6 +69,7 @@ Phase 1 is complete through CB-1C. The shared format foundation is now ready.
 | [x] DONE | 1A persistent working-copy identity and API boundary | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` | Versioned pristine records, safe legacy/copy migration, distinct linked worktrees and sandboxes, explicit working-copy capabilities, scoped caches/shelves, and derived `current_view`. |
 | [x] DONE | 1B durable operation/effect journal, ordered locks, and crash recovery | `ATOM::continuouslee::79` / `01M1QA9RZQ5RA0HG3HDST78R1J` | Canonical append-only operation/receipt storage, CAS heads, common→working-copy→pristine→shelf locking, per-effect leases, inverse/startup recovery, canonical imported deletes, and harnesses 05/43. |
 | [x] DONE | 1C operation commands, inverse deltas, head consolidation, and native routing | `ATOM::continuouslee::80` / `01M1SFDT134Z6N3S6VKH1S59FR` | V1-preserving operation V2, `op log|show|undo|restore`, shift-aware historical restore, shared repository heads, deterministic consolidation/`Diverged`, routed native mutations, and harness 44 (31/31). |
+| [x] DONE | FMT1 change-object lifecycle/origin/frontier format | `ATOM::continuouslee::81` / `01M1TG0HTNBC6MX7563WA7BN2C` | ATOM schema V2 hashed envelope, immutable V1 byte/hash fixture, lossless `extra_known`/metadata, checked lifecycle/origin combinations, verified causal frontier closure in conflict checks, and pre-write repository capability fence. |
 
 ---
 
@@ -182,7 +185,7 @@ recovery harness 43 at 21/21, and operation harness 44 at 31/31.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] READY | CB-FMT1 | Change-object format vNext for snapshot lifecycle and Git origin/frontier | 1A, 1C | pending |
+| [x] DONE | CB-FMT1 | Change-object format vNext for snapshot lifecycle and Git origin/frontier | 1A, 1C | `ATOM::continuouslee::81` / `01M1TG0HTNBC6MX7563WA7BN2C` |
 
 ### CB-FMT1 definition of done
 
@@ -192,13 +195,20 @@ their hashes without re-encoding; impossible combinations fail; old clients fail
 closed on the repository capability fence. Git parents never enter Atomic
 `dependencies`.
 
+Evidence: ATOM schema V2 frozen-envelope round trips and invalid-combination fixtures;
+immutable V1 fixture object hash `KQEBIVO7FVXRZ5PWLT75G267BRXZU5GKHWLV62MHBQDG67VE5BGQ`;
+complete frontier-index verification wired into zombie checks; eight repository
+capability/open/write tests; full `atomic-core`; `atomic-repository` excluding four
+pre-existing long-running property/import tests that exceeded 10- and 20-minute
+bounds; and strict workspace clippy with `-D warnings`.
+
 ---
 
 ## Phase 2 — Snapshot changes, promotion, and split
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-2A | Complete baseline-relative snapshot lifecycle and promotion | FMT1, 1C | pending |
+| [ ] READY | CB-2A | Complete baseline-relative snapshot lifecycle and promotion | FMT1, 1C | pending |
 | [ ] BLOCKED | CB-2B | Graph-safe staged/remainder snapshot split, retention, and snapshot UX | 2A, 3A, 3C | pending |
 
 ### CB-2A definition of done
@@ -221,7 +231,7 @@ operations return structured refusal; retention, status, and `diff --snapshot` w
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-3A | Causal inode attributes and native mode/kind lifecycle | FMT1, N34 | pending |
+| [ ] READY | CB-3A | Causal inode attributes and native mode/kind lifecycle | FMT1, N34 | pending |
 | [ ] BLOCKED | CB-3B | Effective projection closure, SetId index, and topological-order proof | 3A, N6, N7 | pending |
 | [ ] BLOCKED | CB-3C | Repository-byte filters, opaque tracked content, and empty-directory loss notes | FMT1, 3A, N34 | pending |
 
@@ -511,10 +521,10 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-FMT1.
+1. **Now:** CB-2A, with CB-3A independently ready.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
-4. **Operation substrate:** CB-1A is done; CB-1B → CB-1C → CB-FMT1.
+4. **Operation and format substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1 are done.
 5. **Snapshots and semantics:** CB-2A; CB-3A → CB-3B/CB-3C → CB-2B.
 6. **Equivalence:** CB-4A → CB-4B → CB-4C.
 7. **Shared transaction:** CB-5A → CB-5B → CB-5C.
@@ -527,4 +537,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-FMT1 intent next with CB-1A and CB-1C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
+- Allocate the CB-2A intent next with CB-FMT1 and CB-1C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.

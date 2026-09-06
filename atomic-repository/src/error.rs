@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use atomic_core::pristine::PristineError;
 use atomic_core::WorkingCopyId;
 use thiserror::Error;
 
@@ -53,6 +54,13 @@ pub enum RepositoryError {
     /// Invalid repository structure
     #[error("Invalid repository structure: {reason}")]
     InvalidRepository { reason: String },
+
+    /// The repository requires capabilities unsupported by this Atomic build.
+    #[error("{source}")]
+    UnsupportedRequiredCapabilities {
+        #[source]
+        source: PristineError,
+    },
 
     /// View not found
     #[error("View not found: {name}")]
@@ -344,6 +352,7 @@ impl RepositoryError {
         matches!(
             self,
             RepositoryError::UncommittedChanges
+                | RepositoryError::UnsupportedRequiredCapabilities { .. }
                 | RepositoryError::WorkingCopyMigrationRequired { .. }
                 | RepositoryError::MalformedWorkingCopyIdentity { .. }
                 | RepositoryError::MergeConflict { .. }
@@ -391,6 +400,17 @@ impl RepositoryError {
                 | RepositoryError::ChangeAlreadyApplied { .. }
                 | RepositoryError::MissingDependency { .. }
         )
+    }
+}
+
+impl From<PristineError> for RepositoryError {
+    fn from(error: PristineError) -> Self {
+        match error {
+            source @ PristineError::UnsupportedRequiredCapabilities { .. } => {
+                Self::UnsupportedRequiredCapabilities { source }
+            }
+            other => Self::Database(other.to_string()),
+        }
     }
 }
 

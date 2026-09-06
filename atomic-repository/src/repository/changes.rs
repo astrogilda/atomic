@@ -1,5 +1,25 @@
 use super::*;
 
+const ATOM_CHANGE_MAGIC: &[u8; 4] = b"ATOM";
+const ATOM_CHANGE_FILE_HEADER_LEN: usize = 64;
+const ATOM_CHANGE_FILE_VERSION_V1: u32 = 1;
+const ATOM_CHANGE_FILE_VERSION_V2: u32 = 2;
+
+fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
+    if bytes.len() < ATOM_CHANGE_FILE_HEADER_LEN {
+        return Err(RepositoryError::Serialization(format!(
+            "change object is too short for an ATOM file header: expected at least {ATOM_CHANGE_FILE_HEADER_LEN} bytes, found {}",
+            bytes.len()
+        )));
+    }
+    if &bytes[..4] != ATOM_CHANGE_MAGIC {
+        return Err(RepositoryError::Serialization(
+            "change object does not begin with ATOM file-header magic".to_string(),
+        ));
+    }
+    Ok(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+}
+
 impl Repository {
     // Change Storage Methods
 
@@ -97,37 +117,51 @@ impl Repository {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> Result<Hash, RepositoryError> {
+        self.pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .map_err(RepositoryError::from)?;
         self.change_store
             .save_change(change)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Save a change using pre-serialized V3 bytes (hash-stable).
+    /// Save a change using pre-serialized ATOM bytes (hash-stable).
     ///
-    /// This writes the exact V3 bytes to disk, ensuring the file hash matches
-    /// the hash registered in the pristine graph. Without this, re-serializing
-    /// the deserialized Change can produce a different hash (different hash table
-    /// ordering, different chunk boundaries, etc.), causing "change not found"
-    /// errors on push.
+    /// This writes the exact bytes to disk after inspecting the explicit ATOM
+    /// file-header version. Version 1 is legacy; version 2 requires the durable
+    /// `change-format-vnext` repository capability before persistence.
     ///
     /// # Arguments
     ///
     /// * `hash` - The content hash (from the original serialization)
-    /// * `v3_bytes` - The exact V3 bytes to write to disk
+    /// * `change_bytes` - The exact ATOM bytes to write to disk
     /// * `_change` - The deserialized Change (unused, kept for API compatibility)
     pub(crate) fn save_change_bytes(
         &self,
         hash: &Hash,
-        v3_bytes: &[u8],
+        change_bytes: &[u8],
         _change: &Change,
     ) -> Result<Hash, RepositoryError> {
-        // Write the exact V3 bytes to the file store (no re-serialization).
-        // This ensures the hash in the filename matches the hash in the pristine.
+        match atom_change_file_version(change_bytes)? {
+            ATOM_CHANGE_FILE_VERSION_V1 => {}
+            ATOM_CHANGE_FILE_VERSION_V2 => self
+                .pristine
+                .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+                .map_err(RepositoryError::from)?,
+            version => {
+                return Err(RepositoryError::Serialization(format!(
+                    "unsupported ATOM change file-header version {version}; supported versions are 1 and 2"
+                )))
+            }
+        }
+
+        // Write the exact bytes to the file store (no re-serialization).
+        // Capability declaration is durably committed before this path mutates.
         let change_path = self.change_store.change_path(hash);
         if let Some(parent) = change_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&change_path, v3_bytes)?;
+        std::fs::write(&change_path, change_bytes)?;
 
         Ok(*hash)
     }

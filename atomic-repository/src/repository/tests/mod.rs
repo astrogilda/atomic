@@ -8,6 +8,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+mod capability_tests;
 mod change_tests;
 mod conflict_surface_tests;
 mod cross_view_merge_tests;

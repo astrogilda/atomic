@@ -570,6 +570,7 @@ mod tests {
     fn make_change(store: &MemoryChangeStore, content: &[u8]) -> Hash {
         let mut change = Change::empty(ChangeHeader::new("test change"));
         change.contents = content.to_vec();
+        change.finalize();
         store.insert_change(change).expect("insert_change")
     }
 

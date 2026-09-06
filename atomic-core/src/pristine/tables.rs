@@ -137,11 +137,11 @@ pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("c
 
 // File Tree Tables
 
-/// Pristine schema completion markers.
+/// Repository metadata and pristine schema completion markers.
 ///
-/// Keys name independently migratable derived indexes; values are their
-/// completed schema versions. A missing marker means writable backfill is
-/// required before read-only consumers may trust that index.
+/// Derived-index keys store completed schema versions. Keys prefixed with
+/// `required-capability/` store the minimum capability version required to
+/// open the repository. Missing capability entries identify legacy repositories.
 pub const PRISTINE_META: TableDefinition<&str, u32> = TableDefinition::new("pristine_meta");
 
 /// Additive path-claim transitions keyed by repository-relative path.

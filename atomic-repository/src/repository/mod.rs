@@ -47,7 +47,7 @@ use atomic_core::output::repo::{MaterializeResult, OutputItem};
 
 use atomic_core::pristine::{
     GraphTxnT, GraphVisibilityClosure, MutTxnT, Pristine, TreeTxnT, ViewMembershipSet, ViewScope,
-    ViewTxnT, WorkingCopyTxnT,
+    ViewTxnT, WorkingCopyTxnT, CHANGE_FORMAT_VNEXT_CAPABILITY,
 };
 use atomic_core::record::workflow::retrieve::{RetrieveContentOptions, RetrieveResult};
 use atomic_core::types::{Base32, Hash, Inode, Merkle, NodeId, Position, WorkingCopyId};
@@ -313,10 +313,8 @@ default = "{}"
         std::fs::write(&config_path, initial_config)?;
 
         // Initialize the pristine database (redb creates the file)
-        let pristine = Arc::new(
-            Pristine::open(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
-        );
+        let pristine =
+            Arc::new(Pristine::open(dot_dir.join("pristine.redb")).map_err(RepositoryError::from)?);
 
         // Create the default view and its workspace directory
         {
@@ -369,8 +367,6 @@ default = "{}"
         }
 
         let mut layout = working_copy::discover_layout(path.as_ref())?;
-        working_copy::ensure_repository_pointer(&layout)?;
-        layout.pointer_needs_write = false;
         let root = layout.working_root.clone();
         let dot_dir = layout.common_dot_dir.clone();
 
@@ -379,12 +375,17 @@ default = "{}"
         // record owns this canonical location yet.
         let legacy_view =
             Self::read_legacy_current_view(&layout.working_copy_dot_dir, &layout.common_dot_dir)?;
+
+        // Capability validation happens inside Pristine::open before additive
+        // table initialization commits. No linked-worktree pointer, change-store
+        // directory, migration, or recovery mutation may precede this open.
+        let pristine_path = dot_dir.join("pristine.redb");
+        let pristine = Pristine::open(&pristine_path).map_err(RepositoryError::from)?;
+
+        working_copy::ensure_repository_pointer(&layout)?;
+        layout.pointer_needs_write = false;
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let pristine_path = dot_dir.join("pristine.redb");
-        let pristine =
-            Pristine::open(&pristine_path).map_err(|e| RepositoryError::Database(e.to_string()))?;
         let migration_view =
             working_copy::registered_view_name(&pristine, &layout)?.unwrap_or(legacy_view);
         let pristine = migration::migrate_path_claims_if_required(
@@ -451,7 +452,7 @@ default = "{}"
 
         let pristine = Arc::new(
             Pristine::open_existing(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                .map_err(RepositoryError::from)?,
         );
         let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
@@ -547,7 +548,7 @@ default = "{}"
         // performs no repair and reports a typed migration-required error.
         let pristine = Arc::new(
             Pristine::open_readonly(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                .map_err(RepositoryError::from)?,
         );
         let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
@@ -609,7 +610,7 @@ default = "{}"
         } else {
             Pristine::open_existing_for_repair(pristine_path)
         }
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        .map_err(RepositoryError::from)?;
         let current_view = Self::read_current_view(&dot_dir)?;
         let change_store =
             ChangeStore::open_existing(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
@@ -651,6 +652,9 @@ default = "{}"
         pristine: Arc<Pristine>,
     ) -> Result<Self, RepositoryError> {
         let mut layout = working_copy::discover_layout(path.as_ref())?;
+        pristine
+            .ensure_supported_repository_capabilities()
+            .map_err(RepositoryError::from)?;
         working_copy::ensure_repository_pointer(&layout)?;
         layout.pointer_needs_write = false;
         let root = layout.working_root.clone();

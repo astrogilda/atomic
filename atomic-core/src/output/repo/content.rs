@@ -810,6 +810,7 @@ mod tests {
     fn make_change(content: &[u8]) -> Change {
         let mut change = Change::empty(ChangeHeader::new("test"));
         change.contents = content.to_vec();
+        change.finalize();
         change
     }
 

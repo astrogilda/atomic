@@ -111,8 +111,9 @@ pub use types::{InsertError, InsertOptions, InsertOutcome, InsertResult, InsertS
 pub(crate) use types::format_hashes;
 
 use atomic_core::apply::{
-    apply_file_ops_batched, compute_new_state, validate_can_apply, verify_dependencies,
-    write_edge_map, write_new_vertex, CachedWriteGraphTxn, ConflictTracker, MissingContextConflict,
+    apply_file_ops_batched, compute_new_state, validate_can_apply_with_frontier,
+    verify_causal_frontier, verify_dependencies, write_edge_map_with_frontier,
+    write_new_vertex_with_frontier, CachedWriteGraphTxn, ConflictTracker, MissingContextConflict,
     Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
@@ -248,9 +249,13 @@ pub fn write_change_to_graph(
 
     // Validate we can apply (unless caller explicitly skipped validation,
     // e.g. rebuild_change_graph re-applying an existing change with new hunks).
-    if !options.skip_validation {
-        validate_can_apply(txn, &view, change_id, change_hash, change)?;
-    }
+    let verified_frontier = if options.skip_validation {
+        // Rebuild paths may skip duplicate/dependency checks, but a causal
+        // frontier is never accepted without complete local closure proof.
+        verify_causal_frontier(txn, change)?
+    } else {
+        validate_can_apply_with_frontier(txn, &view, change_id, change_hash, change)?
+    };
 
     // Only apply hunks if the change isn't already in the graph.
     // All edges go to the global GRAPH + INODE_GRAPH tables.
@@ -291,6 +296,7 @@ pub fn write_change_to_graph(
                     change_id,
                     graph_op,
                     change,
+                    &verified_frontier,
                     options,
                     &mut stats,
                 )?;
@@ -396,6 +402,7 @@ fn write_hunk(
     change_id: NodeId,
     graph_op: &GraphOp<Option<Hash>>,
     change: &Change,
+    verified_frontier: &atomic_core::change::VerifiedCausalFrontier,
     options: &InsertOptions,
     stats: &mut InsertStats,
 ) -> InsertResult<()> {
@@ -410,34 +417,52 @@ fn write_hunk(
     for atom_ref in graph_op.atoms() {
         match atom_ref {
             AtomRef::Insertion(insertion) => {
-                write_new_vertex(
+                write_new_vertex_with_frontier(
                     txn,
                     workspace,
                     change_id,
                     insertion,
                     change,
+                    verified_frontier,
                     detect_conflicts,
                 )?;
                 stats.atoms_processed += 1;
             }
             AtomRef::EdgeUpdate(edge_update) => {
-                write_edge_map(
+                write_edge_map_with_frontier(
                     txn,
                     workspace,
                     change_id,
                     edge_update,
                     change,
+                    verified_frontier,
                     detect_conflicts,
                 )?;
                 stats.atoms_processed += 1;
             }
             AtomRef::Atom(atom) => match atom {
                 Atom::Insertion(nv) => {
-                    write_new_vertex(txn, workspace, change_id, nv, change, detect_conflicts)?;
+                    write_new_vertex_with_frontier(
+                        txn,
+                        workspace,
+                        change_id,
+                        nv,
+                        change,
+                        verified_frontier,
+                        detect_conflicts,
+                    )?;
                     stats.atoms_processed += 1;
                 }
                 Atom::EdgeUpdate(em) => {
-                    write_edge_map(txn, workspace, change_id, em, change, detect_conflicts)?;
+                    write_edge_map_with_frontier(
+                        txn,
+                        workspace,
+                        change_id,
+                        em,
+                        change,
+                        verified_frontier,
+                        detect_conflicts,
+                    )?;
                     stats.atoms_processed += 1;
                 }
             },

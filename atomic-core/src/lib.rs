@@ -64,9 +64,11 @@ pub use operation::{
 
 // Re-export change types
 pub use change::{
-    AITool, AIVendor, Atom, Author, Change, ChangeError, ChangeHeader, Cost, Credit, CreditRange,
-    CreditStats, CreditType, EdgeUpdate, Encoding, FileCredits, GraphOp, HashedChange, Insertion,
+    AITool, AIVendor, Atom, Author, CausalFrontier, Change, ChangeError, ChangeHeader, ChangeKind,
+    ChangeOrigin, ChangeValidationError, Cost, Credit, CreditRange, CreditStats, CreditType,
+    Derivation, EdgeUpdate, Encoding, FileCredits, GitDerivation, GraphOp, HashedChange, Insertion,
     LineCredit, Local, LocalByte, NewEdge, PromptContent, Provenance, SuggestionType, TokenUsage,
+    VerifiedCausalFrontier,
 };
 
 // Re-export pristine types
@@ -97,9 +99,10 @@ pub use record::{
 
 // Re-export apply types
 pub use apply::{
-    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
-    ApplyChangeResult, ApplyError, ApplyResult, ChangeToApply, LocalApplyError, LocalApplyResult,
-    MissingContext, PendingEdge, Workspace, WorkspaceStats, Zombie,
+    compute_new_state, is_change_on_view, validate_can_apply, validate_can_apply_with_frontier,
+    verify_causal_frontier, verify_dependencies, ApplyChangeResult, ApplyError, ApplyResult,
+    ChangeToApply, LocalApplyError, LocalApplyResult, MissingContext, PendingEdge, Workspace,
+    WorkspaceStats, Zombie,
 };
 
 // Re-export output types
