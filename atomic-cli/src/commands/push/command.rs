@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use atomic_core::operation::OperationKind;
 use atomic_core::types::{Base32, Hash, SetId};
 use atomic_objects::{
     ObjectFamily, ObjectRecord, RefRecord, SyncPack, SyncWants, ViewScopeLabel, ViewSnapshot,
@@ -911,6 +912,22 @@ impl Push {
             }
         }
 
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let evidence = pack
+            .encode()
+            .map(|bytes| Hash::of(&bytes))
+            .map_err(|error| {
+                CliError::Internal(anyhow::anyhow!(
+                    "failed to encode prepared push evidence: {}",
+                    error
+                ))
+            })?;
+        let push_operation = repo
+            .prepare_remote_operation(working_copy, OperationKind::Push, &remote_name, evidence)
+            .map_err(CliError::Repository)?;
+
         // Send everything in one `/code` push: objects stored + refs CAS-moved.
         if !pack.is_empty() {
             let spinner = create_spinner("Pushing to remote...");
@@ -964,6 +981,9 @@ impl Push {
                 "Push complete; remote union contains proposed patches",
             );
         }
+
+        repo.finalize_remote_operation(push_operation)
+            .map_err(CliError::Repository)?;
 
         // Summary
         print_blank();

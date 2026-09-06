@@ -5,7 +5,7 @@
 //! effect, record deterministic receipts after effects, and invoke recovery while the
 //! same ordered per-working-copy operation lock is held.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,10 +13,14 @@ use std::path::{Component, Path, PathBuf};
 
 use atomic_core::operation::{
     ActorRef, EffectPlan, EffectReceipt, EffectReceiptKind, EffectReceiptPayload, EffectTarget,
-    EffectValue, FileKind, FileState, Operation, OperationKind, OperationPayload, OperationScope,
-    RepoStateDelta, RepoStateRef, WorkingCopyStateRef,
+    EffectValue, FileKind, FileState, MetadataTarget, MetadataTransition, MetadataValue, Operation,
+    OperationKind, OperationPayload, OperationRelation, OperationScope, RepoStateDelta,
+    RepoStateRef, WorkingCopyStateRef,
 };
-use atomic_core::pristine::{OperationMutTxnT, OperationTxnT, WorkingCopyRecord, WorkingCopyTxnT};
+use atomic_core::pristine::{
+    GraphTxnT, MutTxnT, OperationMutTxnT, OperationTxnT, TagMutTxnT, TagTxnT, ViewTxnT,
+    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT,
+};
 use atomic_core::{Hash, OperationId, WorkingCopyId};
 
 use super::locks::WorkingCopyOperationLockGuard;
@@ -32,6 +36,70 @@ const BACKUP_VERSION: &[u8] = b"atomic-operation-recovery-v1\n";
 const RECEIPT_ATTEMPT: u32 = 0;
 const ANCHOR_ACTOR: &str = "cb-1b-anchor";
 const RECOVERY_ACTOR: &str = "cb-1b-recovery";
+const CONSOLIDATION_ACTOR: &str = "cb-1c-head-consolidation";
+const MIN_OPERATION_PREFIX_LEN: usize = 4;
+
+/// Completion state derived from immutable receipts for one operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationVerificationState {
+    /// The operation is durable but has no successful effect receipt yet.
+    Prepared,
+    /// At least one effect landed, but operation-level verification is absent.
+    InProgress,
+    /// An effect lease was rejected because the observed value diverged.
+    LeaseRejected,
+    /// Every effect completed and the operation has a final verified receipt.
+    Verified,
+}
+
+/// Current causal state of one operation scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationHeadState {
+    /// No operation history exists for the scope.
+    Empty,
+    /// Exactly one causal head exists.
+    Single(OperationId),
+    /// Multiple heads remain and no combined state is implied.
+    Diverged(Vec<OperationId>),
+}
+
+/// One operation in deterministic causal log order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationLogEntry {
+    pub operation: Operation,
+    pub verification: OperationVerificationState,
+    pub is_head: bool,
+}
+
+/// Reachable operation history for one mutable scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationLog {
+    pub scope: OperationScope,
+    pub head_state: OperationHeadState,
+    pub entries: Vec<OperationLogEntry>,
+}
+
+/// Full immutable operation data plus its derived receipt/head state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationDetails {
+    pub operation: Operation,
+    pub receipts: Vec<EffectReceipt>,
+    pub verification: OperationVerificationState,
+    pub head_of: Vec<OperationScope>,
+}
+
+/// Prepared remote operation that retains the ordered locks through protocol I/O.
+pub struct PreparedRemoteOperation {
+    operation_id: OperationId,
+    operation_lock: WorkingCopyOperationLockGuard,
+}
+
+impl PreparedRemoteOperation {
+    /// Immutable operation identity published before the remote mutation.
+    pub fn id(&self) -> OperationId {
+        self.operation_id
+    }
+}
 
 /// Pure classification of an observed value against one expected-old/new lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,10 +223,789 @@ pub(super) fn has_operation_verified_receipt(receipts: &[EffectReceipt]) -> bool
 }
 
 impl Repository {
-    /// Ensure one per-working-copy anchor exists and return the sole current head.
+    /// Resolve a full operation identity or unambiguous Base32 prefix.
+    pub fn resolve_operation_id(&self, selector: &str) -> Result<OperationId, RepositoryError> {
+        let selector = selector.trim();
+        let normalized = selector.to_ascii_uppercase();
+        if normalized.len() < MIN_OPERATION_PREFIX_LEN {
+            return Err(RepositoryError::InvalidOperationSelector {
+                selector: selector.to_string(),
+                reason: format!(
+                    "prefixes must contain at least {MIN_OPERATION_PREFIX_LEN} Base32 characters"
+                ),
+            });
+        }
+        if normalized.len() > 52
+            || !normalized
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))
+        {
+            return Err(RepositoryError::InvalidOperationSelector {
+                selector: selector.to_string(),
+                reason: "expected a Base32 operation identity or prefix".to_string(),
+            });
+        }
+
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let mut matches: Vec<OperationId> = txn
+            .list_operations()
+            .map_err(pristine_error)?
+            .into_iter()
+            .map(|operation| operation.id())
+            .filter(|id| id.to_string().starts_with(&normalized))
+            .collect();
+        matches.sort_unstable();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(RepositoryError::OperationNotFound {
+                selector: selector.to_string(),
+            }),
+            _ => Err(RepositoryError::AmbiguousOperation {
+                prefix: selector.to_string(),
+                matches: matches.iter().map(ToString::to_string).collect(),
+            }),
+        }
+    }
+
+    /// Return full operation data, receipts, verification, and current head scopes.
+    pub fn operation_details(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<OperationDetails, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let operation = txn
+            .get_operation(operation_id)
+            .map_err(pristine_error)?
+            .ok_or_else(|| RepositoryError::OperationNotFound {
+                selector: operation_id.to_string(),
+            })?;
+        let mut receipts = txn
+            .get_effect_receipts(operation_id)
+            .map_err(pristine_error)?;
+        sort_receipts(&mut receipts);
+        let verification = operation_verification_state(&receipts);
+        let mut head_of: Vec<OperationScope> = txn
+            .list_operation_heads()
+            .map_err(pristine_error)?
+            .into_iter()
+            .filter_map(|(scope, heads)| heads.as_slice().contains(&operation_id).then_some(scope))
+            .collect();
+        head_of.sort_unstable();
+        Ok(OperationDetails {
+            operation,
+            receipts,
+            verification,
+            head_of,
+        })
+    }
+
+    /// Prepare a native remote command before its protocol mutation begins.
+    pub fn prepare_remote_operation(
+        &self,
+        working_copy: WorkingCopyId,
+        kind: OperationKind,
+        remote: &str,
+        evidence: Hash,
+    ) -> Result<PreparedRemoteOperation, RepositoryError> {
+        if !matches!(kind, OperationKind::Pull | OperationKind::Push) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("{kind:?} is not a native remote operation kind"),
+            });
+        }
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let state = {
+            let txn = self.pristine.read_txn().map_err(pristine_error)?;
+            let record = txn
+                .get_working_copy(working_copy)
+                .map_err(pristine_error)?
+                .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: working_copy })?;
+            let view = ViewTxnT::get_view_by_id(&txn, record.desired_view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "working copy {working_copy} references missing view {}",
+                        record.desired_view
+                    ),
+                })?;
+            RepoStateRef {
+                view: Some(atomic_core::operation::ViewStateRef {
+                    name: view.name,
+                    state: view.state,
+                    set_id: None,
+                }),
+                working_copy: Some(working_copy_state_ref(record)),
+                git: None,
+            }
+        };
+        let operation = self.prepare_metadata_operation(
+            &operation_lock,
+            kind,
+            None,
+            state.clone(),
+            state,
+            Vec::new(),
+            vec![
+                evidence,
+                Hash::of(format!("atomic:remote:v1\\0{remote}").as_bytes()),
+            ],
+            ActorRef::System {
+                name: format!(
+                    "repository-{}",
+                    if kind == OperationKind::Pull {
+                        "pull"
+                    } else {
+                        "push"
+                    }
+                ),
+            },
+            current_operation_timestamp_ms(),
+        )?;
+        Ok(PreparedRemoteOperation {
+            operation_id: operation.id(),
+            operation_lock,
+        })
+    }
+
+    /// Mark a prepared remote command verified after protocol-level confirmation.
+    pub fn finalize_remote_operation(
+        &self,
+        prepared: PreparedRemoteOperation,
+    ) -> Result<(), RepositoryError> {
+        let operation_id = prepared.operation_id;
+        let working_copy = prepared.operation_lock.working_copy();
+        let actual = self.sole_operation_head(OperationScope::WorkingCopy(working_copy))?;
+        if actual != operation_id {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "remote operation head changed before verification: expected {operation_id}, found {actual}"
+                ),
+            });
+        }
+        let operation = self.load_operation(operation_id)?;
+        if !matches!(
+            operation.payload().kind,
+            OperationKind::Pull | OperationKind::Push
+        ) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("operation {operation_id} is not a native remote operation"),
+            });
+        }
+        self.finalize_operation_verified(&prepared.operation_lock, operation_id)?;
+        Ok(())
+    }
+
+    /// Append a verified remote observation when no protocol mutation follows.
+    pub fn append_verified_remote_operation(
+        &self,
+        working_copy: WorkingCopyId,
+        kind: OperationKind,
+        remote: &str,
+        evidence: Hash,
+    ) -> Result<OperationId, RepositoryError> {
+        let prepared = self.prepare_remote_operation(working_copy, kind, remote, evidence)?;
+        let operation_id = prepared.id();
+        self.finalize_remote_operation(prepared)?;
+        Ok(operation_id)
+    }
+
+    /// Append an inverse operation for the current verified working-copy head.
     ///
-    /// Multiple heads are intentionally refused until CB-1C adds consolidation and
-    /// explicit divergence records.
+    /// The optional target must be the sole current head. This first implementation
+    /// supports operations whose inverse is a view/materialization transition; other
+    /// metadata kinds are refused until their routed deltas are available.
+    pub fn undo_operation(
+        &mut self,
+        working_copy: WorkingCopyId,
+        target: Option<OperationId>,
+    ) -> Result<OperationId, RepositoryError> {
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let current = self.sole_operation_head(scope)?;
+        let target = target.unwrap_or(current);
+        if target != current {
+            return Err(RepositoryError::OperationNotReversible {
+                operation: target.to_string(),
+                kind: "historical".to_string(),
+                reason: format!(
+                    "undo requires the sole current head {}; use restore for an earlier state",
+                    current
+                ),
+            });
+        }
+        let details = self.operation_details(target)?;
+        if details.verification != OperationVerificationState::Verified {
+            return Err(RepositoryError::OperationNotVerified {
+                operation: target.to_string(),
+            });
+        }
+        if !details.operation.payload().delta.metadata.is_empty() {
+            return self.append_related_metadata_operation(
+                working_copy,
+                &details.operation,
+                OperationKind::Undo,
+                OperationRelation::Undo { target },
+                true,
+            );
+        }
+        if !matches!(
+            details.operation.payload().kind,
+            OperationKind::SwitchView | OperationKind::Undo | OperationKind::Restore
+        ) {
+            return Err(operation_not_reversible(
+                &details.operation,
+                "no typed inverse metadata transition is available",
+            ));
+        }
+        let view = details
+            .operation
+            .payload()
+            .before
+            .view
+            .as_ref()
+            .map(|view| view.name.clone())
+            .ok_or_else(|| {
+                operation_not_reversible(
+                    &details.operation,
+                    "the operation does not carry a prior view state",
+                )
+            })?;
+        self.switch_view_with_operation(
+            working_copy,
+            &view,
+            OperationKind::Undo,
+            Some(OperationRelation::Undo { target }),
+            ActorRef::System {
+                name: "operation-undo".to_string(),
+            },
+            Some(current),
+        )?;
+        self.sole_operation_head(scope)
+    }
+
+    /// Re-project the verified state selected by an earlier reachable operation.
+    pub fn restore_operation(
+        &mut self,
+        working_copy: WorkingCopyId,
+        target: OperationId,
+    ) -> Result<OperationId, RepositoryError> {
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let current_head = self.sole_operation_head(scope)?;
+        let history = self.operation_log(scope, None, false)?;
+        if !history
+            .entries
+            .iter()
+            .any(|entry| entry.operation.id() == target)
+        {
+            return Err(RepositoryError::OperationNotReachable {
+                operation: target.to_string(),
+                scope: scope.to_string(),
+            });
+        }
+        let details = self.operation_details(target)?;
+        if details.verification != OperationVerificationState::Verified {
+            return Err(RepositoryError::OperationNotVerified {
+                operation: target.to_string(),
+            });
+        }
+        if !details.operation.payload().delta.metadata.is_empty() {
+            return self.append_related_metadata_operation(
+                working_copy,
+                &details.operation,
+                OperationKind::Restore,
+                OperationRelation::Restore { target },
+                false,
+            );
+        }
+        let view = details
+            .operation
+            .payload()
+            .delta
+            .after
+            .view
+            .as_ref()
+            .map(|view| view.name.clone())
+            .ok_or_else(|| {
+                operation_not_reversible(
+                    &details.operation,
+                    "the operation does not carry a selected view state",
+                )
+            })?;
+        let expected_state = details
+            .operation
+            .payload()
+            .delta
+            .after
+            .view
+            .as_ref()
+            .map(|state| state.state)
+            .ok_or_else(|| {
+                operation_not_reversible(
+                    &details.operation,
+                    "the operation does not carry a selected view state",
+                )
+            })?;
+        let observed_state = {
+            let txn = self.pristine.read_txn().map_err(pristine_error)?;
+            txn.get_view(&view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?
+                .state
+        };
+        if observed_state != expected_state {
+            return Err(operation_not_reversible(
+                &details.operation,
+                "the selected view has advanced beyond the historical state",
+            ));
+        }
+        self.switch_view_with_operation(
+            working_copy,
+            &view,
+            OperationKind::Restore,
+            Some(OperationRelation::Restore { target }),
+            ActorRef::System {
+                name: "operation-restore".to_string(),
+            },
+            Some(current_head),
+        )?;
+        self.sole_operation_head(scope)
+    }
+
+    fn metadata_restore_transitions(
+        &self,
+        current: OperationId,
+        target: OperationId,
+    ) -> Result<Vec<MetadataTransition>, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let operations: BTreeMap<OperationId, Operation> = txn
+            .list_operations()
+            .map_err(pristine_error)?
+            .into_iter()
+            .map(|operation| (operation.id(), operation))
+            .collect();
+        drop(txn);
+        let mut memo = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let current_snapshot =
+            fold_operation_metadata_snapshot(current, &operations, &mut memo, &mut visiting)?;
+        visiting.clear();
+        let target_snapshot =
+            fold_operation_metadata_snapshot(target, &operations, &mut memo, &mut visiting)?;
+        let targets: BTreeSet<MetadataTarget> = current_snapshot
+            .keys()
+            .chain(target_snapshot.keys())
+            .cloned()
+            .collect();
+        let mut transitions = Vec::new();
+        for metadata_target in targets {
+            let observed = self.observe_metadata_value(&metadata_target)?;
+            let expected_new = target_snapshot
+                .get(&metadata_target)
+                .cloned()
+                .unwrap_or(MetadataValue::Absent);
+            if matches!(
+                (&observed, &expected_new),
+                (MetadataValue::Sequence(_), MetadataValue::Sequence(_))
+            ) {
+                continue;
+            }
+            if observed != expected_new {
+                transitions.push(MetadataTransition {
+                    target: metadata_target,
+                    expected_old: observed,
+                    expected_new,
+                });
+            }
+        }
+        Ok(transitions)
+    }
+
+    fn append_related_metadata_operation(
+        &self,
+        working_copy: WorkingCopyId,
+        target: &Operation,
+        kind: OperationKind,
+        relation: OperationRelation,
+        inverse: bool,
+    ) -> Result<OperationId, RepositoryError> {
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let current_id = self.sole_operation_head(scope)?;
+        let current = self.operation_details(current_id)?.operation;
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: scope.to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        if self.sole_operation_head(scope)? != current_id {
+            return Err(RepositoryError::InvalidOperation {
+                message: "operation head changed while preparing inverse metadata".to_string(),
+            });
+        }
+        let metadata = if inverse {
+            target
+                .payload()
+                .delta
+                .metadata
+                .iter()
+                .map(|transition| MetadataTransition {
+                    target: transition.target.clone(),
+                    expected_old: transition.expected_new.clone(),
+                    expected_new: transition.expected_old.clone(),
+                })
+                .collect()
+        } else {
+            self.metadata_restore_transitions(current_id, target.id())?
+        };
+        let after = if inverse {
+            target.payload().before.clone()
+        } else {
+            target.payload().delta.after.clone()
+        };
+        if !inverse && metadata.is_empty() {
+            if let Some(expected_view) = &after.view {
+                let txn = self.pristine.read_txn().map_err(pristine_error)?;
+                let observed = txn
+                    .get_view(&expected_view.name)
+                    .map_err(pristine_error)?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: expected_view.name.clone(),
+                    })?;
+                if observed.state != expected_view.state {
+                    return Err(operation_not_reversible(
+                        target,
+                        "historical ordering cannot be reconstructed without changing membership",
+                    ));
+                }
+            }
+        }
+        let operation = self.prepare_metadata_operation(
+            &operation_lock,
+            kind,
+            Some(relation),
+            current.payload().delta.after.clone(),
+            after,
+            metadata,
+            target.payload().evidence.clone(),
+            ActorRef::System {
+                name: if inverse {
+                    "operation-undo".to_string()
+                } else {
+                    "operation-restore".to_string()
+                },
+            },
+            current_operation_timestamp_ms(),
+        )?;
+        self.apply_operation_metadata_locked(&operation_lock, operation.id())?;
+        self.finalize_operation_verified(&operation_lock, operation.id())?;
+        let operation_id = operation.id();
+        drop(operation_lock);
+        if !inverse {
+            self.materialize(working_copy)?;
+        }
+        Ok(operation_id)
+    }
+
+    pub(super) fn sole_operation_head(
+        &self,
+        scope: OperationScope,
+    ) -> Result<OperationId, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let heads = txn.get_operation_heads(scope).map_err(pristine_error)?;
+        match heads.as_slice() {
+            [head] => Ok(*head),
+            [] => Err(RepositoryError::OperationNotFound {
+                selector: format!("current head of {scope}"),
+            }),
+            many => Err(RepositoryError::OperationHeadsDiverged {
+                scope: scope.to_string(),
+                heads: many.iter().map(ToString::to_string).collect(),
+            }),
+        }
+    }
+
+    /// Return operations reachable from a scope's heads in deterministic causal order.
+    ///
+    /// Children always precede parents unless `reverse` is true. Timestamps are used
+    /// only to order causally independent ready nodes, with the operation ID as a
+    /// deterministic tie-breaker.
+    pub fn operation_log(
+        &self,
+        scope: OperationScope,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Result<OperationLog, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let heads = txn.get_operation_heads(scope).map_err(pristine_error)?;
+        let head_state = match heads.as_slice() {
+            [] => OperationHeadState::Empty,
+            [head] => OperationHeadState::Single(*head),
+            many => OperationHeadState::Diverged(many.to_vec()),
+        };
+        let head_ids: BTreeSet<OperationId> = heads.as_slice().iter().copied().collect();
+        let operations: BTreeMap<OperationId, Operation> = txn
+            .list_operations()
+            .map_err(pristine_error)?
+            .into_iter()
+            .map(|operation| (operation.id(), operation))
+            .collect();
+
+        let mut reachable = BTreeSet::new();
+        let mut pending = heads.as_slice().to_vec();
+        while let Some(operation_id) = pending.pop() {
+            if !reachable.insert(operation_id) {
+                continue;
+            }
+            let operation = operations.get(&operation_id).ok_or_else(|| {
+                RepositoryError::OperationNotFound {
+                    selector: operation_id.to_string(),
+                }
+            })?;
+            pending.extend(operation.payload().parents.iter().copied());
+        }
+
+        let mut child_counts: BTreeMap<OperationId, usize> = reachable
+            .iter()
+            .copied()
+            .map(|operation_id| (operation_id, 0))
+            .collect();
+        for operation_id in &reachable {
+            let operation =
+                operations
+                    .get(operation_id)
+                    .ok_or_else(|| RepositoryError::OperationNotFound {
+                        selector: operation_id.to_string(),
+                    })?;
+            for parent in &operation.payload().parents {
+                if let Some(count) = child_counts.get_mut(parent) {
+                    *count += 1;
+                }
+            }
+        }
+
+        let mut ready: BTreeSet<(i64, OperationId)> = child_counts
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(operation_id, _)| {
+                let timestamp = operations
+                    .get(operation_id)
+                    .map(|operation| operation.payload().timestamp_ms)
+                    .unwrap_or_default();
+                (timestamp, *operation_id)
+            })
+            .collect();
+        let mut ordered = Vec::with_capacity(reachable.len());
+        while let Some(key) = ready.iter().next_back().copied() {
+            ready.remove(&key);
+            let operation_id = key.1;
+            ordered.push(operation_id);
+            let operation = operations.get(&operation_id).ok_or_else(|| {
+                RepositoryError::OperationNotFound {
+                    selector: operation_id.to_string(),
+                }
+            })?;
+            for parent in &operation.payload().parents {
+                let Some(count) = child_counts.get_mut(parent) else {
+                    continue;
+                };
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    let parent_operation = operations.get(parent).ok_or_else(|| {
+                        RepositoryError::OperationNotFound {
+                            selector: parent.to_string(),
+                        }
+                    })?;
+                    ready.insert((parent_operation.payload().timestamp_ms, *parent));
+                }
+            }
+        }
+        if ordered.len() != reachable.len() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("operation history for {scope} contains a causal cycle"),
+            });
+        }
+        if reverse {
+            ordered.reverse();
+        }
+        if let Some(limit) = limit {
+            ordered.truncate(limit);
+        }
+
+        let mut entries = Vec::with_capacity(ordered.len());
+        for operation_id in ordered {
+            let operation = operations.get(&operation_id).cloned().ok_or_else(|| {
+                RepositoryError::OperationNotFound {
+                    selector: operation_id.to_string(),
+                }
+            })?;
+            let receipts = txn
+                .get_effect_receipts(operation_id)
+                .map_err(pristine_error)?;
+            entries.push(OperationLogEntry {
+                operation,
+                verification: operation_verification_state(&receipts),
+                is_head: head_ids.contains(&operation_id),
+            });
+        }
+        Ok(OperationLog {
+            scope,
+            head_state,
+            entries,
+        })
+    }
+
+    /// Consolidate verified commuting heads or return their explicit divergent state.
+    ///
+    /// Ancestor-dominated heads are removed first. Remaining direct siblings are
+    /// consolidated only when their typed metadata/effect write sets and aggregate
+    /// repository-state components do not overlap. Incompatible heads are preserved.
+    pub fn consolidate_operation_heads(
+        &self,
+        scope: OperationScope,
+    ) -> Result<OperationHeadState, RepositoryError> {
+        match scope {
+            OperationScope::Repository => {
+                let operation_lock = self.try_lock_common_operation()?;
+                let mut txn = operation_lock.begin_write_immediate()?;
+                let state = self.consolidate_operation_heads_in_txn(&mut txn, scope)?;
+                txn.commit()?;
+                Ok(state)
+            }
+            OperationScope::WorkingCopy(working_copy) => {
+                let operation_lock = self.try_lock_operation(working_copy)?;
+                self.consolidate_operation_heads_locked(&operation_lock)
+            }
+        }
+    }
+
+    pub(super) fn consolidate_operation_heads_locked(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+    ) -> Result<OperationHeadState, RepositoryError> {
+        let scope = OperationScope::WorkingCopy(operation_lock.working_copy());
+        let mut txn = operation_lock.begin_write_immediate()?;
+        let state = self.consolidate_operation_heads_in_txn(&mut txn, scope)?;
+        txn.commit()?;
+        Ok(state)
+    }
+
+    fn consolidate_operation_heads_in_txn(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        scope: OperationScope,
+    ) -> Result<OperationHeadState, RepositoryError> {
+        let original = txn.get_operation_heads(scope).map_err(pristine_error)?;
+        let mut reduced = Vec::new();
+        for candidate in original.as_slice() {
+            let mut dominated = false;
+            for other in original.as_slice() {
+                if other != candidate && operation_reaches(txn, *other, *candidate)? {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                reduced.push(*candidate);
+            }
+        }
+        reduced.sort_unstable();
+        reduced.dedup();
+
+        match reduced.as_slice() {
+            [] => {
+                if !original.is_empty() {
+                    txn.compare_and_set_operation_heads(scope, original.as_slice(), &[])
+                        .map_err(pristine_error)?;
+                }
+                return Ok(OperationHeadState::Empty);
+            }
+            [head] => {
+                if original.as_slice() != reduced.as_slice() {
+                    txn.compare_and_set_operation_heads(scope, original.as_slice(), &reduced)
+                        .map_err(pristine_error)?;
+                }
+                return Ok(OperationHeadState::Single(*head));
+            }
+            _ => {}
+        }
+
+        let mut operations = Vec::with_capacity(reduced.len());
+        for operation_id in &reduced {
+            let operation = txn
+                .get_operation(*operation_id)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::OperationNotFound {
+                    selector: operation_id.to_string(),
+                })?;
+            let receipts = txn
+                .get_effect_receipts(*operation_id)
+                .map_err(pristine_error)?;
+            if !has_operation_verified_receipt(&receipts) {
+                return Ok(OperationHeadState::Diverged(reduced));
+            }
+            operations.push(operation);
+        }
+
+        let Some(merged_state) = merge_commuting_operation_states(&operations, scope) else {
+            return Ok(OperationHeadState::Diverged(reduced));
+        };
+        if !operation_write_sets_are_disjoint(&operations) {
+            return Ok(OperationHeadState::Diverged(reduced));
+        }
+
+        let timestamp_ms = operations
+            .iter()
+            .map(|operation| operation.payload().timestamp_ms)
+            .max()
+            .unwrap_or_default();
+        let consolidation = Operation::new(OperationPayload {
+            parents: reduced.clone(),
+            kind: OperationKind::Consolidate,
+            relation: None,
+            working_copy: match scope {
+                OperationScope::Repository => None,
+                OperationScope::WorkingCopy(working_copy) => Some(working_copy),
+            },
+            before: merged_state.clone(),
+            delta: RepoStateDelta {
+                after: merged_state,
+                metadata: Vec::new(),
+                effects: Vec::new(),
+            },
+            git_observed: Vec::new(),
+            evidence: Vec::new(),
+            actor: ActorRef::System {
+                name: CONSOLIDATION_ACTOR.to_string(),
+            },
+            timestamp_ms,
+            lossy: Vec::new(),
+        })
+        .map_err(codec_error)?;
+        txn.put_operation(&consolidation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(scope, original.as_slice(), &[consolidation.id()])
+            .map_err(pristine_error)?;
+        let verified = deterministic_effect_receipt(
+            &consolidation,
+            None,
+            EffectReceiptKind::Verified,
+            None,
+            None,
+        )?;
+        txn.append_effect_receipt(&verified)
+            .map_err(pristine_error)?;
+        Ok(OperationHeadState::Single(consolidation.id()))
+    }
+
+    /// Ensure one per-working-copy anchor exists and return the sole current head.
     pub(super) fn ensure_working_copy_anchor(
         &self,
         operation_lock: &WorkingCopyOperationLockGuard,
@@ -175,10 +1022,12 @@ impl Repository {
                 let anchor = Operation::new(OperationPayload {
                     parents: Vec::new(),
                     kind: OperationKind::Anchor,
+                    relation: None,
                     working_copy: Some(working_copy),
                     before: state.clone(),
                     delta: RepoStateDelta {
                         after: state,
+                        metadata: Vec::new(),
                         effects: Vec::new(),
                     },
                     git_observed: Vec::new(),
@@ -209,14 +1058,106 @@ impl Repository {
         }
     }
 
+    fn ensure_repository_anchor(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        state: &RepoStateRef,
+    ) -> Result<OperationId, RepositoryError> {
+        let scope = OperationScope::Repository;
+        let repository_state = RepoStateRef {
+            view: state.view.clone(),
+            working_copy: None,
+            git: state.git.clone(),
+        };
+        let mut txn = operation_lock.begin_write_immediate()?;
+        let head_state = self.consolidate_operation_heads_in_txn(&mut txn, scope)?;
+        match head_state {
+            OperationHeadState::Single(head) => {
+                let receipts = txn.get_effect_receipts(head).map_err(pristine_error)?;
+                if !has_operation_verified_receipt(&receipts) {
+                    return Err(RepositoryError::OperationNotVerified {
+                        operation: head.to_string(),
+                    });
+                }
+                txn.commit()?;
+                Ok(head)
+            }
+            OperationHeadState::Empty => {
+                let anchor = Operation::new(OperationPayload {
+                    parents: Vec::new(),
+                    kind: OperationKind::Anchor,
+                    relation: None,
+                    working_copy: None,
+                    before: repository_state.clone(),
+                    delta: RepoStateDelta {
+                        after: repository_state,
+                        metadata: Vec::new(),
+                        effects: Vec::new(),
+                    },
+                    git_observed: Vec::new(),
+                    evidence: Vec::new(),
+                    actor: ActorRef::System {
+                        name: ANCHOR_ACTOR.to_string(),
+                    },
+                    timestamp_ms: 0,
+                    lossy: Vec::new(),
+                })
+                .map_err(codec_error)?;
+                txn.put_operation(&anchor).map_err(pristine_error)?;
+                txn.compare_and_set_operation_heads(scope, &[], &[anchor.id()])
+                    .map_err(pristine_error)?;
+                let verified = deterministic_effect_receipt(
+                    &anchor,
+                    None,
+                    EffectReceiptKind::Verified,
+                    None,
+                    None,
+                )?;
+                txn.append_effect_receipt(&verified)
+                    .map_err(pristine_error)?;
+                txn.commit()?;
+                Ok(anchor.id())
+            }
+            OperationHeadState::Diverged(heads) => Err(RepositoryError::OperationHeadsDiverged {
+                scope: scope.to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            }),
+        }
+    }
+
     /// Prepare and immediately persist a switch operation before external effects.
     ///
     /// Filesystem leases are preflighted, the operation/head CAS is fsync-durable,
     /// and only then are immutable old-value backups written. A returned value proves
     /// that the complete backup marker is durable and callers may start effects.
+    #[cfg(test)]
     pub(super) fn prepare_switch_operation(
         &self,
         operation_lock: &WorkingCopyOperationLockGuard,
+        before: RepoStateRef,
+        after: RepoStateRef,
+        effects: Vec<EffectPlan>,
+        actor: ActorRef,
+        timestamp_ms: i64,
+    ) -> Result<PreparedSwitchOperation, RepositoryError> {
+        self.prepare_working_copy_transition(
+            operation_lock,
+            OperationKind::SwitchView,
+            None,
+            before,
+            after,
+            effects,
+            actor,
+            timestamp_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_working_copy_transition(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        kind: OperationKind,
+        relation: Option<OperationRelation>,
         before: RepoStateRef,
         after: RepoStateRef,
         effects: Vec<EffectPlan>,
@@ -231,10 +1172,15 @@ impl Repository {
 
         let operation = Operation::new(OperationPayload {
             parents: vec![parent],
-            kind: OperationKind::SwitchView,
+            kind,
+            relation,
             working_copy: Some(working_copy),
             before,
-            delta: RepoStateDelta { after, effects },
+            delta: RepoStateDelta {
+                after,
+                metadata: Vec::new(),
+                effects,
+            },
             git_observed: Vec::new(),
             evidence: Vec::new(),
             actor,
@@ -257,6 +1203,163 @@ impl Repository {
             operation,
             backup_root,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_metadata_operation(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        kind: OperationKind,
+        relation: Option<OperationRelation>,
+        before: RepoStateRef,
+        after: RepoStateRef,
+        metadata: Vec<MetadataTransition>,
+        evidence: Vec<Hash>,
+        actor: ActorRef,
+        timestamp_ms: i64,
+    ) -> Result<Operation, RepositoryError> {
+        let working_copy = operation_lock.working_copy();
+        validate_state_working_copy(&before, working_copy)?;
+        validate_state_working_copy(&after, working_copy)?;
+        for transition in &metadata {
+            let observed = self.observe_metadata_value(&transition.target)?;
+            if observed != transition.expected_old {
+                return Err(metadata_divergence_error(transition, &observed));
+            }
+        }
+        let working_copy_parent =
+            self.ensure_working_copy_anchor(operation_lock, before.clone())?;
+        self.require_complete_single_head(working_copy, working_copy_parent)?;
+        let repository_parent = self.ensure_repository_anchor(operation_lock, &before)?;
+        let operation = Operation::new(OperationPayload {
+            parents: vec![working_copy_parent, repository_parent],
+            kind,
+            relation,
+            working_copy: Some(working_copy),
+            before,
+            delta: RepoStateDelta {
+                after,
+                metadata,
+                effects: Vec::new(),
+            },
+            git_observed: Vec::new(),
+            evidence,
+            actor,
+            timestamp_ms,
+            lossy: Vec::new(),
+        })
+        .map_err(codec_error)?;
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let mut txn = operation_lock.begin_write_immediate()?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(scope, &[working_copy_parent], &[operation.id()])
+            .map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[repository_parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
+        txn.commit()?;
+        Ok(operation)
+    }
+
+    pub(super) fn apply_operation_metadata_locked(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        operation_id: OperationId,
+    ) -> Result<(), RepositoryError> {
+        let operation = self.load_operation(operation_id)?;
+        self.validate_operation_lock(operation_lock, &operation)?;
+        if operation.payload().delta.metadata.is_empty() {
+            return Ok(());
+        }
+        let mut txn = operation_lock.begin_write_immediate()?;
+        let mut pending = Vec::new();
+        for transition in &operation.payload().delta.metadata {
+            let observed = observe_metadata_value_in_write(&txn, &transition.target)?;
+            match classify_metadata_lease(
+                &observed,
+                &transition.expected_old,
+                &transition.expected_new,
+            ) {
+                LeaseClassification::Apply => pending.push((transition, observed)),
+                LeaseClassification::AlreadyApplied => {}
+                LeaseClassification::Diverged => {
+                    return Err(metadata_divergence_error(transition, &observed));
+                }
+            }
+        }
+        pending.sort_by(|(left, left_observed), (right, right_observed)| {
+            metadata_application_key(left, left_observed)
+                .cmp(&metadata_application_key(right, right_observed))
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        let mut affected_views = BTreeSet::new();
+        for (transition, _) in pending {
+            apply_metadata_value_in_write(&mut txn, &transition.target, &transition.expected_new)?;
+            if let Some(view) = metadata_target_view(&transition.target) {
+                affected_views.insert(view.to_string());
+            }
+        }
+        for view in affected_views {
+            self.realign_tree_projection_in_txn(&mut txn, &view)?;
+        }
+        if let Some(state) = &operation.payload().delta.after.working_copy {
+            if state.id != operation_lock.working_copy() {
+                return Err(RepositoryError::WorkingCopyIdentityMismatch {
+                    requested: state.id,
+                    actual: operation_lock.working_copy(),
+                });
+            }
+            txn.put_working_copy(&WorkingCopyRecord {
+                id: state.id,
+                location_fingerprint: state.location_fingerprint,
+                desired_view: state.desired_view,
+                desired_state: state.desired_state,
+                materialized_state: state.materialized_state,
+                materialized_manifest: state.materialized_manifest,
+            })
+            .map_err(pristine_error)?;
+        }
+        txn.commit()
+    }
+
+    pub(super) fn abort_prepared_metadata_operation(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        original: &Operation,
+    ) -> Result<OperationId, RepositoryError> {
+        if !original.payload().delta.effects.is_empty() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "operation {} has external effects and cannot use metadata-only abort",
+                    original.id()
+                ),
+            });
+        }
+        let working_copy = operation_lock.working_copy();
+        let recovery = self.inverse_recovery_operation(original, working_copy)?;
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let mut txn = operation_lock.begin_write_immediate()?;
+        txn.put_operation(&recovery).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(scope, &[original.id()], &[recovery.id()])
+            .map_err(pristine_error)?;
+        let repository_heads = txn
+            .get_operation_heads(OperationScope::Repository)
+            .map_err(pristine_error)?;
+        if repository_heads.as_slice() == [original.id()] {
+            txn.compare_and_set_operation_heads(
+                OperationScope::Repository,
+                &[original.id()],
+                &[recovery.id()],
+            )
+            .map_err(pristine_error)?;
+        }
+        txn.commit()?;
+        self.apply_operation_metadata_locked(operation_lock, recovery.id())?;
+        self.finalize_operation_verified(operation_lock, recovery.id())?;
+        Ok(recovery.id())
     }
 
     /// Append a deterministic receipt after a caller performs or observes an effect.
@@ -524,7 +1627,44 @@ impl Repository {
                 });
             }
         }
+        for transition in &operation.payload().delta.metadata {
+            let observed = self.observe_metadata_value(&transition.target)?;
+            if observed != transition.expected_new {
+                return Err(metadata_divergence_error(transition, &observed));
+            }
+        }
+        if let Some(expected) = &operation.payload().delta.after.view {
+            let txn = self.pristine.read_txn().map_err(pristine_error)?;
+            let observed = txn
+                .get_view(&expected.name)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: expected.name.clone(),
+                })?;
+            if observed.state != expected.state {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation {} cannot be verified: view '{}' state expected {}, observed {}",
+                        operation.id(),
+                        expected.name,
+                        expected.state,
+                        observed.state
+                    ),
+                });
+            }
+        }
         let working_copy = operation_lock.working_copy();
+        if let Some(expected) = &operation.payload().delta.after.working_copy {
+            let observed = working_copy_state_ref(self.working_copy_record(working_copy)?);
+            if &observed != expected {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation {} cannot be verified: working-copy state expected {:?}, observed {:?}",
+                        operation.id(), expected, observed
+                    ),
+                });
+            }
+        }
         let mut final_targets = Vec::<(&EffectTarget, &EffectValue)>::new();
         for effect in &operation.payload().delta.effects {
             if let Some((_, value)) = final_targets
@@ -569,6 +1709,62 @@ impl Repository {
             .get_effect_receipts(operation_id)
             .map_err(pristine_error)?;
         Ok(has_operation_verified_receipt(&receipts))
+    }
+
+    pub(super) fn repository_operation_requires_recovery(&self) -> Result<bool, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let heads = txn
+            .get_operation_heads(OperationScope::Repository)
+            .map_err(pristine_error)?;
+        if heads.as_slice().len() > 1 {
+            return Ok(true);
+        }
+        let Some(head) = heads.as_slice().first().copied() else {
+            return Ok(false);
+        };
+        let receipts = txn.get_effect_receipts(head).map_err(pristine_error)?;
+        Ok(!has_operation_verified_receipt(&receipts))
+    }
+
+    pub(super) fn ensure_repository_operation_safe_for(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+    ) -> Result<(), RepositoryError> {
+        let working_copy = operation_lock.working_copy();
+        let mut txn = operation_lock.begin_write_immediate()?;
+        let head =
+            match self.consolidate_operation_heads_in_txn(&mut txn, OperationScope::Repository)? {
+                OperationHeadState::Empty => {
+                    txn.commit()?;
+                    return Ok(());
+                }
+                OperationHeadState::Single(head) => head,
+                OperationHeadState::Diverged(heads) => {
+                    return Err(RepositoryError::OperationHeadsDiverged {
+                        scope: OperationScope::Repository.to_string(),
+                        heads: heads.iter().map(ToString::to_string).collect(),
+                    })
+                }
+            };
+        let receipts = txn.get_effect_receipts(head).map_err(pristine_error)?;
+        if has_operation_verified_receipt(&receipts) {
+            txn.commit()?;
+            return Ok(());
+        }
+        let operation = txn
+            .get_operation(head)
+            .map_err(pristine_error)?
+            .ok_or_else(|| RepositoryError::OperationNotFound {
+                selector: head.to_string(),
+            })?;
+        if operation.payload().working_copy == Some(working_copy) {
+            txn.commit()?;
+            Ok(())
+        } else {
+            Err(RepositoryError::OperationNotVerified {
+                operation: head.to_string(),
+            })
+        }
     }
 
     /// Return whether a working-copy head requires writable recovery.
@@ -626,10 +1822,22 @@ impl Repository {
                 txn.put_operation(&recovery).map_err(pristine_error)?;
                 txn.compare_and_set_operation_heads(scope, &[head], &[recovery.id()])
                     .map_err(pristine_error)?;
+                let repository_heads = txn
+                    .get_operation_heads(OperationScope::Repository)
+                    .map_err(pristine_error)?;
+                if repository_heads.as_slice() == [head] {
+                    txn.compare_and_set_operation_heads(
+                        OperationScope::Repository,
+                        &[head],
+                        &[recovery.id()],
+                    )
+                    .map_err(pristine_error)?;
+                }
                 txn.commit()?;
                 (head_operation, recovery, true)
             };
 
+        self.apply_operation_metadata_locked(operation_lock, recovery.id())?;
         self.replay_filesystem_recovery(operation_lock, &original, &recovery)?;
         self.finalize_operation_verified(operation_lock, recovery.id())?;
         Ok(RecoveryOutcome::Recovered {
@@ -637,6 +1845,40 @@ impl Repository {
             recovery: recovery.id(),
             created,
         })
+    }
+
+    fn observe_metadata_value(
+        &self,
+        target: &MetadataTarget,
+    ) -> Result<MetadataValue, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        match target {
+            MetadataTarget::ViewChange { view, change } => {
+                let view = txn
+                    .get_view(view)
+                    .map_err(pristine_error)?
+                    .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?;
+                let Some(change_id) = txn.get_internal(change).map_err(pristine_error)? else {
+                    return Ok(MetadataValue::Absent);
+                };
+                Ok(txn
+                    .get_change_seq(&view, change_id)
+                    .map_err(pristine_error)?
+                    .map(MetadataValue::Sequence)
+                    .unwrap_or(MetadataValue::Absent))
+            }
+            MetadataTarget::Tag { view, name } => txn
+                .get_tag(view, name)
+                .map_err(pristine_error)?
+                .map(|tag| {
+                    postcard::to_allocvec(&tag)
+                        .map(MetadataValue::Bytes)
+                        .map_err(|error| RepositoryError::Serialization(error.to_string()))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(MetadataValue::Absent)),
+            target => Err(unsupported_metadata_error(target)),
+        }
     }
 
     /// Observe the exact typed value of an effect supported by this repository engine.
@@ -1247,6 +2489,26 @@ impl Repository {
             }
         }
 
+        let mut metadata = Vec::new();
+        for transition in &original.payload().delta.metadata {
+            let observed = self.observe_metadata_value(&transition.target)?;
+            match classify_metadata_lease(
+                &observed,
+                &transition.expected_old,
+                &transition.expected_new,
+            ) {
+                LeaseClassification::Apply => {}
+                LeaseClassification::AlreadyApplied => metadata.push(MetadataTransition {
+                    target: transition.target.clone(),
+                    expected_old: transition.expected_new.clone(),
+                    expected_new: transition.expected_old.clone(),
+                }),
+                LeaseClassification::Diverged => {
+                    return Err(metadata_divergence_error(transition, &observed));
+                }
+            }
+        }
+
         let effects = original_effects
             .iter()
             .rev()
@@ -1269,10 +2531,12 @@ impl Repository {
         Operation::new(OperationPayload {
             parents: vec![original.id()],
             kind: OperationKind::Recover,
+            relation: None,
             working_copy: original.payload().working_copy,
             before: original.payload().delta.after.clone(),
             delta: RepoStateDelta {
                 after: original.payload().before.clone(),
+                metadata,
                 effects,
             },
             git_observed: Vec::new(),
@@ -1404,6 +2668,467 @@ impl Repository {
             .join(working_copy.to_string())
             .join(RECOVERY_DIR)
             .join(original.to_string())
+    }
+}
+
+fn classify_metadata_lease(
+    observed: &MetadataValue,
+    expected_old: &MetadataValue,
+    expected_new: &MetadataValue,
+) -> LeaseClassification {
+    if observed == expected_old {
+        LeaseClassification::Apply
+    } else if observed == expected_new {
+        LeaseClassification::AlreadyApplied
+    } else {
+        LeaseClassification::Diverged
+    }
+}
+
+fn observe_metadata_value_in_write(
+    txn: &atomic_core::pristine::WriteTxn<'_>,
+    target: &MetadataTarget,
+) -> Result<MetadataValue, RepositoryError> {
+    match target {
+        MetadataTarget::ViewChange { view, change } => {
+            let view = txn
+                .get_view(view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?;
+            let Some(change_id) = txn.get_internal(change).map_err(pristine_error)? else {
+                return Ok(MetadataValue::Absent);
+            };
+            Ok(txn
+                .get_change_seq(&view, change_id)
+                .map_err(pristine_error)?
+                .map(MetadataValue::Sequence)
+                .unwrap_or(MetadataValue::Absent))
+        }
+        MetadataTarget::Tag { view, name } => txn
+            .get_tag(view, name)
+            .map_err(pristine_error)?
+            .map(|tag| {
+                postcard::to_allocvec(&tag)
+                    .map(MetadataValue::Bytes)
+                    .map_err(|error| RepositoryError::Serialization(error.to_string()))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(MetadataValue::Absent)),
+        target => Err(unsupported_metadata_error(target)),
+    }
+}
+
+fn apply_metadata_value_in_write(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    target: &MetadataTarget,
+    value: &MetadataValue,
+) -> Result<(), RepositoryError> {
+    match (target, value) {
+        (MetadataTarget::ViewChange { view, change }, MetadataValue::Absent) => {
+            let mut view_state = txn
+                .get_view(view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?;
+            let change_id = txn
+                .get_internal(change)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: change.to_string(),
+                })?;
+            txn.del_change(&mut view_state, change_id, change)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ChangeNotInView {
+                    hash: change.to_string(),
+                    view: view.clone(),
+                })?;
+            txn.update_view(&view_state).map_err(pristine_error)
+        }
+        (MetadataTarget::ViewChange { view, change }, MetadataValue::Sequence(sequence)) => {
+            let mut view_state = txn
+                .get_view(view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?;
+            let change_id = txn
+                .get_internal(change)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: change.to_string(),
+                })?;
+            if *sequence == view_state.change_count {
+                txn.put_change(&mut view_state, change_id, change)
+                    .map_err(pristine_error)?;
+            } else {
+                txn.reinsert_change(&mut view_state, change_id, change, *sequence)
+                    .map_err(pristine_error)?;
+            }
+            txn.update_view(&view_state).map_err(pristine_error)
+        }
+        (MetadataTarget::Tag { view, name }, MetadataValue::Absent) => {
+            txn.del_tag(view, name).map_err(pristine_error)?;
+            Ok(())
+        }
+        (MetadataTarget::Tag { view, name }, MetadataValue::Bytes(bytes)) => {
+            let tag: atomic_core::pristine::TagRecord = postcard::from_bytes(bytes)
+                .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+            if tag.view != *view || tag.name != *name {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "tag metadata value identifies '{}:{}', expected '{view}:{name}'",
+                        tag.view, tag.name
+                    ),
+                });
+            }
+            txn.put_tag(&tag).map_err(pristine_error)?;
+            Ok(())
+        }
+        (target, _) => Err(unsupported_metadata_error(target)),
+    }
+}
+
+fn metadata_application_key(
+    transition: &MetadataTransition,
+    observed: &MetadataValue,
+) -> (u8, u64) {
+    match (&transition.expected_new, observed) {
+        (MetadataValue::Absent, MetadataValue::Sequence(sequence)) => (0, u64::MAX - sequence),
+        (MetadataValue::Sequence(sequence), _) => (1, *sequence),
+        _ => (2, 0),
+    }
+}
+
+fn metadata_target_view(target: &MetadataTarget) -> Option<&str> {
+    match target {
+        MetadataTarget::ViewChange { view, .. } => Some(view),
+        MetadataTarget::View { name } => Some(name),
+        MetadataTarget::Tag { .. } => None,
+        MetadataTarget::Remote { .. } => None,
+    }
+}
+
+fn metadata_divergence_error(
+    transition: &MetadataTransition,
+    observed: &MetadataValue,
+) -> RepositoryError {
+    RepositoryError::InvalidOperation {
+        message: format!(
+            "metadata lease {:?} diverged: expected old {:?} or new {:?}, observed {:?}",
+            transition.target, transition.expected_old, transition.expected_new, observed
+        ),
+    }
+}
+
+fn unsupported_metadata_error(target: &MetadataTarget) -> RepositoryError {
+    RepositoryError::InvalidOperation {
+        message: format!("operation metadata target {target:?} is not yet executable"),
+    }
+}
+
+fn operation_map_reaches(
+    start: OperationId,
+    target: OperationId,
+    operations: &BTreeMap<OperationId, Operation>,
+) -> Result<bool, RepositoryError> {
+    let mut pending = vec![start];
+    let mut visited = BTreeSet::new();
+    while let Some(operation_id) = pending.pop() {
+        if operation_id == target {
+            return Ok(true);
+        }
+        if !visited.insert(operation_id) {
+            continue;
+        }
+        let operation =
+            operations
+                .get(&operation_id)
+                .ok_or_else(|| RepositoryError::OperationNotFound {
+                    selector: operation_id.to_string(),
+                })?;
+        pending.extend(operation.payload().parents.iter().copied());
+    }
+    Ok(false)
+}
+
+fn apply_snapshot_transition(
+    snapshot: &mut BTreeMap<MetadataTarget, MetadataValue>,
+    transition: &MetadataTransition,
+) {
+    if let MetadataTarget::ViewChange { view, .. } = &transition.target {
+        if let MetadataValue::Sequence(old_sequence) = transition.expected_old {
+            let shifted: Vec<MetadataTarget> = snapshot
+                .iter()
+                .filter_map(|(target, value)| match (target, value) {
+                    (
+                        MetadataTarget::ViewChange {
+                            view: target_view, ..
+                        },
+                        MetadataValue::Sequence(sequence),
+                    ) if target_view == view && *sequence > old_sequence => Some(target.clone()),
+                    _ => None,
+                })
+                .collect();
+            for target in shifted {
+                if let Some(MetadataValue::Sequence(sequence)) = snapshot.get_mut(&target) {
+                    *sequence -= 1;
+                }
+            }
+            snapshot.remove(&transition.target);
+        }
+        if let MetadataValue::Sequence(new_sequence) = transition.expected_new {
+            let shifted: Vec<MetadataTarget> = snapshot
+                .iter()
+                .filter_map(|(target, value)| match (target, value) {
+                    (
+                        MetadataTarget::ViewChange {
+                            view: target_view, ..
+                        },
+                        MetadataValue::Sequence(sequence),
+                    ) if target_view == view && *sequence >= new_sequence => Some(target.clone()),
+                    _ => None,
+                })
+                .collect();
+            for target in shifted {
+                if let Some(MetadataValue::Sequence(sequence)) = snapshot.get_mut(&target) {
+                    *sequence += 1;
+                }
+            }
+            snapshot.insert(
+                transition.target.clone(),
+                MetadataValue::Sequence(new_sequence),
+            );
+        }
+        return;
+    }
+    if transition.expected_new == MetadataValue::Absent {
+        snapshot.remove(&transition.target);
+    } else {
+        snapshot.insert(transition.target.clone(), transition.expected_new.clone());
+    }
+}
+
+fn fold_operation_metadata_snapshot(
+    operation_id: OperationId,
+    operations: &BTreeMap<OperationId, Operation>,
+    memo: &mut BTreeMap<OperationId, BTreeMap<MetadataTarget, MetadataValue>>,
+    visiting: &mut BTreeSet<OperationId>,
+) -> Result<BTreeMap<MetadataTarget, MetadataValue>, RepositoryError> {
+    if let Some(snapshot) = memo.get(&operation_id) {
+        return Ok(snapshot.clone());
+    }
+    if !visiting.insert(operation_id) {
+        return Err(RepositoryError::InvalidOperation {
+            message: format!("operation metadata history contains a cycle at {operation_id}"),
+        });
+    }
+    let operation =
+        operations
+            .get(&operation_id)
+            .ok_or_else(|| RepositoryError::OperationNotFound {
+                selector: operation_id.to_string(),
+            })?;
+    let mut maximal_parents = Vec::new();
+    for candidate in &operation.payload().parents {
+        let mut dominated = false;
+        for other in &operation.payload().parents {
+            if other != candidate && operation_map_reaches(*other, *candidate, operations)? {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            maximal_parents.push(*candidate);
+        }
+    }
+    let mut snapshot = BTreeMap::new();
+    for parent in maximal_parents {
+        let parent_snapshot = fold_operation_metadata_snapshot(parent, operations, memo, visiting)?;
+        for (target, value) in parent_snapshot {
+            if let Some(existing) = snapshot.get(&target) {
+                if existing != &value {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "operation {operation_id} parents disagree on metadata target {target:?}"
+                        ),
+                    });
+                }
+            } else {
+                snapshot.insert(target, value);
+            }
+        }
+    }
+    let mut transitions: Vec<&MetadataTransition> =
+        operation.payload().delta.metadata.iter().collect();
+    transitions.sort_by(|left, right| {
+        metadata_application_key(left, &left.expected_old)
+            .cmp(&metadata_application_key(right, &right.expected_old))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    for transition in transitions {
+        apply_snapshot_transition(&mut snapshot, transition);
+    }
+    visiting.remove(&operation_id);
+    memo.insert(operation_id, snapshot.clone());
+    Ok(snapshot)
+}
+
+fn operation_reaches(
+    txn: &atomic_core::pristine::WriteTxn<'_>,
+    start: OperationId,
+    target: OperationId,
+) -> Result<bool, RepositoryError> {
+    let mut pending = vec![start];
+    let mut visited = BTreeSet::new();
+    while let Some(operation_id) = pending.pop() {
+        if operation_id == target {
+            return Ok(true);
+        }
+        if !visited.insert(operation_id) {
+            continue;
+        }
+        let operation = txn
+            .get_operation(operation_id)
+            .map_err(pristine_error)?
+            .ok_or_else(|| RepositoryError::OperationNotFound {
+                selector: operation_id.to_string(),
+            })?;
+        pending.extend(operation.payload().parents.iter().copied());
+    }
+    Ok(false)
+}
+
+fn merge_commuting_operation_states(
+    operations: &[Operation],
+    scope: OperationScope,
+) -> Option<RepoStateRef> {
+    if scope == OperationScope::Repository {
+        return operations
+            .iter()
+            .all(|operation| operation.payload().delta.effects.is_empty())
+            .then_some(RepoStateRef::EMPTY);
+    }
+    let first = operations.first()?;
+    let common_parents = &first.payload().parents;
+    let base = &first.payload().before;
+    let mut merged = base.clone();
+    let mut view_changed = false;
+    let mut working_copy_changed = false;
+    let mut git_changed = false;
+
+    for operation in operations {
+        if operation.payload().parents != *common_parents || operation.payload().before != *base {
+            return None;
+        }
+        let after = &operation.payload().delta.after;
+        if !merge_state_component(&base.view, &after.view, &mut merged.view, &mut view_changed)
+            || !merge_state_component(
+                &base.working_copy,
+                &after.working_copy,
+                &mut merged.working_copy,
+                &mut working_copy_changed,
+            )
+            || !merge_state_component(&base.git, &after.git, &mut merged.git, &mut git_changed)
+        {
+            return None;
+        }
+    }
+    Some(merged)
+}
+
+fn merge_state_component<T: Clone + PartialEq>(
+    base: &Option<T>,
+    after: &Option<T>,
+    merged: &mut Option<T>,
+    changed: &mut bool,
+) -> bool {
+    if after == base {
+        return true;
+    }
+    if *changed {
+        return false;
+    }
+    *merged = after.clone();
+    *changed = true;
+    true
+}
+
+fn operation_write_sets_are_disjoint(operations: &[Operation]) -> bool {
+    let mut metadata_targets = BTreeSet::<MetadataTarget>::new();
+    let mut effect_targets = Vec::<EffectTarget>::new();
+    for operation in operations {
+        for transition in &operation.payload().delta.metadata {
+            if !metadata_targets.insert(transition.target.clone()) {
+                return false;
+            }
+        }
+        for effect in &operation.payload().delta.effects {
+            if effect_targets.contains(&effect.target) {
+                return false;
+            }
+            effect_targets.push(effect.target.clone());
+        }
+    }
+    true
+}
+
+pub(super) fn current_operation_timestamp_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn operation_not_reversible(operation: &Operation, reason: &str) -> RepositoryError {
+    RepositoryError::OperationNotReversible {
+        operation: operation.id().to_string(),
+        kind: format!("{:?}", operation.payload().kind),
+        reason: reason.to_string(),
+    }
+}
+
+fn operation_verification_state(receipts: &[EffectReceipt]) -> OperationVerificationState {
+    if has_operation_verified_receipt(receipts) {
+        return OperationVerificationState::Verified;
+    }
+    if receipts
+        .iter()
+        .any(|receipt| receipt.payload().kind == EffectReceiptKind::LeaseRejected)
+    {
+        return OperationVerificationState::LeaseRejected;
+    }
+    if receipts.iter().any(|receipt| {
+        matches!(
+            receipt.payload().kind,
+            EffectReceiptKind::Applied
+                | EffectReceiptKind::RolledBack
+                | EffectReceiptKind::Recovered
+        )
+    }) {
+        OperationVerificationState::InProgress
+    } else {
+        OperationVerificationState::Prepared
+    }
+}
+
+fn sort_receipts(receipts: &mut [EffectReceipt]) {
+    receipts.sort_by_key(|receipt| {
+        let payload = receipt.payload();
+        (
+            payload.effect_ordinal.unwrap_or(u32::MAX),
+            payload.attempt,
+            receipt_kind_order(payload.kind),
+            receipt.id(),
+        )
+    });
+}
+
+fn receipt_kind_order(kind: EffectReceiptKind) -> u8 {
+    match kind {
+        EffectReceiptKind::Applied => 0,
+        EffectReceiptKind::Recovered => 1,
+        EffectReceiptKind::RolledBack => 2,
+        EffectReceiptKind::LeaseRejected => 3,
+        EffectReceiptKind::Verified => 4,
     }
 }
 
@@ -1902,7 +3627,18 @@ fn create_directory_effect_path(
 fn remove_filesystem_effect_path(path: &Path) -> Result<(), RepositoryError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir(path)?
+            fs::remove_dir(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                    RepositoryError::InvalidOperation {
+                        message: format!(
+                            "cannot remove directory '{}': untracked children are never removed recursively",
+                            path.display()
+                        ),
+                    }
+                } else {
+                    RepositoryError::Io(error)
+                }
+            })?
         }
         Ok(_) => fs::remove_file(path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

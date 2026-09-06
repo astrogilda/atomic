@@ -1,10 +1,42 @@
 use super::*;
-use atomic_core::pristine::{PathClaimTxnT, StoredConflict, StoredConflictKind};
+use atomic_core::operation::{
+    ActorRef, EffectPlan, EffectTarget, EffectValue, FileKind, FileState, OperationKind,
+    OperationScope, RepoStateRef, ViewStateRef,
+};
+use atomic_core::pristine::{
+    PathClaimTxnT, StoredConflict, StoredConflictKind, WorkingCopyMutTxnT,
+};
 
 pub(super) trait MaterializationEffectExecutor {
     fn create_directory(&mut self, path: &str) -> Result<bool, RepositoryError>;
     fn write_file(&mut self, path: &str, content: &[u8]) -> Result<bool, RepositoryError>;
     fn remove_path(&mut self, path: &str) -> Result<bool, RepositoryError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializationPlanEntry {
+    path: String,
+    expected_new: EffectValue,
+}
+
+#[cfg(unix)]
+fn materialized_regular_mode() -> u32 {
+    0o644
+}
+
+#[cfg(not(unix))]
+fn materialized_regular_mode() -> u32 {
+    0o666
+}
+
+#[cfg(unix)]
+fn materialized_directory_mode() -> u32 {
+    0o755
+}
+
+#[cfg(not(unix))]
+fn materialized_directory_mode() -> u32 {
+    0o666
 }
 
 /// Return the 1-based line number of the first Atomic conflict-start marker
@@ -659,6 +691,40 @@ impl Repository {
         self.materialize_parallel(working_copy, Some(paths))
     }
 
+    #[cfg(unix)]
+    fn materialized_creation_mode(&self, desired: u32) -> Result<u32, RepositoryError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let probes = self
+            .working_copy_dot_dir()
+            .join("operation-recovery")
+            .join("mode-probes");
+        std::fs::create_dir_all(&probes)?;
+        for suffix in 0..100u32 {
+            let probe = probes.join(format!("{}-{suffix}", std::process::id()));
+            match std::fs::create_dir(&probe) {
+                Ok(()) => {
+                    let mask = std::fs::metadata(&probe)?.permissions().mode() & 0o777;
+                    std::fs::remove_dir(&probe)?;
+                    return Ok(desired & mask);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(RepositoryError::Io(error)),
+            }
+        }
+        Err(RepositoryError::InvalidOperation {
+            message: format!(
+                "could not allocate a materialization mode probe under '{}'",
+                probes.display()
+            ),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn materialized_creation_mode(&self, desired: u32) -> Result<u32, RepositoryError> {
+        Ok(desired)
+    }
+
     /// Materialize the working copy using parallel file processing.
     ///
     /// This is an optimized version of `materialize` that:
@@ -675,9 +741,18 @@ impl Repository {
         only_paths: Option<std::collections::HashSet<String>>,
     ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
         let view_name = self.desired_view_name(working_copy)?;
         let full_materialization = only_paths.is_none();
-        let (visibility, view_id) = {
+        let (visibility, view_id, view_state) = {
             let txn = self
                 .pristine
                 .read_txn()
@@ -688,35 +763,150 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view_name.clone(),
                 })?;
-            (graph_visibility_closure(&txn, &view)?, view.id)
+            (graph_visibility_closure(&txn, &view)?, view.id, view.state)
         };
-        let result = self.materialize_parallel_with_visibility(
+        let plan = self.plan_materialization_with_visibility(
             working_copy,
-            only_paths,
-            visibility,
+            only_paths.clone(),
+            visibility.clone(),
             view_id,
         )?;
-        if full_materialization {
-            self.mark_working_copy_materialized(working_copy, &view_name)?;
+        let mut effects = Vec::new();
+        for entry in plan {
+            let target = EffectTarget::FilesystemPath {
+                path: entry.path.clone(),
+            };
+            let observed = self.observe_filesystem_effect(working_copy, &target)?;
+            let mut expected_new = entry.expected_new;
+            if let EffectValue::File(new) = &mut expected_new {
+                match &observed {
+                    EffectValue::File(old) if old.kind == new.kind => new.mode = old.mode,
+                    EffectValue::Absent => {
+                        new.mode = self.materialized_creation_mode(new.mode)?;
+                    }
+                    _ => {}
+                }
+            }
+            if observed == expected_new {
+                continue;
+            }
+            let type_changes = matches!(
+                (&observed, &expected_new),
+                (EffectValue::File(old), EffectValue::File(new)) if old.kind != new.kind
+            );
+            if type_changes {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: target.clone(),
+                    expected_old: observed,
+                    expected_new: EffectValue::Absent,
+                });
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target,
+                    expected_old: EffectValue::Absent,
+                    expected_new,
+                });
+            } else {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target,
+                    expected_old: observed,
+                    expected_new,
+                });
+            }
         }
-        Ok(result)
-    }
 
-    pub(super) fn materialize_parallel_with_visibility(
-        &self,
-        working_copy: WorkingCopyId,
-        only_paths: Option<std::collections::HashSet<String>>,
-        visibility: GraphVisibilityClosure,
-        view_id: u64,
-    ) -> Result<MaterializeResult, RepositoryError> {
-        self.materialize_parallel_with_visibility_mode(
+        let before_record = self.working_copy_record(working_copy)?;
+        let mut after_record = before_record.clone();
+        if full_materialization {
+            after_record.desired_view = view_id;
+            after_record.desired_state = view_state;
+            after_record.materialized_state = Some(view_state);
+            after_record.materialized_manifest = None;
+        }
+        let before_state = RepoStateRef {
+            view: Some(ViewStateRef {
+                name: view_name.clone(),
+                state: view_state,
+                set_id: None,
+            }),
+            working_copy: Some(super::operation::working_copy_state_ref(
+                before_record.clone(),
+            )),
+            git: None,
+        };
+        let after_state = RepoStateRef {
+            view: before_state.view.clone(),
+            working_copy: Some(super::operation::working_copy_state_ref(
+                after_record.clone(),
+            )),
+            git: None,
+        };
+        if full_materialization && before_record != after_record {
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: EffectTarget::WorkingCopy { working_copy },
+                expected_old: EffectValue::WorkingCopy(super::operation::working_copy_state_ref(
+                    before_record,
+                )),
+                expected_new: EffectValue::WorkingCopy(super::operation::working_copy_state_ref(
+                    after_record.clone(),
+                )),
+            });
+        }
+        let prepared = self.prepare_working_copy_transition(
+            &operation_lock,
+            OperationKind::Materialize,
+            None,
+            before_state,
+            after_state,
+            effects,
+            ActorRef::System {
+                name: "repository-materialize".to_string(),
+            },
+            super::operation::current_operation_timestamp_ms(),
+        )?;
+        let operation_id = prepared.operation().id();
+        let mut executor = super::switch::SwitchMaterializationExecutor::new(
+            self,
+            &operation_lock,
+            prepared.operation().clone(),
+        );
+        executor.complete_preparatory(&view_name)?;
+        let result = self.materialize_parallel_with_visibility_journaled(
             working_copy,
             only_paths,
             visibility,
             view_id,
-            true,
-            None,
-        )
+            &mut executor,
+        )?;
+        executor.complete_remaining(&view_name)?;
+        drop(executor);
+        if let Some(effect) = prepared
+            .operation()
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .find(|effect| matches!(effect.target, EffectTarget::WorkingCopy { .. }))
+        {
+            let observed_before = self.observe_operation_effect(working_copy, &effect.target)?;
+            let mut txn = operation_lock.begin_write_immediate()?;
+            txn.put_working_copy(&after_record)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            txn.commit()?;
+            let observed_after = self.observe_operation_effect(working_copy, &effect.target)?;
+            self.record_effect_outcome(
+                &operation_lock,
+                operation_id,
+                effect.ordinal,
+                observed_before,
+                observed_after,
+            )?;
+        }
+        self.finalize_operation_verified(&operation_lock, operation_id)?;
+        Ok(result)
     }
 
     pub(super) fn materialize_parallel_with_visibility_journaled(
@@ -734,6 +924,7 @@ impl Repository {
             view_id,
             true,
             Some(executor),
+            None,
         )
     }
 
@@ -752,10 +943,32 @@ impl Repository {
             view_id,
             false,
             None,
+            None,
         )
         .map(|_| ())
     }
 
+    fn plan_materialization_with_visibility(
+        &self,
+        working_copy: WorkingCopyId,
+        only_paths: Option<std::collections::HashSet<String>>,
+        visibility: GraphVisibilityClosure,
+        view_id: u64,
+    ) -> Result<Vec<MaterializationPlanEntry>, RepositoryError> {
+        let mut plan = Vec::new();
+        self.materialize_parallel_with_visibility_mode(
+            working_copy,
+            only_paths,
+            visibility,
+            view_id,
+            false,
+            None,
+            Some(&mut plan),
+        )?;
+        Ok(plan)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn materialize_parallel_with_visibility_mode(
         &self,
         working_copy: WorkingCopyId,
@@ -764,6 +977,7 @@ impl Repository {
         view_id: u64,
         execute: bool,
         mut effect_executor: Option<&mut dyn MaterializationEffectExecutor>,
+        plan: Option<&mut Vec<MaterializationPlanEntry>>,
     ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         use atomic_core::output::repo::OutputItem;
@@ -1149,6 +1363,63 @@ impl Repository {
                     atomic_core::output::repo::FileConflictType::Name,
                 ));
             }
+        }
+
+        if let Some(plan) = plan {
+            let mut desired = std::collections::BTreeMap::<String, EffectValue>::new();
+            for path in &prepared_name_conflicts.directories {
+                desired.insert(
+                    path.clone(),
+                    super::operation::filesystem_directory_value(materialized_directory_mode()),
+                );
+            }
+            for item in &items {
+                if item.is_directory
+                    && only_paths.as_ref().is_none_or(|paths| {
+                        paths.contains(&item.path)
+                            || paths.iter().any(|path| {
+                                path.strip_prefix(&item.path)
+                                    .is_some_and(|suffix| suffix.starts_with('/'))
+                            })
+                    })
+                {
+                    desired.insert(
+                        item.path.clone(),
+                        super::operation::filesystem_directory_value(u32::from(
+                            item.metadata.permissions,
+                        )),
+                    );
+                }
+            }
+            for rendered in rendered_files.iter().flatten() {
+                if rendered.2 {
+                    desired.insert(
+                        rendered.0.path().to_string(),
+                        EffectValue::File(FileState {
+                            kind: FileKind::Regular,
+                            mode: items
+                                .iter()
+                                .find(|item| item.path == rendered.0.path())
+                                .map(|item| u32::from(item.metadata.permissions))
+                                .unwrap_or_else(materialized_regular_mode),
+                            content: rendered.1,
+                        }),
+                    );
+                }
+            }
+            for entry in &absent_entries {
+                if only_paths
+                    .as_ref()
+                    .is_none_or(|paths| paths.contains(entry.path()))
+                {
+                    desired.insert(entry.path().to_string(), EffectValue::Absent);
+                }
+            }
+            plan.extend(
+                desired
+                    .into_iter()
+                    .map(|(path, expected_new)| MaterializationPlanEntry { path, expected_new }),
+            );
         }
 
         if !execute {

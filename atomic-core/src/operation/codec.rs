@@ -1,7 +1,11 @@
 use super::*;
 
+/// Original canonical operation payload version.
+pub const OPERATION_VERSION_V1: u8 = 1;
+/// Canonical operation payload version with relations and metadata transitions.
+pub const OPERATION_VERSION_V2: u8 = 2;
 /// Current canonical operation payload version.
-pub const OPERATION_VERSION: u8 = 1;
+pub const OPERATION_VERSION: u8 = OPERATION_VERSION_V2;
 /// Current canonical effect-receipt payload version.
 pub const EFFECT_RECEIPT_VERSION: u8 = 1;
 /// Current canonical operation-head-set version.
@@ -12,7 +16,7 @@ const OPERATION_SCOPE_WORKING_COPY: u8 = 1;
 
 /// Encode an operation's immutable payload and verify its derived ID.
 pub fn encode_operation(operation: &Operation) -> Result<Vec<u8>, OperationCodecError> {
-    let bytes = encode_operation_payload(operation.payload())?;
+    let bytes = encode_operation_payload(operation.payload(), operation.encoding_version())?;
     let actual = OperationId::from_canonical_bytes(&bytes);
     if actual != operation.id() {
         return Err(OperationCodecError::new(format!(
@@ -26,18 +30,26 @@ pub fn encode_operation(operation: &Operation) -> Result<Vec<u8>, OperationCodec
 
 pub(crate) fn encode_operation_payload(
     payload: &OperationPayload,
+    encoding_version: u8,
 ) -> Result<Vec<u8>, OperationCodecError> {
     payload.validate_canonical()?;
+    payload.validate_encoding_version(encoding_version)?;
     let mut encoder = Encoder::new();
-    encoder.put_u8(OPERATION_VERSION)?;
+    encoder.put_u8(encoding_version)?;
     encoder.put_count(payload.parents.len(), "operation parents")?;
     for parent in &payload.parents {
         encoder.put_operation_id(*parent)?;
     }
     encoder.put_operation_kind(payload.kind)?;
+    if encoding_version == OPERATION_VERSION_V2 {
+        encoder.put_optional_tag(payload.relation.is_some())?;
+        if let Some(relation) = &payload.relation {
+            encoder.put_operation_relation(relation)?;
+        }
+    }
     encoder.put_optional_working_copy(payload.working_copy)?;
     encoder.put_repo_state(&payload.before)?;
-    encoder.put_repo_state_delta(&payload.delta)?;
+    encoder.put_repo_state_delta(&payload.delta, encoding_version)?;
     encoder.put_count(payload.git_observed.len(), "Git ref observations")?;
     for observation in &payload.git_observed {
         encoder.put_git_ref_observation(observation)?;
@@ -58,16 +70,31 @@ pub(crate) fn encode_operation_payload(
 /// Decode strict canonical operation bytes and recompute the derived ID.
 pub fn decode_operation(bytes: &[u8]) -> Result<Operation, OperationCodecError> {
     let mut decoder = Decoder::new(bytes)?;
-    decoder.expect_version(OPERATION_VERSION, "operation")?;
+    let encoding_version = decoder.read_u8()?;
+    if !matches!(
+        encoding_version,
+        OPERATION_VERSION_V1 | OPERATION_VERSION_V2
+    ) {
+        return Err(OperationCodecError::new(format!(
+            "unsupported operation version {encoding_version} (maximum supported version {OPERATION_VERSION})"
+        )));
+    }
     let parent_count = decoder.read_count("operation parents")?;
     let mut parents = Vec::with_capacity(parent_count);
     for _ in 0..parent_count {
         parents.push(decoder.read_operation_id()?);
     }
-    let kind = decoder.read_operation_kind()?;
+    let kind = decoder.read_operation_kind(encoding_version)?;
+    let relation = if encoding_version == OPERATION_VERSION_V2
+        && decoder.read_optional_tag("operation relation")?
+    {
+        Some(decoder.read_operation_relation()?)
+    } else {
+        None
+    };
     let working_copy = decoder.read_optional_working_copy()?;
     let before = decoder.read_repo_state()?;
-    let delta = decoder.read_repo_state_delta()?;
+    let delta = decoder.read_repo_state_delta(encoding_version)?;
     let observation_count = decoder.read_count("Git ref observations")?;
     let mut git_observed = Vec::with_capacity(observation_count);
     for _ in 0..observation_count {
@@ -90,6 +117,7 @@ pub fn decode_operation(bytes: &[u8]) -> Result<Operation, OperationCodecError> 
     let payload = OperationPayload {
         parents,
         kind,
+        relation,
         working_copy,
         before,
         delta,
@@ -100,14 +128,15 @@ pub fn decode_operation(bytes: &[u8]) -> Result<Operation, OperationCodecError> 
         lossy,
     };
     payload.validate_canonical()?;
-    let canonical = encode_operation_payload(&payload)?;
+    payload.validate_encoding_version(encoding_version)?;
+    let canonical = encode_operation_payload(&payload, encoding_version)?;
     if canonical != bytes {
         return Err(OperationCodecError::new(
             "operation payload is not canonically encoded",
         ));
     }
     let id = OperationId::from_canonical_bytes(bytes);
-    Operation::from_canonical_payload(id, payload)
+    Operation::from_canonical_payload(id, payload, encoding_version)
 }
 
 /// Encode an immutable effect receipt and verify its derived ID.
@@ -319,6 +348,18 @@ impl Encoder {
         self.put_bytes(value.as_bytes())
     }
 
+    fn put_blob(&mut self, value: &[u8], field: &str) -> Result<(), OperationCodecError> {
+        if value.len() > MAX_OPERATION_OBJECT_BYTES {
+            return Err(OperationCodecError::new(format!(
+                "{field} exceeds {MAX_OPERATION_OBJECT_BYTES} bytes"
+            )));
+        }
+        let len = u32::try_from(value.len())
+            .map_err(|_| OperationCodecError::new(format!("{field} length exceeds u32")))?;
+        self.put_u32(len)?;
+        self.put_bytes(value)
+    }
+
     fn put_hash(&mut self, value: Hash) -> Result<(), OperationCodecError> {
         self.put_bytes(value.as_bytes())
     }
@@ -394,7 +435,27 @@ impl Encoder {
             OperationKind::Recover => 15,
             OperationKind::Undo => 16,
             OperationKind::Gc => 17,
+            OperationKind::Restore => 18,
+            OperationKind::Pull => 19,
+            OperationKind::Push => 20,
+            OperationKind::Consolidate => 21,
         })
+    }
+
+    fn put_operation_relation(
+        &mut self,
+        relation: &OperationRelation,
+    ) -> Result<(), OperationCodecError> {
+        match relation {
+            OperationRelation::Undo { target } => {
+                self.put_u8(0)?;
+                self.put_operation_id(*target)
+            }
+            OperationRelation::Restore { target } => {
+                self.put_u8(1)?;
+                self.put_operation_id(*target)
+            }
+        }
     }
 
     fn put_repo_state(&mut self, state: &RepoStateRef) -> Result<(), OperationCodecError> {
@@ -413,14 +474,74 @@ impl Encoder {
         Ok(())
     }
 
-    fn put_repo_state_delta(&mut self, delta: &RepoStateDelta) -> Result<(), OperationCodecError> {
+    fn put_repo_state_delta(
+        &mut self,
+        delta: &RepoStateDelta,
+        encoding_version: u8,
+    ) -> Result<(), OperationCodecError> {
         delta.validate_canonical()?;
         self.put_repo_state(&delta.after)?;
+        if encoding_version == OPERATION_VERSION_V2 {
+            self.put_count(delta.metadata.len(), "metadata transitions")?;
+            for transition in &delta.metadata {
+                self.put_metadata_transition(transition)?;
+            }
+        }
         self.put_count(delta.effects.len(), "operation effects")?;
         for effect in &delta.effects {
             self.put_effect_plan(effect)?;
         }
         Ok(())
+    }
+
+    fn put_metadata_transition(
+        &mut self,
+        transition: &MetadataTransition,
+    ) -> Result<(), OperationCodecError> {
+        self.put_metadata_target(&transition.target)?;
+        self.put_metadata_value(&transition.expected_old)?;
+        self.put_metadata_value(&transition.expected_new)
+    }
+
+    fn put_metadata_target(&mut self, target: &MetadataTarget) -> Result<(), OperationCodecError> {
+        match target {
+            MetadataTarget::ViewChange { view, change } => {
+                self.put_u8(0)?;
+                self.put_string(view, "metadata view-change view")?;
+                self.put_hash(*change)
+            }
+            MetadataTarget::View { name } => {
+                self.put_u8(1)?;
+                self.put_string(name, "metadata view name")
+            }
+            MetadataTarget::Tag { view, name } => {
+                self.put_u8(2)?;
+                self.put_string(view, "metadata tag view")?;
+                self.put_string(name, "metadata tag name")
+            }
+            MetadataTarget::Remote { name } => {
+                self.put_u8(3)?;
+                self.put_string(name, "metadata remote name")
+            }
+        }
+    }
+
+    fn put_metadata_value(&mut self, value: &MetadataValue) -> Result<(), OperationCodecError> {
+        match value {
+            MetadataValue::Absent => self.put_u8(0),
+            MetadataValue::Sequence(sequence) => {
+                self.put_u8(1)?;
+                self.put_u64(*sequence)
+            }
+            MetadataValue::Digest(hash) => {
+                self.put_u8(2)?;
+                self.put_hash(*hash)
+            }
+            MetadataValue::Bytes(bytes) => {
+                self.put_u8(3)?;
+                self.put_blob(bytes, "metadata bytes")
+            }
+        }
     }
 
     fn put_view_state(&mut self, state: &ViewStateRef) -> Result<(), OperationCodecError> {
@@ -814,6 +935,27 @@ impl<'a> Decoder<'a> {
             .map_err(|_| OperationCodecError::new(format!("{field} is not valid UTF-8")))
     }
 
+    fn read_blob(&mut self, field: &str) -> Result<Vec<u8>, OperationCodecError> {
+        let len = self.read_u32()? as usize;
+        if len > MAX_OPERATION_OBJECT_BYTES {
+            return Err(OperationCodecError::new(format!(
+                "{field} has {len} bytes, maximum is {MAX_OPERATION_OBJECT_BYTES}"
+            )));
+        }
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| OperationCodecError::new("canonical byte-string length overflow"))?;
+        let bytes = self.bytes.get(self.offset..end).ok_or_else(|| {
+            OperationCodecError::new(format!(
+                "canonical object is truncated at byte {} while reading {field}",
+                self.offset
+            ))
+        })?;
+        self.offset = end;
+        Ok(bytes.to_vec())
+    }
+
     fn read_hash(&mut self) -> Result<Hash, OperationCodecError> {
         Ok(Hash::from_bytes(self.read_exact()?))
     }
@@ -872,7 +1014,10 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn read_operation_kind(&mut self) -> Result<OperationKind, OperationCodecError> {
+    fn read_operation_kind(
+        &mut self,
+        encoding_version: u8,
+    ) -> Result<OperationKind, OperationCodecError> {
         match self.read_u8()? {
             0 => Ok(OperationKind::Anchor),
             1 => Ok(OperationKind::Record),
@@ -892,8 +1037,26 @@ impl<'a> Decoder<'a> {
             15 => Ok(OperationKind::Recover),
             16 => Ok(OperationKind::Undo),
             17 => Ok(OperationKind::Gc),
+            18 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Restore),
+            19 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Pull),
+            20 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Push),
+            21 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Consolidate),
             tag => Err(OperationCodecError::new(format!(
-                "unsupported operation kind tag {tag}"
+                "unsupported operation kind tag {tag} for operation version {encoding_version}"
+            ))),
+        }
+    }
+
+    fn read_operation_relation(&mut self) -> Result<OperationRelation, OperationCodecError> {
+        match self.read_u8()? {
+            0 => Ok(OperationRelation::Undo {
+                target: self.read_operation_id()?,
+            }),
+            1 => Ok(OperationRelation::Restore {
+                target: self.read_operation_id()?,
+            }),
+            tag => Err(OperationCodecError::new(format!(
+                "unsupported operation relation tag {tag}"
             ))),
         }
     }
@@ -921,16 +1084,75 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn read_repo_state_delta(&mut self) -> Result<RepoStateDelta, OperationCodecError> {
+    fn read_repo_state_delta(
+        &mut self,
+        encoding_version: u8,
+    ) -> Result<RepoStateDelta, OperationCodecError> {
         let after = self.read_repo_state()?;
+        let metadata = if encoding_version == OPERATION_VERSION_V2 {
+            let count = self.read_count("metadata transitions")?;
+            let mut metadata = Vec::with_capacity(count);
+            for _ in 0..count {
+                metadata.push(self.read_metadata_transition()?);
+            }
+            metadata
+        } else {
+            Vec::new()
+        };
         let count = self.read_count("operation effects")?;
         let mut effects = Vec::with_capacity(count);
         for _ in 0..count {
             effects.push(self.read_effect_plan()?);
         }
-        let delta = RepoStateDelta { after, effects };
+        let delta = RepoStateDelta {
+            after,
+            metadata,
+            effects,
+        };
         delta.validate_canonical()?;
         Ok(delta)
+    }
+
+    fn read_metadata_transition(&mut self) -> Result<MetadataTransition, OperationCodecError> {
+        Ok(MetadataTransition {
+            target: self.read_metadata_target()?,
+            expected_old: self.read_metadata_value()?,
+            expected_new: self.read_metadata_value()?,
+        })
+    }
+
+    fn read_metadata_target(&mut self) -> Result<MetadataTarget, OperationCodecError> {
+        match self.read_u8()? {
+            0 => Ok(MetadataTarget::ViewChange {
+                view: self.read_string("metadata view-change view")?,
+                change: self.read_hash()?,
+            }),
+            1 => Ok(MetadataTarget::View {
+                name: self.read_string("metadata view name")?,
+            }),
+            2 => Ok(MetadataTarget::Tag {
+                view: self.read_string("metadata tag view")?,
+                name: self.read_string("metadata tag name")?,
+            }),
+            3 => Ok(MetadataTarget::Remote {
+                name: self.read_string("metadata remote name")?,
+            }),
+            tag => Err(OperationCodecError::new(format!(
+                "unsupported metadata target tag {tag}"
+            ))),
+        }
+    }
+
+    fn read_metadata_value(&mut self) -> Result<MetadataValue, OperationCodecError> {
+        match self.read_u8()? {
+            0 => Ok(MetadataValue::Absent),
+            1 => Ok(MetadataValue::Sequence(self.read_u64()?)),
+            2 => Ok(MetadataValue::Digest(self.read_hash()?)),
+            3 => Ok(MetadataValue::Bytes(self.read_blob("metadata bytes")?)),
+            tag => Err(OperationCodecError::new(format!(
+                "unsupported metadata value tag {tag}"
+            ))),
+        }
     }
 
     fn read_view_state(&mut self) -> Result<ViewStateRef, OperationCodecError> {
@@ -1258,10 +1480,12 @@ mod tests {
         OperationPayload {
             parents: Vec::new(),
             kind: OperationKind::Anchor,
+            relation: None,
             working_copy: None,
             before: RepoStateRef::EMPTY,
             delta: RepoStateDelta {
                 after: RepoStateRef::EMPTY,
+                metadata: Vec::new(),
                 effects: Vec::new(),
             },
             git_observed: Vec::new(),
@@ -1274,6 +1498,75 @@ mod tests {
         }
     }
 
+    fn v2_payload() -> OperationPayload {
+        let mut payload = anchor_payload();
+        payload.parents = vec![OperationId::from_bytes([1; 32])];
+        payload.kind = OperationKind::Restore;
+        payload.relation = Some(OperationRelation::Restore {
+            target: OperationId::from_bytes([2; 32]),
+        });
+        payload.delta.metadata = vec![
+            MetadataTransition {
+                target: MetadataTarget::Remote {
+                    name: "origin".into(),
+                },
+                expected_old: MetadataValue::Absent,
+                expected_new: MetadataValue::Bytes(b"ssh://example/repo".to_vec()),
+            },
+            MetadataTransition {
+                target: MetadataTarget::Tag {
+                    view: "main".into(),
+                    name: "v1".into(),
+                },
+                expected_old: MetadataValue::Digest(Hash::from_bytes([3; 32])),
+                expected_new: MetadataValue::Absent,
+            },
+            MetadataTransition {
+                target: MetadataTarget::View {
+                    name: "main".into(),
+                },
+                expected_old: MetadataValue::Absent,
+                expected_new: MetadataValue::Digest(Hash::from_bytes([4; 32])),
+            },
+            MetadataTransition {
+                target: MetadataTarget::ViewChange {
+                    view: "main".into(),
+                    change: Hash::from_bytes([5; 32]),
+                },
+                expected_old: MetadataValue::Absent,
+                expected_new: MetadataValue::Sequence(7),
+            },
+        ];
+        payload
+    }
+
+    fn metadata_transition_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+        let mut decoder = Decoder::new(bytes).unwrap();
+        let encoding_version = decoder.read_u8().unwrap();
+        assert_eq!(encoding_version, OPERATION_VERSION_V2);
+        let parent_count = decoder.read_count("operation parents").unwrap();
+        for _ in 0..parent_count {
+            decoder.read_operation_id().unwrap();
+        }
+        decoder
+            .read_operation_kind(encoding_version)
+            .expect("operation kind");
+        if decoder.read_optional_tag("operation relation").unwrap() {
+            decoder.read_operation_relation().unwrap();
+        }
+        decoder.read_optional_working_copy().unwrap();
+        decoder.read_repo_state().unwrap();
+        decoder.read_repo_state().unwrap();
+        let metadata_count = decoder.read_count("metadata transitions").unwrap();
+        let mut ranges = Vec::with_capacity(metadata_count);
+        for _ in 0..metadata_count {
+            let start = decoder.offset;
+            decoder.read_metadata_transition().unwrap();
+            ranges.push(start..decoder.offset);
+        }
+        ranges
+    }
+
     #[test]
     fn operation_v1_golden_vector_and_roundtrip() {
         let operation = Operation::new(anchor_payload()).unwrap();
@@ -1282,8 +1575,25 @@ mod tests {
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 6, 0, 0,
             0, b's', b'y', b's', b't', b'e', b'm', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
+        assert_eq!(operation.encoding_version(), OPERATION_VERSION_V1);
         assert_eq!(encoded, expected);
-        assert_eq!(decode_operation(&encoded).unwrap(), operation);
+        let decoded = decode_operation(&encoded).unwrap();
+        assert_eq!(decoded, operation);
+        assert_eq!(decoded.encoding_version(), OPERATION_VERSION_V1);
+        assert_eq!(decoded.id(), OperationId::from_canonical_bytes(&expected));
+        assert_eq!(encode_operation(&decoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn decoded_operation_retains_v2_for_legacy_compatible_payload() {
+        let encoded = encode_operation_payload(&anchor_payload(), OPERATION_VERSION_V2).unwrap();
+        let decoded = decode_operation(&encoded).unwrap();
+
+        assert_eq!(decoded.encoding_version(), OPERATION_VERSION_V2);
+        assert_eq!(decoded.payload().relation, None);
+        assert!(decoded.payload().delta.metadata.is_empty());
+        assert_eq!(encode_operation(&decoded).unwrap(), encoded);
+        assert_ne!(decoded.id(), Operation::new(anchor_payload()).unwrap().id());
     }
 
     #[test]
@@ -1293,6 +1603,146 @@ mod tests {
         changed.timestamp_ms = 1;
         let second = Operation::new(changed).unwrap();
         assert_ne!(first.id(), second.id());
+
+        let v2 = Operation::new(v2_payload()).unwrap();
+        let mut changed_relation = v2_payload();
+        changed_relation.relation = Some(OperationRelation::Restore {
+            target: OperationId::from_bytes([6; 32]),
+        });
+        assert_ne!(v2.id(), Operation::new(changed_relation).unwrap().id());
+
+        let mut changed_metadata = v2_payload();
+        changed_metadata.delta.metadata[0].expected_new = MetadataValue::Bytes(b"changed".to_vec());
+        assert_ne!(v2.id(), Operation::new(changed_metadata).unwrap().id());
+    }
+
+    #[test]
+    fn operation_v2_roundtrips_relation_and_typed_metadata() {
+        let operation = Operation::new(v2_payload()).unwrap();
+        let encoded = encode_operation(&operation).unwrap();
+        let decoded = decode_operation(&encoded).unwrap();
+
+        assert_eq!(operation.encoding_version(), OPERATION_VERSION_V2);
+        assert_eq!(encoded[0], OPERATION_VERSION_V2);
+        assert_eq!(decoded, operation);
+        assert_eq!(encode_operation(&decoded).unwrap(), encoded);
+        assert!(matches!(
+            decoded.payload().relation,
+            Some(OperationRelation::Restore { target })
+                if target == OperationId::from_bytes([2; 32])
+        ));
+        assert_eq!(decoded.payload().delta.metadata.len(), 4);
+    }
+
+    #[test]
+    fn metadata_transitions_are_canonicalized_and_noncanonical_bytes_are_rejected() {
+        let operation = Operation::new(v2_payload()).unwrap();
+        let targets: Vec<_> = operation
+            .payload()
+            .delta
+            .metadata
+            .iter()
+            .map(|transition| transition.target.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                MetadataTarget::ViewChange {
+                    view: "main".into(),
+                    change: Hash::from_bytes([5; 32]),
+                },
+                MetadataTarget::View {
+                    name: "main".into(),
+                },
+                MetadataTarget::Tag {
+                    view: "main".into(),
+                    name: "v1".into(),
+                },
+                MetadataTarget::Remote {
+                    name: "origin".into(),
+                },
+            ]
+        );
+
+        let mut payload = v2_payload();
+        payload.kind = OperationKind::Undo;
+        payload.relation = Some(OperationRelation::Undo {
+            target: OperationId::from_bytes([2; 32]),
+        });
+        payload.delta.metadata = vec![
+            MetadataTransition {
+                target: MetadataTarget::Remote { name: "b".into() },
+                expected_old: MetadataValue::Absent,
+                expected_new: MetadataValue::Sequence(1),
+            },
+            MetadataTransition {
+                target: MetadataTarget::Remote { name: "a".into() },
+                expected_old: MetadataValue::Absent,
+                expected_new: MetadataValue::Sequence(1),
+            },
+        ];
+        let mut encoded = encode_operation(&Operation::new(payload).unwrap()).unwrap();
+        let ranges = metadata_transition_ranges(&encoded);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].len(), ranges[1].len());
+        let first = encoded[ranges[0].clone()].to_vec();
+        let second = encoded[ranges[1].clone()].to_vec();
+        encoded[ranges[0].clone()].copy_from_slice(&second);
+        encoded[ranges[1].clone()].copy_from_slice(&first);
+        assert!(decode_operation(&encoded).is_err());
+    }
+
+    #[test]
+    fn metadata_leases_reject_duplicate_targets_and_unchanged_values() {
+        let mut duplicate = v2_payload();
+        duplicate
+            .delta
+            .metadata
+            .push(duplicate.delta.metadata[0].clone());
+        assert!(Operation::new(duplicate).is_err());
+
+        let mut unchanged = v2_payload();
+        unchanged.delta.metadata[0].expected_new = unchanged.delta.metadata[0].expected_old.clone();
+        assert!(Operation::new(unchanged).is_err());
+    }
+
+    #[test]
+    fn appended_kinds_select_v2_and_relation_rules_are_enforced() {
+        for kind in [
+            OperationKind::Restore,
+            OperationKind::Pull,
+            OperationKind::Push,
+        ] {
+            let mut payload = anchor_payload();
+            payload.parents = vec![OperationId::from_bytes([1; 32])];
+            payload.kind = kind;
+            assert_eq!(
+                Operation::new(payload).unwrap().encoding_version(),
+                OPERATION_VERSION_V2
+            );
+        }
+
+        let mut consolidate = anchor_payload();
+        consolidate.parents = vec![OperationId::from_bytes([1; 32])];
+        consolidate.kind = OperationKind::Consolidate;
+        assert!(Operation::new(consolidate.clone()).is_err());
+        consolidate.parents.push(OperationId::from_bytes([2; 32]));
+        assert_eq!(
+            Operation::new(consolidate).unwrap().encoding_version(),
+            OPERATION_VERSION_V2
+        );
+
+        let mut legacy_undo = anchor_payload();
+        legacy_undo.parents = vec![OperationId::from_bytes([1; 32])];
+        legacy_undo.kind = OperationKind::Undo;
+        assert_eq!(
+            Operation::new(legacy_undo).unwrap().encoding_version(),
+            OPERATION_VERSION_V1
+        );
+
+        let mut mismatched = v2_payload();
+        mismatched.kind = OperationKind::Push;
+        assert!(Operation::new(mismatched).is_err());
     }
 
     #[test]
@@ -1336,15 +1786,50 @@ mod tests {
     }
 
     #[test]
-    fn codecs_reject_unknown_versions_truncation_and_trailing_bytes() {
+    fn codecs_reject_unknown_versions_tags_truncation_and_trailing_bytes() {
         let operation = Operation::new(anchor_payload()).unwrap();
         let encoded = encode_operation(&operation).unwrap();
 
-        let mut unknown = encoded.clone();
-        unknown[0] = 2;
-        assert!(decode_operation(&unknown).is_err());
-        assert!(decode_operation(&encoded[..encoded.len() - 1]).is_err());
+        let mut unknown_version = encoded.clone();
+        unknown_version[0] = 3;
+        assert!(decode_operation(&unknown_version).is_err());
 
+        let mut unknown_kind = encoded.clone();
+        unknown_kind[5] = u8::MAX;
+        assert!(decode_operation(&unknown_kind).is_err());
+
+        let v2 = encode_operation(&Operation::new(v2_payload()).unwrap()).unwrap();
+        let relation_tag_offset = {
+            let mut decoder = Decoder::new(&v2).unwrap();
+            let encoding_version = decoder.read_u8().unwrap();
+            let parent_count = decoder.read_count("operation parents").unwrap();
+            for _ in 0..parent_count {
+                decoder.read_operation_id().unwrap();
+            }
+            decoder.read_operation_kind(encoding_version).unwrap();
+            assert!(decoder.read_optional_tag("operation relation").unwrap());
+            decoder.offset
+        };
+        let mut unknown_relation = v2.clone();
+        unknown_relation[relation_tag_offset] = u8::MAX;
+        assert!(decode_operation(&unknown_relation).is_err());
+
+        let first_metadata = metadata_transition_ranges(&v2)[0].clone();
+        let mut unknown_metadata_target = v2.clone();
+        unknown_metadata_target[first_metadata.start] = u8::MAX;
+        assert!(decode_operation(&unknown_metadata_target).is_err());
+
+        let metadata_value_offset = {
+            let mut decoder = Decoder::new(&v2).unwrap();
+            decoder.offset = first_metadata.start;
+            decoder.read_metadata_target().unwrap();
+            decoder.offset
+        };
+        let mut unknown_metadata_value = v2;
+        unknown_metadata_value[metadata_value_offset] = u8::MAX;
+        assert!(decode_operation(&unknown_metadata_value).is_err());
+
+        assert!(decode_operation(&encoded[..encoded.len() - 1]).is_err());
         let mut trailing = encoded;
         trailing.push(0);
         assert!(decode_operation(&trailing).is_err());
@@ -1532,10 +2017,12 @@ mod tests {
         let operation = Operation::new(OperationPayload {
             parents: vec![OperationId::from_bytes([1; 32])],
             kind: OperationKind::SwitchView,
+            relation: None,
             working_copy: Some(working_copy),
             before: before.clone(),
             delta: RepoStateDelta {
                 after: before,
+                metadata: Vec::new(),
                 effects: targets,
             },
             git_observed: vec![GitRefObservation {

@@ -101,6 +101,10 @@ pub use filter::{
     view_membership_at_sequence, view_set_id,
 };
 pub use locks::RepositoryCommonLockGuard;
+pub use operation::{
+    OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
+    OperationVerificationState, PreparedRemoteOperation,
+};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
@@ -403,6 +407,16 @@ default = "{}"
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.ensure_repository_operation_safe_for(&operation_lock)?;
+        if let OperationHeadState::Diverged(heads) =
+            repository.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy_id)
+                    .to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
         repository.recover_incomplete_operation(&operation_lock)?;
         drop(operation_lock);
 
@@ -455,6 +469,16 @@ default = "{}"
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.ensure_repository_operation_safe_for(&operation_lock)?;
+        if let OperationHeadState::Diverged(heads) =
+            repository.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy_id)
+                    .to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
         repository.recover_incomplete_operation(&operation_lock)?;
         drop(operation_lock);
         let (_id, authoritative_view) =
@@ -494,10 +518,28 @@ default = "{}"
     /// let status = repo.status(StatusOptions::default())?;
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
-        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+        Self::open_readonly_mode(path.as_ref(), false)
+    }
+
+    /// Open read-only for operation-log diagnosis without performing recovery.
+    ///
+    /// Unlike [`Self::open_readonly`], this narrow mode permits incomplete or
+    /// multi-head operation state so `atomic op log|show` can explain the fault.
+    /// It never repairs deferred tree alignment or executes operation effects.
+    pub fn open_readonly_for_operation_inspection<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_readonly_mode(path.as_ref(), true)
+    }
+
+    fn open_readonly_mode(
+        path: &Path,
+        operation_inspection: bool,
+    ) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let layout = working_copy::discover_layout(path.as_ref())?;
+        let layout = working_copy::discover_layout(path)?;
         let root = layout.working_root.clone();
         let dot_dir = layout.common_dot_dir.clone();
 
@@ -523,8 +565,10 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        if repository.has_pending_deferred_tree_alignment()
-            || repository.working_copy_operation_requires_recovery(working_copy_id)?
+        if !operation_inspection
+            && (repository.has_pending_deferred_tree_alignment()
+                || repository.working_copy_operation_requires_recovery(working_copy_id)?
+                || repository.repository_operation_requires_recovery()?)
         {
             return Err(RepositoryError::InvalidOperation {
                 message: "repository operation is still completing; retry with a writable repository open"
@@ -629,6 +673,16 @@ default = "{}"
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        repository.ensure_repository_operation_safe_for(&operation_lock)?;
+        if let OperationHeadState::Diverged(heads) =
+            repository.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy_id)
+                    .to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
         repository.recover_incomplete_operation(&operation_lock)?;
         drop(operation_lock);
         let (_id, authoritative_view) =

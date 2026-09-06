@@ -56,9 +56,10 @@ pub use operation::{
     ActorRef, CheckpointKind, DigestKind, EffectPlan, EffectReceipt, EffectReceiptKind,
     EffectReceiptPayload, EffectTarget, EffectValue, FileKind, FileState, GitHashAlgorithm,
     GitHeadState, GitIndexState, GitObjectId, GitRefObservation, GitRefTarget, GitStateRef,
-    Operation, OperationCodecError, OperationHeads, OperationKind, OperationLossNote,
-    OperationPayload, OperationScope, RepoStateDelta, RepoStateRef, VerificationScope,
-    ViewStateRef, WorkingCopyStateRef,
+    MetadataTarget, MetadataTransition, MetadataValue, Operation, OperationCodecError,
+    OperationHeads, OperationKind, OperationLossNote, OperationPayload, OperationRelation,
+    OperationScope, RepoStateDelta, RepoStateRef, VerificationScope, ViewStateRef,
+    WorkingCopyStateRef,
 };
 
 // Re-export change types

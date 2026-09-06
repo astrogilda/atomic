@@ -9,6 +9,9 @@ pub trait OperationTxnT {
     /// Load and verify one content-addressed operation.
     fn get_operation(&self, id: OperationId) -> PristineResult<Option<Operation>>;
 
+    /// List and verify every operation in canonical `OperationId` table order.
+    fn list_operations(&self) -> PristineResult<Vec<Operation>>;
+
     /// Load the canonical sorted head set for one scope.
     fn get_operation_heads(&self, scope: OperationScope) -> PristineResult<OperationHeads>;
 

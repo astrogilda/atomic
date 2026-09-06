@@ -73,6 +73,7 @@ use commands::{
     Log,
     Memory,
     Move,
+    Op,
     ProjectCmd,
     Provenance,
     Pull,
@@ -372,6 +373,9 @@ enum Commands {
     ///
     /// Displays the log of changes inserted into the current view.
     Log(Log),
+
+    /// Inspect the immutable repository operation journal.
+    Op(Op),
 
     /// Show details for a specific change.
     ///
@@ -999,6 +1003,8 @@ fn main() {
         Commands::Revise(revise) => revise.run(),
 
         Commands::Log(log) => log.run(),
+
+        Commands::Op(op) => op.run(),
 
         Commands::Change(change) => change.run(),
 

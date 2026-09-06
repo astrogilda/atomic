@@ -758,35 +758,4 @@ impl Repository {
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
         Ok(())
     }
-
-    pub(super) fn mark_working_copy_materialized(
-        &self,
-        id: WorkingCopyId,
-        view_name: &str,
-    ) -> Result<(), RepositoryError> {
-        self.validate_working_copy(id)?;
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        let view = txn
-            .get_view(view_name)
-            .map_err(|error| RepositoryError::Database(error.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: view_name.to_string(),
-            })?;
-        let mut record = txn
-            .get_working_copy(id)
-            .map_err(|error| RepositoryError::Database(error.to_string()))?
-            .ok_or(RepositoryError::WorkingCopyRecordNotFound { id })?;
-        record.desired_view = view.id;
-        record.desired_state = view.state;
-        record.materialized_state = Some(view.state);
-        record.materialized_manifest = None;
-        txn.put_working_copy(&record)
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        txn.commit()
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        Ok(())
-    }
 }

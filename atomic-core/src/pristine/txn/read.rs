@@ -590,6 +590,22 @@ impl OperationTxnT for ReadTxn {
         }
     }
 
+    fn list_operations(&self) -> PristineResult<Vec<Operation>> {
+        let table = match self.txn.open_table(OPERATIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut operations = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            operations.push(decode_operation_row(key.value(), value.value())?);
+        }
+        Ok(operations)
+    }
+
     fn get_operation_heads(&self, scope: OperationScope) -> PristineResult<OperationHeads> {
         let table = match self.txn.open_table(OP_HEADS) {
             Ok(table) => table,

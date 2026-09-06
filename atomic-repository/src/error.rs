@@ -144,6 +144,41 @@ pub enum RepositoryError {
     #[error("Change not found: {hash}")]
     ChangeNotFound { hash: String },
 
+    /// Operation not found by full identity or prefix.
+    #[error("Operation not found: {selector}")]
+    OperationNotFound { selector: String },
+
+    /// Ambiguous operation identity prefix.
+    #[error("Ambiguous operation prefix '{prefix}': matches {}", matches.join(", "))]
+    AmbiguousOperation {
+        prefix: String,
+        matches: Vec<String>,
+    },
+
+    /// An operation selector is malformed or too short to resolve safely.
+    #[error("Invalid operation selector '{selector}': {reason}")]
+    InvalidOperationSelector { selector: String, reason: String },
+
+    /// Concurrent operation heads cannot be consolidated without inventing state.
+    #[error("Operation scope '{scope}' is Diverged: {}", heads.join(", "))]
+    OperationHeadsDiverged { scope: String, heads: Vec<String> },
+
+    /// The selected operation has not completed verification.
+    #[error("Operation {operation} is not verified")]
+    OperationNotVerified { operation: String },
+
+    /// The selected operation is outside the current scope's reachable history.
+    #[error("Operation {operation} is not reachable from scope '{scope}'")]
+    OperationNotReachable { operation: String, scope: String },
+
+    /// The selected operation cannot be inverted by the current implementation.
+    #[error("Operation {operation} ({kind}) is not reversible: {reason}")]
+    OperationNotReversible {
+        operation: String,
+        kind: String,
+        reason: String,
+    },
+
     /// Ambiguous hash prefix (multiple matches)
     #[error("Ambiguous hash prefix '{prefix}': matches {}", matches.join(", "))]
     AmbiguousHash {

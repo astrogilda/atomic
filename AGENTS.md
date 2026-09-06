@@ -394,6 +394,15 @@ and execution phase. `OP_HEADS` stores a sorted multi-head set per repository or
 working-copy scope and changes only through compare-and-set. `EFFECT_RECEIPTS`
 appends immutable, content-addressed outcomes keyed by operation and receipt ID.
 
+Operation payload V1 remains byte-for-byte hash-authoritative. V2 adds typed
+`OperationRelation::{Undo, Restore}` links and canonical `MetadataTransition`
+leases for view membership, tags, views, and remotes. Metadata operations advance
+the initiating working-copy head and the shared repository head in one immediate
+transaction, so linked worktrees have distinct local chains but one causal order for
+global mutations. Compatible verified heads consolidate under a deterministic
+multi-parent `Consolidate` operation; incompatible resource writes remain a sorted
+multi-head set surfaced as `Diverged`, with no invented after-state.
+
 Each `EffectPlan` has a stable ordinal, typed target, `expected_old`, and
 `expected_new`. A resource is mutated only when its observation equals one of
 those leases:
@@ -412,7 +421,24 @@ Worktree directory staging and rollback tombstones use the working-copy-local
 `.atomic/operation-recovery/<operation-id>/` so linked worktrees remain safe even
 when the common Atomic directory is on another filesystem.
 Writable repository open performs the same idempotent recovery before accepting a
-new operation.
+new operation. Every writable constructor and ordinary read-only open also gates
+incomplete shared repository heads; only the dedicated operation-inspection open
+may examine incomplete or divergent state without recovery.
+
+`atomic op log|show` exposes deterministic DAG history, payloads, metadata/effect
+leases, receipts, verification, and head scopes in human or JSON form.
+`atomic op undo [<id>]` and `atomic op restore <id>` append relation-bearing inverse
+or replay operations. Switch undo restores view, shelves, and materialized bytes;
+record undo removes only the view reference and retains working bytes and the
+content-addressed change. Historical restore reconstructs shift-aware membership,
+verifies the exact view Merkle, and re-materializes selected content.
+
+Native switch, record, insert, unrecord, tag, pull-fetch, push, and materialize paths
+now emit operations. Direct materialization renders a plan before mutation, leases
+each filesystem transition, preserves existing modes, filters absent-path modes by
+the active umask, and uses the same receipted executor as switch. Push retains the
+ordered operation locks from prepared intent through remote CAS verification; pull
+records the verified fetched pack before its journaled local child operations.
 
 Operation resources are nonblocking cross-process locks acquired only in this
 order:
@@ -430,8 +456,10 @@ namespace.
 
 Relevant code: `atomic-core/src/operation/`,
 `atomic-core/src/pristine/traits/operation.rs`,
-`atomic-repository/src/repository/operation.rs`, and
-`atomic-repository/src/repository/locks.rs`.
+`atomic-repository/src/repository/operation.rs`,
+`atomic-repository/src/repository/materialize.rs`,
+`atomic-repository/src/repository/locks.rs`, and
+`atomic-cli/src/commands/op/`.
 
 ### Workspace Shelving
 

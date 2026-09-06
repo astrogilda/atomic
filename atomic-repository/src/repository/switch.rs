@@ -2,7 +2,7 @@ use super::*;
 
 use atomic_core::operation::{
     ActorRef, EffectPlan, EffectReceiptKind, EffectTarget, EffectValue, FileKind, FileState,
-    Operation, RepoStateRef, ViewStateRef,
+    Operation, OperationKind, OperationRelation, OperationScope, RepoStateRef, ViewStateRef,
 };
 use atomic_core::pristine::OperationTxnT;
 
@@ -117,13 +117,25 @@ fn default_directory_mode() -> u32 {
     0o666
 }
 
-struct SwitchMaterializationExecutor<'a> {
+pub(super) struct SwitchMaterializationExecutor<'a> {
     repository: &'a Repository,
     operation_lock: &'a super::locks::WorkingCopyOperationLockGuard,
     operation: Operation,
 }
 
-impl SwitchMaterializationExecutor<'_> {
+impl<'a> SwitchMaterializationExecutor<'a> {
+    pub(super) fn new(
+        repository: &'a Repository,
+        operation_lock: &'a super::locks::WorkingCopyOperationLockGuard,
+        operation: Operation,
+    ) -> Self {
+        Self {
+            repository,
+            operation_lock,
+            operation,
+        }
+    }
+
     fn effect_for_expected_new(
         &self,
         path: &str,
@@ -213,7 +225,22 @@ impl SwitchMaterializationExecutor<'_> {
         )
     }
 
-    fn complete_remaining(&mut self, target_view: &str) -> Result<(), RepositoryError> {
+    pub(super) fn complete_preparatory(
+        &mut self,
+        target_view: &str,
+    ) -> Result<(), RepositoryError> {
+        self.complete_effects(target_view, true)
+    }
+
+    pub(super) fn complete_remaining(&mut self, target_view: &str) -> Result<(), RepositoryError> {
+        self.complete_effects(target_view, false)
+    }
+
+    fn complete_effects(
+        &mut self,
+        target_view: &str,
+        preparatory_only: bool,
+    ) -> Result<(), RepositoryError> {
         let completed: HashSet<u32> = {
             let txn = self
                 .repository
@@ -240,8 +267,15 @@ impl SwitchMaterializationExecutor<'_> {
             .filter(|effect| matches!(effect.target, EffectTarget::FilesystemPath { .. }))
             .cloned()
             .collect();
-        for effect in effects {
+        for effect in &effects {
             if completed.contains(&effect.ordinal) {
+                continue;
+            }
+            if preparatory_only
+                && !effects
+                    .iter()
+                    .any(|later| later.ordinal > effect.ordinal && later.target == effect.target)
+            {
                 continue;
             }
             let EffectTarget::FilesystemPath { path } = &effect.target else {
@@ -401,11 +435,58 @@ impl Repository {
         working_copy: WorkingCopyId,
         view: &str,
     ) -> Result<MaterializeResult, RepositoryError> {
+        self.switch_view_with_operation(
+            working_copy,
+            view,
+            OperationKind::SwitchView,
+            None,
+            ActorRef::System {
+                name: "repository-switch".to_string(),
+            },
+            None,
+        )
+    }
+
+    pub(super) fn switch_view_with_operation(
+        &mut self,
+        working_copy: WorkingCopyId,
+        view: &str,
+        kind: OperationKind,
+        relation: Option<OperationRelation>,
+        actor: ActorRef,
+        expected_head: Option<atomic_core::OperationId>,
+    ) -> Result<MaterializeResult, RepositoryError> {
         let operation_lock = self.try_lock_operation(working_copy)?;
         self.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        if let super::operation::OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
         self.recover_incomplete_operation(&operation_lock)?;
+        if let Some(expected_head) = expected_head {
+            let actual_head =
+                self.sole_operation_head(OperationScope::WorkingCopy(working_copy))?;
+            if actual_head != expected_head {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation head changed before inverse switch: expected {expected_head}, found {actual_head}"
+                    ),
+                });
+            }
+        }
 
-        match self.switch_view_journaled(&operation_lock, working_copy, view) {
+        match self.switch_view_journaled(
+            &operation_lock,
+            working_copy,
+            view,
+            kind,
+            relation,
+            actor,
+        ) {
             Ok(result) => Ok(result),
             Err(operation_error) => match self.recover_incomplete_operation(&operation_lock) {
                 Ok(_) => Err(operation_error),
@@ -423,6 +504,9 @@ impl Repository {
         operation_lock: &super::locks::WorkingCopyOperationLockGuard,
         working_copy: WorkingCopyId,
         view: &str,
+        kind: OperationKind,
+        relation: Option<OperationRelation>,
+        actor: ActorRef,
     ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         let old_view_name = self.desired_view_name(working_copy)?;
@@ -804,14 +888,14 @@ impl Repository {
             expected_new: EffectValue::WorkingCopy(target_materialized.clone()),
         });
 
-        let prepared = self.prepare_switch_operation(
+        let prepared = self.prepare_working_copy_transition(
             operation_lock,
+            kind,
+            relation,
             before_state,
             after_state,
             effects,
-            ActorRef::System {
-                name: "repository-switch".to_string(),
-            },
+            actor,
             operation_timestamp_ms(),
         )?;
         let operation_id = prepared.operation().id();
@@ -863,11 +947,8 @@ impl Repository {
             }
         }
 
-        let mut filesystem_executor = SwitchMaterializationExecutor {
-            repository: self,
-            operation_lock,
-            operation: prepared.operation().clone(),
-        };
+        let mut filesystem_executor =
+            SwitchMaterializationExecutor::new(self, operation_lock, prepared.operation().clone());
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
         //

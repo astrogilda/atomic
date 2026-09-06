@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 
 use super::*;
+use atomic_core::operation::{
+    ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind, OperationScope,
+    RepoStateRef, ViewStateRef,
+};
 
 impl Repository {
     // History Methods
@@ -269,37 +273,140 @@ impl Repository {
         hash: &Hash,
         options: UnrecordOptions,
     ) -> Result<UnrecordOutcome, RepositoryError> {
-        // Get write transaction
-        let mut txn = self
+        let view_name = options
+            .view
+            .as_deref()
+            .unwrap_or(&self.current_view)
+            .to_string();
+        if options.dry_run {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let view = txn
+                .get_view(&view_name)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view_name.clone(),
+                })?;
+            return crate::unrecord::preview_unrecord(&txn, &view, &[*hash], &options)
+                .map_err(|error| RepositoryError::Unrecord(error.to_string()));
+        }
+        let working_copy = self.require_working_copy_id()?;
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let preflight_txn = self
             .pristine
-            .write_txn()
+            .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Determine which view to use
-        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
-
-        // Get the view
-        let mut view = txn
-            .open_or_create_view(view_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get internal ID
-        let change_id = txn
+        let view = preflight_txn
+            .get_view(&view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.clone(),
+            })?;
+        let change_id = preflight_txn
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ChangeNotFound {
                 hash: hash.to_base32(),
             })?;
 
-        // Check if this is a dry run
-        if options.dry_run {
-            // Preview mode - just return what would happen
-            let preview = crate::unrecord::preview_unrecord(&txn, &view, &[*hash], &options)
-                .map_err(|e| RepositoryError::Unrecord(e.to_string()))?;
-            return Ok(preview);
+        let original_seq = preflight_txn
+            .get_change_seq(&view, change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Unrecord(format!(
+                    "Change {} is not in view '{}'",
+                    hash.to_base32(),
+                    view_name
+                ))
+            })?;
+        let mut after_view_state = Merkle::ZERO;
+        for row in preflight_txn
+            .iter_changes(&view, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let (_, candidate, _) = row.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if candidate == change_id {
+                continue;
+            }
+            let candidate_hash = preflight_txn
+                .get_external(candidate)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: candidate.to_string(),
+                })?;
+            after_view_state = after_view_state.next(&candidate_hash);
         }
+        let before_view_state = view.state;
+        drop(preflight_txn);
 
-        // Remove the change from the view
+        let before_record = self.working_copy_record(working_copy)?;
+        let mut after_record = before_record.clone();
+        if before_record.desired_view == view.id {
+            after_record.desired_state = after_view_state;
+        }
+        let operation = self.prepare_metadata_operation(
+            &operation_lock,
+            OperationKind::Unrecord,
+            None,
+            RepoStateRef {
+                view: Some(ViewStateRef {
+                    name: view_name.clone(),
+                    state: before_view_state,
+                    set_id: None,
+                }),
+                working_copy: Some(super::operation::working_copy_state_ref(before_record)),
+                git: None,
+            },
+            RepoStateRef {
+                view: Some(ViewStateRef {
+                    name: view_name.clone(),
+                    state: after_view_state,
+                    set_id: None,
+                }),
+                working_copy: Some(super::operation::working_copy_state_ref(after_record)),
+                git: None,
+            },
+            vec![MetadataTransition {
+                target: MetadataTarget::ViewChange {
+                    view: view_name.clone(),
+                    change: *hash,
+                },
+                expected_old: MetadataValue::Sequence(original_seq),
+                expected_new: MetadataValue::Absent,
+            }],
+            vec![*hash],
+            ActorRef::System {
+                name: "repository-unrecord".to_string(),
+            },
+            super::operation::current_operation_timestamp_ms(),
+        )?;
+
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut view = txn
+            .get_view(&view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.clone(),
+            })?;
+        let change_id = txn
+            .get_internal(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: hash.to_base32(),
+            })?;
         let original_seq = txn
             .del_change(&mut view, change_id, hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -317,7 +424,7 @@ impl Repository {
         // must restore its exact graph-backed source path and stable inode.
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, view_name)?;
+        let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, &view_name)?;
 
         // Commit the transaction
         txn.commit()
@@ -346,6 +453,9 @@ impl Repository {
             }
             let _ = idx_txn.commit();
         }
+
+        self.apply_operation_metadata_locked(&operation_lock, operation.id())?;
+        self.finalize_operation_verified(&operation_lock, operation.id())?;
 
         // Build outcome
         let mut outcome = UnrecordOutcome::new(vec![*hash], view.state, view.change_count);

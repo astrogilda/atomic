@@ -62,6 +62,22 @@ impl OperationTxnT for WriteTxn<'_> {
         result
     }
 
+    fn list_operations(&self) -> PristineResult<Vec<Operation>> {
+        let table = match self.txn.open_table(OPERATIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut operations = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            operations.push(decode_operation_row(key.value(), value.value())?);
+        }
+        Ok(operations)
+    }
+
     fn get_operation_heads(&self, scope: OperationScope) -> PristineResult<OperationHeads> {
         let table = match self.txn.open_table(OP_HEADS) {
             Ok(table) => table,
@@ -329,13 +345,19 @@ mod tests {
     use crate::types::Hash;
 
     fn anchor() -> Operation {
+        anchor_at(1)
+    }
+
+    fn anchor_at(timestamp_ms: i64) -> Operation {
         Operation::new(OperationPayload {
             parents: Vec::new(),
             kind: OperationKind::Anchor,
+            relation: None,
             working_copy: None,
             before: RepoStateRef::EMPTY,
             delta: RepoStateDelta {
                 after: RepoStateRef::EMPTY,
+                metadata: Vec::new(),
                 effects: Vec::new(),
             },
             git_observed: Vec::new(),
@@ -343,7 +365,7 @@ mod tests {
             actor: ActorRef::System {
                 name: "test".into(),
             },
-            timestamp_ms: 1,
+            timestamp_ms,
             lossy: Vec::new(),
         })
         .unwrap()
@@ -353,10 +375,12 @@ mod tests {
         Operation::new(OperationPayload {
             parents: vec![parent],
             kind: OperationKind::Materialize,
+            relation: None,
             working_copy: None,
             before: RepoStateRef::EMPTY,
             delta: RepoStateDelta {
                 after: RepoStateRef::EMPTY,
+                metadata: Vec::new(),
                 effects: vec![EffectPlan {
                     ordinal: 0,
                     target: EffectTarget::FilesystemPath {
@@ -388,6 +412,31 @@ mod tests {
             timestamp_ms: 3,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn operations_list_in_id_order_and_survive_readonly_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pristine");
+        let mut inserted = vec![anchor_at(1), anchor_at(2), anchor_at(3)];
+        inserted.sort_by_key(Operation::id);
+        inserted.reverse();
+        let mut expected = inserted.clone();
+        expected.sort_by_key(Operation::id);
+
+        {
+            let pristine = Pristine::open(&path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            for operation in &inserted {
+                txn.put_operation(operation).unwrap();
+            }
+            assert_eq!(txn.list_operations().unwrap(), expected);
+            txn.commit().unwrap();
+        }
+
+        let pristine = Pristine::open_readonly(&path).unwrap();
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(txn.list_operations().unwrap(), expected);
     }
 
     #[test]
@@ -521,6 +570,10 @@ mod tests {
         }
         assert!(matches!(
             txn.get_operation(wrong),
+            Err(PristineError::Inconsistent { .. })
+        ));
+        assert!(matches!(
+            txn.list_operations(),
             Err(PristineError::Inconsistent { .. })
         ));
 

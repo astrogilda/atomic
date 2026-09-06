@@ -33,6 +33,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use clap::Parser;
 
+use atomic_core::operation::OperationKind;
 use atomic_core::types::{Base32, Hash, Merkle, SetId};
 use atomic_objects::{ObjectFamily, SyncPack, SyncWants, ViewSnapshot};
 use atomic_remote::{ChangelistEntry, HttpRemote, HttpRemoteConfig, StateResponse};
@@ -657,6 +658,23 @@ impl Pull {
         if self.dry_run {
             return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_download);
         }
+
+        let evidence = pull_pack
+            .encode()
+            .map(|bytes| Hash::of(&bytes))
+            .map_err(|error| {
+                CliError::Internal(anyhow::anyhow!(
+                    "failed to encode verified pull evidence: {}",
+                    error
+                ))
+            })?;
+        repo.append_verified_remote_operation(
+            working_copy,
+            OperationKind::Pull,
+            &remote_name,
+            evidence,
+        )
+        .map_err(CliError::Repository)?;
 
         // Save missing graph nodes first. Even when none are missing, continue:
         // remote view metadata may still add closures around nodes already in

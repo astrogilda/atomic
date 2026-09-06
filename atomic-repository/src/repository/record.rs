@@ -1,5 +1,9 @@
 use super::*;
 use crate::apply::InsertOptions;
+use atomic_core::operation::{
+    ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind, RepoStateRef,
+    ViewStateRef,
+};
 use atomic_core::pristine::{
     CachedGraphTxn, GraphTxnT, GraphVisibilityClosure, PathClaimId, ViewGraph, ViewMembershipSet,
 };
@@ -1069,6 +1073,99 @@ impl Repository {
             outcome.add_error(path, error);
         }
 
+        let operation_context = if options.get_save_to_store() && options.get_apply_after_record() {
+            let operation_lock = self
+                .try_lock_operation(working_copy)
+                .map_err(RecordError::Repository)?;
+            if let OperationHeadState::Diverged(heads) = self
+                .consolidate_operation_heads_locked(&operation_lock)
+                .map_err(RecordError::Repository)?
+            {
+                return Err(RecordError::Repository(
+                    RepositoryError::OperationHeadsDiverged {
+                        scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy)
+                            .to_string(),
+                        heads: heads.iter().map(ToString::to_string).collect(),
+                    },
+                ));
+            }
+            let (before_state, after_state, sequence) = {
+                let txn = self.pristine.read_txn().map_err(|error| {
+                    RecordError::Repository(RepositoryError::Database(error.to_string()))
+                })?;
+                let view = txn
+                    .get_view(&effective_view)
+                    .map_err(|error| {
+                        RecordError::Repository(RepositoryError::Database(error.to_string()))
+                    })?
+                    .ok_or_else(|| {
+                        RecordError::Repository(RepositoryError::ViewNotFound {
+                            name: effective_view.clone(),
+                        })
+                    })?;
+                let before_record = txn
+                    .get_working_copy(working_copy)
+                    .map_err(|error| {
+                        RecordError::Repository(RepositoryError::Database(error.to_string()))
+                    })?
+                    .ok_or_else(|| {
+                        RecordError::Repository(RepositoryError::WorkingCopyRecordNotFound {
+                            id: working_copy,
+                        })
+                    })?;
+                let sequence = view.change_count;
+                let after_view_state = view.state.next(&computed_hash);
+                let mut after_record = before_record.clone();
+                after_record.desired_state = after_view_state;
+                (
+                    RepoStateRef {
+                        view: Some(ViewStateRef {
+                            name: effective_view.clone(),
+                            state: view.state,
+                            set_id: None,
+                        }),
+                        working_copy: Some(super::operation::working_copy_state_ref(before_record)),
+                        git: None,
+                    },
+                    RepoStateRef {
+                        view: Some(ViewStateRef {
+                            name: effective_view.clone(),
+                            state: after_view_state,
+                            set_id: None,
+                        }),
+                        working_copy: Some(super::operation::working_copy_state_ref(after_record)),
+                        git: None,
+                    },
+                    sequence,
+                )
+            };
+            let operation = self
+                .prepare_metadata_operation(
+                    &operation_lock,
+                    OperationKind::Record,
+                    None,
+                    before_state,
+                    after_state,
+                    vec![MetadataTransition {
+                        target: MetadataTarget::ViewChange {
+                            view: effective_view.clone(),
+                            change: computed_hash,
+                        },
+                        expected_old: MetadataValue::Absent,
+                        expected_new: MetadataValue::Sequence(sequence),
+                    }],
+                    vec![computed_hash],
+                    ActorRef::System {
+                        name: "repository-record".to_string(),
+                    },
+                    super::operation::current_operation_timestamp_ms(),
+                )
+                .map_err(RecordError::Repository)?;
+            Some((operation_lock, operation))
+        } else {
+            None
+        };
+
         // Save to store if requested.
         // Use the original V3 bytes (not re-serialized) to ensure the hash
         // on disk matches the hash registered in the pristine graph.
@@ -1212,6 +1309,16 @@ impl Repository {
                     "[record] write_recorded (apply): {:.1}ms",
                     apply_t0.elapsed().as_secs_f64() * 1000.0,
                 );
+            }
+        }
+
+        if let Some((operation_lock, operation)) = operation_context {
+            if outcome.was_applied() {
+                self.finalize_operation_verified(&operation_lock, operation.id())
+                    .map_err(RecordError::Repository)?;
+            } else {
+                self.abort_prepared_metadata_operation(&operation_lock, &operation)
+                    .map_err(RecordError::Repository)?;
             }
         }
 

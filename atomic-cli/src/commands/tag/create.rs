@@ -183,15 +183,12 @@ impl Command for Create {
             other => CliError::Repository(other),
         })?;
 
-        // Check for existing tag — fail unless --force
-        if let Ok(Some(_)) = repo.get_tag(name) {
-            if self.force {
-                let _ = repo.delete_tag(name);
-            } else {
-                return Err(CliError::InvalidArgument {
-                    message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
-                });
-            }
+        // Check for an existing tag. Forced replacement is performed by one
+        // leased repository transition rather than a delete/create pair.
+        if !self.force && repo.get_tag(name).map_err(CliError::Repository)?.is_some() {
+            return Err(CliError::InvalidArgument {
+                message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
+            });
         }
 
         // Create the tag

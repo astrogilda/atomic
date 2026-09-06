@@ -14,7 +14,8 @@ use crate::types::{EffectReceiptId, Hash, Merkle, OperationId, SetId, WorkingCop
 pub use codec::{
     decode_effect_receipt, decode_operation, decode_operation_heads, decode_operation_scope,
     encode_effect_receipt, encode_operation, encode_operation_heads, encode_operation_scope,
-    EFFECT_RECEIPT_VERSION, OPERATION_HEADS_VERSION, OPERATION_VERSION,
+    EFFECT_RECEIPT_VERSION, OPERATION_HEADS_VERSION, OPERATION_VERSION, OPERATION_VERSION_V1,
+    OPERATION_VERSION_V2,
 };
 
 /// Maximum canonical object size accepted by the operation codec.
@@ -72,6 +73,26 @@ pub enum OperationKind {
     Recover,
     Undo,
     Gc,
+    Restore,
+    Pull,
+    Push,
+    Consolidate,
+}
+
+impl OperationKind {
+    fn requires_v2(self) -> bool {
+        matches!(
+            self,
+            Self::Restore | Self::Pull | Self::Push | Self::Consolidate
+        )
+    }
+}
+
+/// Optional semantic relationship between an operation and an earlier operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OperationRelation {
+    Undo { target: OperationId },
+    Restore { target: OperationId },
 }
 
 /// Scope whose mutable head set points at immutable operations.
@@ -132,6 +153,7 @@ impl OperationHeads {
 pub struct OperationPayload {
     pub parents: Vec<OperationId>,
     pub kind: OperationKind,
+    pub relation: Option<OperationRelation>,
     pub working_copy: Option<WorkingCopyId>,
     pub before: RepoStateRef,
     pub delta: RepoStateDelta,
@@ -189,15 +211,62 @@ impl OperationPayload {
             }
         }
         self.delta.validate_canonical()?;
+        match (self.relation, self.kind) {
+            (Some(OperationRelation::Undo { .. }), OperationKind::Undo)
+            | (Some(OperationRelation::Restore { .. }), OperationKind::Restore)
+            | (None, _) => {}
+            (Some(OperationRelation::Undo { .. }), kind) => {
+                return Err(OperationCodecError::new(format!(
+                    "undo relation is not valid for {kind:?} operations"
+                )));
+            }
+            (Some(OperationRelation::Restore { .. }), kind) => {
+                return Err(OperationCodecError::new(format!(
+                    "restore relation is not valid for {kind:?} operations"
+                )));
+            }
+        }
         match self.kind {
             OperationKind::Anchor if !self.parents.is_empty() => Err(OperationCodecError::new(
                 "anchor operations cannot have parents",
             )),
             OperationKind::Anchor => Ok(()),
+            OperationKind::Consolidate if self.parents.len() < 2 => Err(OperationCodecError::new(
+                "consolidate operations require at least two parents",
+            )),
             _ if self.parents.is_empty() => Err(OperationCodecError::new(
                 "non-anchor operations require at least one parent",
             )),
             _ => Ok(()),
+        }
+    }
+
+    fn selected_encoding_version(&self) -> u8 {
+        if self.kind.requires_v2() || self.relation.is_some() || !self.delta.metadata.is_empty() {
+            OPERATION_VERSION_V2
+        } else {
+            OPERATION_VERSION_V1
+        }
+    }
+
+    pub(crate) fn validate_encoding_version(
+        &self,
+        encoding_version: u8,
+    ) -> Result<(), OperationCodecError> {
+        match encoding_version {
+            OPERATION_VERSION_V1
+                if self.kind.requires_v2()
+                    || self.relation.is_some()
+                    || !self.delta.metadata.is_empty() =>
+            {
+                Err(OperationCodecError::new(
+                    "operation payload requires canonical encoding version 2",
+                ))
+            }
+            OPERATION_VERSION_V1 | OPERATION_VERSION_V2 => Ok(()),
+            version => Err(OperationCodecError::new(format!(
+                "unsupported operation version {version} (maximum supported version {OPERATION_VERSION})"
+            ))),
         }
     }
 }
@@ -207,33 +276,50 @@ impl OperationPayload {
 pub struct Operation {
     id: OperationId,
     payload: OperationPayload,
+    encoding_version: u8,
 }
 
 impl Operation {
     /// Canonicalize an immutable payload and derive its content address.
     pub fn new(mut payload: OperationPayload) -> Result<Self, OperationCodecError> {
         payload.canonicalize()?;
-        let bytes = codec::encode_operation_payload(&payload)?;
+        let encoding_version = payload.selected_encoding_version();
+        let bytes = codec::encode_operation_payload(&payload, encoding_version)?;
         let id = OperationId::from_canonical_bytes(&bytes);
         if payload.parents.binary_search(&id).is_ok() {
             return Err(OperationCodecError::new(
                 "an operation cannot name itself as a parent",
             ));
         }
-        Ok(Self { id, payload })
+        Ok(Self {
+            id,
+            payload,
+            encoding_version,
+        })
     }
 
     pub(crate) fn from_canonical_payload(
         id: OperationId,
         payload: OperationPayload,
+        encoding_version: u8,
     ) -> Result<Self, OperationCodecError> {
         payload.validate_canonical()?;
+        payload.validate_encoding_version(encoding_version)?;
         if payload.parents.binary_search(&id).is_ok() {
             return Err(OperationCodecError::new(
                 "an operation cannot name itself as a parent",
             ));
         }
-        Ok(Self { id, payload })
+        Ok(Self {
+            id,
+            payload,
+            encoding_version,
+        })
+    }
+
+    /// Canonical payload encoding version retained by this operation.
+    pub fn encoding_version(&self) -> u8 {
+        self.encoding_version
     }
 
     /// Content address of the immutable payload.
@@ -275,16 +361,45 @@ impl RepoStateRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoStateDelta {
     pub after: RepoStateRef,
+    pub metadata: Vec<MetadataTransition>,
     pub effects: Vec<EffectPlan>,
 }
 
 impl RepoStateDelta {
     fn canonicalize(&mut self) -> Result<(), OperationCodecError> {
+        self.metadata
+            .sort_by(|left, right| left.target.cmp(&right.target));
+        if self
+            .metadata
+            .windows(2)
+            .any(|pair| pair[0].target == pair[1].target)
+        {
+            return Err(OperationCodecError::new(
+                "metadata transitions contain duplicate targets",
+            ));
+        }
         self.effects.sort_by_key(|effect| effect.ordinal);
         self.validate_canonical()
     }
 
     fn validate_canonical(&self) -> Result<(), OperationCodecError> {
+        if self
+            .metadata
+            .windows(2)
+            .any(|pair| pair[0].target >= pair[1].target)
+        {
+            return Err(OperationCodecError::new(
+                "metadata transitions must be strictly sorted by target and unique",
+            ));
+        }
+        for transition in &self.metadata {
+            if transition.expected_old == transition.expected_new {
+                return Err(OperationCodecError::new(format!(
+                    "metadata transition {:?} has identical expected-old and expected-new values",
+                    transition.target
+                )));
+            }
+        }
         for (expected, effect) in self.effects.iter().enumerate() {
             let expected = u32::try_from(expected)
                 .map_err(|_| OperationCodecError::new("too many operation effects"))?;
@@ -303,6 +418,32 @@ impl RepoStateDelta {
         }
         Ok(())
     }
+}
+
+/// Canonically ordered repository metadata addressed by a transition lease.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MetadataTarget {
+    ViewChange { view: String, change: Hash },
+    View { name: String },
+    Tag { view: String, name: String },
+    Remote { name: String },
+}
+
+/// Typed expected value for a repository metadata transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataValue {
+    Absent,
+    Sequence(u64),
+    Digest(Hash),
+    Bytes(Vec<u8>),
+}
+
+/// One expected-old/new lease over a canonical repository metadata target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataTransition {
+    pub target: MetadataTarget,
+    pub expected_old: MetadataValue,
+    pub expected_new: MetadataValue,
 }
 
 /// Stable view identity carried by an operation without repository-local pointers.

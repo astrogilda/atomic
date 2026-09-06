@@ -1,4 +1,8 @@
 use super::*;
+use atomic_core::operation::{
+    ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind, OperationScope,
+    RepoStateRef, ViewStateRef,
+};
 
 fn validate_import_deleted_paths(
     change: &Change,
@@ -1711,6 +1715,98 @@ impl Repository {
 
         // Load the change from the store
         let change = self.load_change(hash)?;
+        let view_name = options
+            .view
+            .as_deref()
+            .unwrap_or(&self.current_view)
+            .to_string();
+        let operation_context = if let Some(working_copy) = self.working_copy_id() {
+            let operation_lock = self.try_lock_operation(working_copy)?;
+            if let OperationHeadState::Diverged(heads) =
+                self.consolidate_operation_heads_locked(&operation_lock)?
+            {
+                return Err(RepositoryError::OperationHeadsDiverged {
+                    scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                    heads: heads.iter().map(ToString::to_string).collect(),
+                });
+            }
+            let (before_state, after_state, sequence) = {
+                let txn = self
+                    .pristine
+                    .read_txn()
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                let view = txn
+                    .get_view(&view_name)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: view_name.clone(),
+                    })?;
+                if let Some(change_id) = txn
+                    .get_internal(hash)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                {
+                    if txn
+                        .get_change_seq(&view, change_id)
+                        .map_err(|error| RepositoryError::Database(error.to_string()))?
+                        .is_some()
+                    {
+                        return Err(RepositoryError::ChangeAlreadyApplied {
+                            hash: hash.to_base32(),
+                        });
+                    }
+                }
+                let before_record = self.working_copy_record(working_copy)?;
+                let mut after_record = before_record.clone();
+                let after_view_state = view.state.next(hash);
+                if before_record.desired_view == view.id {
+                    after_record.desired_state = after_view_state;
+                }
+                (
+                    RepoStateRef {
+                        view: Some(ViewStateRef {
+                            name: view_name.clone(),
+                            state: view.state,
+                            set_id: None,
+                        }),
+                        working_copy: Some(super::operation::working_copy_state_ref(before_record)),
+                        git: None,
+                    },
+                    RepoStateRef {
+                        view: Some(ViewStateRef {
+                            name: view_name.clone(),
+                            state: after_view_state,
+                            set_id: None,
+                        }),
+                        working_copy: Some(super::operation::working_copy_state_ref(after_record)),
+                        git: None,
+                    },
+                    view.change_count,
+                )
+            };
+            let operation = self.prepare_metadata_operation(
+                &operation_lock,
+                OperationKind::Insert,
+                None,
+                before_state,
+                after_state,
+                vec![MetadataTransition {
+                    target: MetadataTarget::ViewChange {
+                        view: view_name.clone(),
+                        change: *hash,
+                    },
+                    expected_old: MetadataValue::Absent,
+                    expected_new: MetadataValue::Sequence(sequence),
+                }],
+                vec![*hash],
+                ActorRef::System {
+                    name: "repository-insert".to_string(),
+                },
+                super::operation::current_operation_timestamp_ms(),
+            )?;
+            Some((operation_lock, operation))
+        } else {
+            None
+        };
 
         if trace_insert {
             eprintln!(
@@ -1785,7 +1881,6 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use
-        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let preserve_existing_tree_paths = view_name != self.current_view;
         log::debug!(
             "insert_change: change_id={:?} view={} already_in_graph={} hunks={}",
@@ -1808,7 +1903,7 @@ impl Repository {
         let t_graph = std::time::Instant::now();
         let outcome = write_change_to_graph(
             &mut txn,
-            view_name,
+            &view_name,
             change_id,
             hash,
             &change,
@@ -1829,7 +1924,7 @@ impl Repository {
         let _affected_tree_paths = self.apply_tree_projection(
             &mut txn,
             &tree_projection,
-            view_name,
+            &view_name,
             preserve_existing_tree_paths,
         )?;
 
@@ -1854,6 +1949,11 @@ impl Repository {
             );
         } else {
             log::debug!("insert_change: txn.commit() took {}ms", commit_ms);
+        }
+
+        if let Some((operation_lock, operation)) = operation_context {
+            self.apply_operation_metadata_locked(&operation_lock, operation.id())?;
+            self.finalize_operation_verified(&operation_lock, operation.id())?;
         }
 
         if trace_insert {

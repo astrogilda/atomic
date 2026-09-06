@@ -151,10 +151,12 @@ fn deterministic_receipts_reuse_identity_and_verified_is_detected() {
     let operation = Operation::new(OperationPayload {
         parents: vec![OperationId::from_bytes([7; 32])],
         kind: OperationKind::SwitchView,
+        relation: None,
         working_copy: None,
         before: RepoStateRef::EMPTY,
         delta: RepoStateDelta {
             after: RepoStateRef::EMPTY,
+            metadata: Vec::new(),
             effects: vec![EffectPlan {
                 ordinal: 0,
                 target: EffectTarget::FilesystemPath {

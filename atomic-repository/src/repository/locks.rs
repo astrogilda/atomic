@@ -37,6 +37,12 @@ pub(super) struct WorkingCopyOperationLockGuard {
     working_copy: WorkingCopyId,
 }
 
+/// A pristine write transaction entered through the common operation lock.
+pub(super) struct CommonPristineWriteTxn<'a> {
+    txn: WriteTxn<'a>,
+    _common: &'a RepositoryCommonLockGuard,
+}
+
 /// A pristine write transaction entered through the ordered operation locks.
 ///
 /// Final shelf and deferred-tree locks are only constructible by consuming this
@@ -120,6 +126,20 @@ impl Repository {
 }
 
 impl RepositoryCommonLockGuard {
+    /// Begin an immediately durable pristine write after the common lock.
+    ///
+    /// Repository-scoped operations use this stage when no physical working-copy
+    /// or final shelf/deferred-tree resource participates in the mutation.
+    pub(super) fn begin_write_immediate(
+        &self,
+    ) -> Result<CommonPristineWriteTxn<'_>, RepositoryError> {
+        let txn = self
+            .pristine
+            .write_txn_immediate()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(CommonPristineWriteTxn { txn, _common: self })
+    }
+
     /// Advance from the common lock to one working-copy lock without blocking.
     pub(super) fn try_lock_working_copy(
         self,
@@ -178,6 +198,14 @@ impl WorkingCopyOperationLockGuard {
     }
 }
 
+impl CommonPristineWriteTxn<'_> {
+    pub(super) fn commit(self) -> Result<(), RepositoryError> {
+        self.txn
+            .commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))
+    }
+}
+
 impl<'a> OrderedPristineWriteTxn<'a> {
     /// Acquire the working-copy shelf lock after entering the write stage.
     pub(super) fn try_lock_shelf(self) -> Result<FinalResourceWriteTxn<'a>, RepositoryError> {
@@ -226,6 +254,20 @@ impl FinalResourceWriteTxn<'_> {
         let result = write.commit();
         drop(_final_lock);
         result
+    }
+}
+
+impl<'a> Deref for CommonPristineWriteTxn<'a> {
+    type Target = WriteTxn<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+impl DerefMut for CommonPristineWriteTxn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.txn
     }
 }
 

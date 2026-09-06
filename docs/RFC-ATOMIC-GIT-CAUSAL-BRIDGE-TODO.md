@@ -30,15 +30,15 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-1C: Operation commands, head consolidation, undo/restore, and native command routing**
-  Intent: pending · Priority: high · Prerequisite: CB-1B (done)
-  Add `atomic op log|show|undo|restore`, consolidate commuting heads, surface incompatible heads as `Diverged`, and route native mutating commands through the operation substrate.
+- [ ] **READY — CB-FMT1: Change-object format vNext for snapshots and Git origin/frontier**
+  Intent: pending · Priority: high · Prerequisites: CB-1A and CB-1C (done)
+  Add lossless versioned `ChangeKind`, snapshot owner/supersession, `ChangeOrigin`, `CausalFrontier`, and capability fencing without rewriting legacy object bytes.
 
 ### Parallel safety workstream
 
 Phase 0 and Phase N are complete; no additional safety prerequisite is ready in parallel.
 
-Phase 1 continues with CB-1C. The shared format foundation remains blocked until CB-1C completes.
+Phase 1 is complete through CB-1C. The shared format foundation is now ready.
 
 ---
 
@@ -66,6 +66,7 @@ Phase 1 continues with CB-1C. The shared format foundation remains blocked until
 | [x] DONE | N9 native derived-index verification and atomic repair | `ATOM::continuouslee::76` / `01M1PH46D0HDWEJWNZYAS2EEY7` | Cache-independent all-view oracle, deterministic diagnostics, ambiguity/staging preservation, immediate all-or-nothing replacement, and read-only doctor checks. |
 | [x] DONE | 1A persistent working-copy identity and API boundary | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` | Versioned pristine records, safe legacy/copy migration, distinct linked worktrees and sandboxes, explicit working-copy capabilities, scoped caches/shelves, and derived `current_view`. |
 | [x] DONE | 1B durable operation/effect journal, ordered locks, and crash recovery | `ATOM::continuouslee::79` / `01M1QA9RZQ5RA0HG3HDST78R1J` | Canonical append-only operation/receipt storage, CAS heads, common→working-copy→pristine→shelf locking, per-effect leases, inverse/startup recovery, canonical imported deletes, and harnesses 05/43. |
+| [x] DONE | 1C operation commands, inverse deltas, head consolidation, and native routing | `ATOM::continuouslee::80` / `01M1SFDT134Z6N3S6VKH1S59FR` | V1-preserving operation V2, `op log|show|undo|restore`, shift-aware historical restore, shared repository heads, deterministic consolidation/`Diverged`, routed native mutations, and harness 44 (31/31). |
 
 ---
 
@@ -150,7 +151,7 @@ execution.
 |---|---|---|---|---|
 | [x] DONE | CB-1A | Persistent working-copy identity and API boundary | Phase N, 0C | `ATOM::continuouslee::77` / `01M1PR1V7M6R5V2AYED4WAVS13` |
 | [x] DONE | CB-1B | Durable operation/effect journal, ordered locks, crash recovery | 1A, N2 | `ATOM::continuouslee::79` / `01M1QA9RZQ5RA0HG3HDST78R1J` |
-| [ ] READY | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | pending |
+| [x] DONE | CB-1C | `atomic op` commands, inverse deltas, operation heads, native command routing | 1B | `ATOM::continuouslee::80` / `01M1SFDT134Z6N3S6VKH1S59FR` |
 
 ### CB-1A definition of done
 
@@ -171,6 +172,9 @@ points recover idempotently and the existing red recovery fixture turns green.
 `atomic op log|show|undo|restore` works; switch and record undo preserve content;
 commuting operation heads consolidate and incompatible heads become explicit
 `Diverged`; record/insert/unrecord/tag/pull/push/materialize all emit operations.
+Evidence: V1/V2 codec and 42 focused repository operation tests, real CLI integration,
+linked-worktree shared-head and historical restore coverage, workspace tests 138/138,
+recovery harness 43 at 21/21, and operation harness 44 at 31/31.
 
 ---
 
@@ -178,7 +182,7 @@ commuting operation heads consolidate and incompatible heads become explicit
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-FMT1 | Change-object format vNext for snapshot lifecycle and Git origin/frontier | 1A, 1C | pending |
+| [ ] READY | CB-FMT1 | Change-object format vNext for snapshot lifecycle and Git origin/frontier | 1A, 1C | pending |
 
 ### CB-FMT1 definition of done
 
@@ -507,7 +511,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-1C.
+1. **Now:** CB-FMT1.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation substrate:** CB-1A is done; CB-1B → CB-1C → CB-FMT1.
@@ -523,5 +527,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-1C intent next with CB-1B encoded in `blocked_by` frontmatter.
-- When the CB-1C intent is created, replace `pending` in this tracker with its human key and UID.
+- Allocate the CB-FMT1 intent next with CB-1A and CB-1C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
