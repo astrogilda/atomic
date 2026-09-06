@@ -38,14 +38,32 @@ fn make_conflicted_repo() -> (TempDir, TestRepository, std::path::PathBuf) {
 
     // feature: insert AAA-inserted after line1
     repo.switch_view("feature").unwrap();
-    std::fs::write(&file, "line1\nAAA-inserted\nline2\nline3\nline4\nline5\n").unwrap();
+    std::fs::write(
+        &file,
+        "line1\nAAA-inserted $Id$\nline2\nline3\nline4\nline5\n",
+    )
+    .unwrap();
     record_all(&repo, "edit A").unwrap();
 
     // dev: insert BBB-inserted after line1 (same position → conflict)
     repo.switch_view("dev").unwrap();
-    std::fs::write(&file, "line1\nBBB-inserted\nline2\nline3\nline4\nline5\n").unwrap();
+    std::fs::write(
+        &file,
+        "line1\nBBB-inserted $Id$\nline2\nline3\nline4\nline5\n",
+    )
+    .unwrap();
     record_all(&repo, "edit B").unwrap();
 
+    std::fs::write(
+        temp_dir.path().join(".gitattributes"),
+        "f.txt ident filter=reject-conflict\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.path().join(".atomic/config.toml"),
+        "[view]\ndefault = \"dev\"\n\n[filters.drivers.reject-conflict]\nclean = \"cat\"\nsmudge = \"exit 19\"\nrequired = true\n",
+    )
+    .unwrap();
     repo.insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
         .unwrap();
     repo.materialize().unwrap();
@@ -86,6 +104,8 @@ fn test_conflict_is_persisted_and_surfaced_in_status() {
         on_disk.contains(">>>>>>>"),
         "expected conflict markers on disk, got:\n{on_disk}"
     );
+    assert_eq!(on_disk.matches("$Id$").count(), 2);
+    assert!(!on_disk.contains("$Id:"));
 
     // Persisted in the CONFLICTS table for dev.
     assert!(
@@ -156,13 +176,13 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
 
     // feature independently creates new.txt.
     repo.switch_view("feature").unwrap();
-    std::fs::write(&new_file, "from-feature\n").unwrap();
+    std::fs::write(&new_file, "from-feature $Id$\n").unwrap();
     repo.add("new.txt", TrackingOptions::default()).unwrap();
     record_all(&repo, "feature creates new.txt").unwrap();
 
     // dev independently creates new.txt with different content (distinct inode).
     repo.switch_view("dev").unwrap();
-    std::fs::write(&new_file, "from-base\n").unwrap();
+    std::fs::write(&new_file, "from-base $Id$\n").unwrap();
     repo.add("new.txt", TrackingOptions::default()).unwrap();
     record_all(&repo, "dev creates new.txt").unwrap();
 
@@ -175,6 +195,19 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
             .any(|path| path == "new.txt"),
         "status must surface PATH_CLAIMS conflict before materialization"
     );
+
+    // Synthesized marker files are evidence, not repository objects. They must
+    // bypass both ident expansion and external smudge drivers.
+    std::fs::write(
+        temp_dir.path().join(".gitattributes"),
+        "new.txt ident filter=reject-conflict\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.path().join(".atomic/config.toml"),
+        "[view]\ndefault = \"dev\"\n\n[filters.drivers.reject-conflict]\nsmudge = \"exit 19\"\nrequired = true\n",
+    )
+    .unwrap();
     repo.materialize().unwrap();
 
     // Both bodies survive, wrapped in a name-conflict block (no silent loss).
@@ -191,6 +224,8 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
         on_disk.contains("from-base"),
         "dev's create must be preserved:\n{on_disk}"
     );
+    assert_eq!(on_disk.matches("$Id$").count(), 2);
+    assert!(!on_disk.contains("$Id:"));
     assert_eq!(
         on_disk.matches("from-feature").count(),
         1,

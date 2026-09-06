@@ -110,6 +110,12 @@ impl Record {
                             ));
                         }
                     }
+                    atomic_repository::LossNote::EmptyDirectory { path } => {
+                        output.push_str(&format!(
+                            " warning: empty directory '{}' is omitted from Git tree projection\n",
+                            path
+                        ));
+                    }
                 }
             }
         }

@@ -109,6 +109,7 @@ use crate::types::{ChangePosition, EdgeFlags, GraphNode, Hash, Inode, NodeId, Po
 use super::graph_op::{BuiltHunk, BuiltHunkKind};
 use super::record::RecordedFile;
 
+mod attribute;
 mod context;
 mod error;
 mod file;
@@ -120,6 +121,7 @@ mod pipeline;
 mod resolve;
 mod vertex;
 
+pub use attribute::globalize_set_attr;
 pub use context::*;
 pub use error::*;
 pub use file::*;

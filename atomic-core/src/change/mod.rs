@@ -90,6 +90,7 @@
 
 mod atom;
 pub mod attestation;
+mod attribute;
 #[allow(clippy::module_inception)]
 mod change;
 mod classification;
@@ -113,6 +114,7 @@ pub use attestation::{
     AttestAgent, Attestation, AttestationBuilder, AttestationError, CodeChangeStats, ModelUsage,
     ATTESTATION_EXTENSION,
 };
+pub use attribute::{AttrValueError, InodeAttr, InodeAttrName, InodeKind};
 pub use change::{Change, ChangeError, HashedChange};
 pub use classification::{
     CausalFrontier, ChangeKind, ChangeOrigin, ChangeValidationError, Derivation, GitDerivation,

@@ -225,6 +225,7 @@
 //! [`Workspace`]: crate::apply::Workspace
 //! [`ConflictTracker`]: crate::apply::ConflictTracker
 
+mod attribute;
 mod change;
 pub mod conflict;
 pub mod edge;
@@ -234,6 +235,8 @@ mod graph_batch;
 pub mod insertion;
 pub mod position;
 mod workspace;
+
+pub use attribute::apply_set_attr;
 
 // Re-export core change application functions
 pub use change::{

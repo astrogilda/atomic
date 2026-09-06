@@ -85,9 +85,12 @@ mod materialize;
 mod migration;
 mod name_resolution;
 mod operation;
+mod projection;
 mod repair;
 mod sandbox;
 mod semantic_materialize;
+mod set_id;
+mod snapshot;
 mod split;
 mod switch;
 mod views;
@@ -98,14 +101,17 @@ mod working_copy;
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
-    view_membership_at_sequence, view_set_id,
+    view_membership_at_sequence,
 };
 pub use locks::RepositoryCommonLockGuard;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedRemoteOperation,
 };
+pub use projection::effective_projection_closure;
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
+pub use set_id::{effective_projection_identity, view_set_id, ViewIdentity};
+pub use snapshot::SnapshotState;
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
@@ -116,6 +122,7 @@ use switch::{ensure_workspace_dir, workspace_path};
 // ── Sub-modules (existing) ──────────────────────────────────────────────
 
 mod archive;
+mod attributes;
 mod changes;
 mod content;
 mod history;

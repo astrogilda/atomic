@@ -759,7 +759,24 @@ pub fn is_always_ignored(path: &Path) -> bool {
 ///
 /// The Blake3 hash of the file contents.
 pub fn hash_file_contents(path: &Path) -> StatusResult<Hash> {
-    let contents = std::fs::read(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let contents = if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_link(path)?.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_link(path)?
+                .as_os_str()
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec()
+        }
+    } else {
+        std::fs::read(path)?
+    };
     Ok(Hash::of(&contents))
 }
 

@@ -170,6 +170,12 @@ impl<'t> Compactor<'t> {
                 name: self.compact_edge_update(name)?,
                 inode: self.compact_edge_update(inode)?,
             }),
+
+            GraphOp::SetAttr { inode, path, value } => Ok(CompactGraphOp::SetAttr {
+                inode: self.compact_position(inode)?,
+                path: path.clone(),
+                value: *value,
+            }),
         }
     }
 
@@ -329,6 +335,12 @@ impl<'t> Compactor<'t> {
             CompactGraphOp::DelRoot { name, inode } => Ok(GraphOp::DelRoot {
                 name: self.expand_edge_update(name)?,
                 inode: self.expand_edge_update(inode)?,
+            }),
+
+            CompactGraphOp::SetAttr { inode, path, value } => Ok(GraphOp::SetAttr {
+                inode: self.expand_position(inode)?,
+                path: path.clone(),
+                value: *value,
             }),
         };
         let expanded = expanded?;

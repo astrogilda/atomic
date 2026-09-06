@@ -111,7 +111,7 @@ pub use types::{InsertError, InsertOptions, InsertOutcome, InsertResult, InsertS
 pub(crate) use types::format_hashes;
 
 use atomic_core::apply::{
-    apply_file_ops_batched, compute_new_state, validate_can_apply_with_frontier,
+    apply_file_ops_batched, apply_set_attr, compute_new_state, validate_can_apply_with_frontier,
     verify_causal_frontier, verify_dependencies, write_edge_map_with_frontier,
     write_new_vertex_with_frontier, CachedWriteGraphTxn, ConflictTracker, MissingContextConflict,
     Workspace, ZombieConflict,
@@ -300,6 +300,14 @@ pub fn write_change_to_graph(
                     options,
                     &mut stats,
                 )?;
+            }
+        }
+        // Attribute events depend on structural FileAdd atoms having installed
+        // the position→inode mapping, so apply them after the cached graph pass.
+        for graph_op in hunks {
+            if matches!(graph_op, GraphOp::SetAttr { .. }) {
+                apply_set_attr(txn, change_id, graph_op)
+                    .map_err(|error| InsertError::Database(error.to_string()))?;
             }
         }
         if trace_record {

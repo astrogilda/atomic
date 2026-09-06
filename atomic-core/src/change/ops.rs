@@ -171,6 +171,37 @@ impl FileOps {
         }
     }
 
+    /// Creates a semantic mode attribute operation.
+    pub fn set_mode(
+        trunk_id: TrunkId,
+        path: String,
+        mode: u16,
+    ) -> Result<Self, crate::change::AttrValueError> {
+        crate::change::InodeAttr::Mode(mode).validate()?;
+        Ok(Self {
+            trunk_id,
+            path,
+            trunk_op: Some(TrunkOp::SetMode {
+                trunk: trunk_id,
+                mode,
+            }),
+            line_ops: Vec::new(),
+        })
+    }
+
+    /// Creates a semantic inode-kind attribute operation.
+    pub fn set_kind(trunk_id: TrunkId, path: String, kind: crate::change::InodeKind) -> Self {
+        Self {
+            trunk_id,
+            path,
+            trunk_op: Some(TrunkOp::SetKind {
+                trunk: trunk_id,
+                kind,
+            }),
+            line_ops: Vec::new(),
+        }
+    }
+
     /// Creates an edit operation (modifying an existing file).
     ///
     /// This has no trunk operation, only line operations.
@@ -272,6 +303,8 @@ impl fmt::Display for FileOps {
             Some(TrunkOp::Delete { .. }) => "delete",
             Some(TrunkOp::Move { .. }) => "move",
             Some(TrunkOp::Undelete { .. }) => "undelete",
+            Some(TrunkOp::SetMode { .. }) => "set-mode",
+            Some(TrunkOp::SetKind { .. }) => "set-kind",
             None => "edit",
         };
         write!(
@@ -702,6 +735,9 @@ impl FileOpsStats {
                 Some(TrunkOp::Delete { .. }) => stats.files_deleted += 1,
                 Some(TrunkOp::Move { .. }) => stats.files_moved += 1,
                 Some(TrunkOp::Undelete { .. }) => stats.files_undeleted += 1,
+                Some(TrunkOp::SetMode { .. }) | Some(TrunkOp::SetKind { .. }) => {
+                    stats.files_edited += 1
+                }
                 None if !file.line_ops().is_empty() => stats.files_edited += 1,
                 None => {}
             }

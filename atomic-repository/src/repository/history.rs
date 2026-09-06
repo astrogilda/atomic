@@ -78,9 +78,12 @@ impl Repository {
                 }
             }
 
-            // Load header if requested
-            if options.load_headers {
-                if let Ok(change) = self.load_change(&entry.hash) {
+            // Snapshots are private working-copy state, not normal history.
+            if let Ok(change) = self.load_change(&entry.hash) {
+                if change.kind().is_snapshot() {
+                    continue;
+                }
+                if options.load_headers {
                     entry = entry.with_change_header(change.hashed.header.clone());
                 }
             }
@@ -179,14 +182,18 @@ impl Repository {
             entries.retain(|e| !ancestor_ids.contains(e.node_id));
         }
 
-        // Load headers if requested
-        if options.load_headers {
-            for entry in &mut entries {
-                if let Ok(change) = self.load_change(&entry.hash) {
+        // Snapshots are private working-copy state, not normal history.
+        entries.retain_mut(|entry| {
+            if let Ok(change) = self.load_change(&entry.hash) {
+                if change.kind().is_snapshot() {
+                    return false;
+                }
+                if options.load_headers {
                     entry.header = Some(change.hashed.header.clone());
                 }
             }
-        }
+            true
+        });
 
         Ok(entries)
     }
@@ -536,6 +543,8 @@ impl Repository {
         hash: &Hash,
         at_sequence: Option<u64>,
     ) -> Result<(Merkle, u64), RepositoryError> {
+        let change = self.load_change(hash)?;
+
         // Get write transaction
         let mut txn = self
             .pristine
@@ -546,6 +555,7 @@ impl Repository {
         let mut view = txn
             .open_or_create_view(&self.current_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.ensure_change_allowed_in_view(&txn, &self.current_view, &change)?;
 
         // Get internal ID (must already be registered)
         let change_id = txn

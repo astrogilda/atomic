@@ -574,6 +574,9 @@ fn apply_trunk_op<T: MutTxnT>(
             // Count as created for stats purposes
             stats.trunks_created += 1;
         }
+
+        // GraphOp::SetAttr owns persistence; FileOps carries the semantic fact.
+        TrunkOp::SetMode { .. } | TrunkOp::SetKind { .. } => {}
     }
 
     Ok(())

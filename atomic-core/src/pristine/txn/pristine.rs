@@ -212,6 +212,8 @@ impl Pristine {
             // Graph tables
             write_txn.open_multimap_table(GRAPH)?;
             write_txn.open_multimap_table(INODE_GRAPH)?;
+            write_txn.open_multimap_table(POSITION_ATTRS)?;
+            write_txn.open_multimap_table(INODE_ATTRS)?;
 
             // View tables
             write_txn.open_table(VIEWS)?;
@@ -221,6 +223,7 @@ impl Pristine {
             write_txn.open_table(EFFECT_RECEIPTS)?;
             write_txn.open_table(VIEW_CHANGES)?;
             write_txn.open_table(REV_VIEW_CHANGES)?;
+            write_txn.open_table(VIEW_SET_ID_INDEX)?;
             write_txn.open_table(CONFLICTS)?;
 
             // Tree tables

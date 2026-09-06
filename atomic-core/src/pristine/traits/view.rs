@@ -77,29 +77,33 @@ impl ViewMembershipSet {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct GraphVisibilityData {
+struct EffectiveProjectionData {
     dependency_first: Vec<NodeId>,
     membership: HashSet<NodeId>,
 }
 
-/// Validated dependency closure used by graph traversal.
+/// Validated dependency closure used by every projection consumer.
 ///
 /// Construction verifies that every reachable change has a complete indexed
 /// dependency list, that every dependency is registered locally, and that the
 /// dependency graph is acyclic. Cloning is O(1) because the immutable data is
 /// shared through an [`Arc`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphVisibilityClosure {
-    data: Arc<GraphVisibilityData>,
+pub struct EffectiveProjectionClosure {
+    data: Arc<EffectiveProjectionData>,
 }
 
-impl Default for GraphVisibilityClosure {
+/// Compatibility name for graph APIs migrated before the projection domain was
+/// shared with attributes, semantics, SetId, export, and bindings.
+pub type GraphVisibilityClosure = EffectiveProjectionClosure;
+
+impl Default for EffectiveProjectionClosure {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl GraphVisibilityClosure {
+impl EffectiveProjectionClosure {
     /// Build a validated, deterministic dependency closure from direct view
     /// membership.
     ///
@@ -210,7 +214,7 @@ impl GraphVisibilityClosure {
         }
 
         Ok(Self {
-            data: Arc::new(GraphVisibilityData {
+            data: Arc::new(EffectiveProjectionData {
                 dependency_first,
                 membership: closure_membership,
             }),
@@ -220,7 +224,7 @@ impl GraphVisibilityClosure {
     /// Return an explicitly filtered closure containing no changes.
     pub fn empty() -> Self {
         Self {
-            data: Arc::new(GraphVisibilityData {
+            data: Arc::new(EffectiveProjectionData {
                 dependency_first: Vec::new(),
                 membership: HashSet::new(),
             }),
@@ -247,6 +251,21 @@ impl GraphVisibilityClosure {
         self.data.dependency_first.iter()
     }
 
+    /// Visibility domain for graph traversal.
+    pub fn graph_visibility(&self) -> &GraphVisibilityClosure {
+        self
+    }
+
+    /// Visibility domain for causal inode attributes.
+    pub fn attribute_visibility(&self) -> &HashSet<NodeId> {
+        &self.data.membership
+    }
+
+    /// Visibility domain for trunk/branch/leaf semantic projection.
+    pub fn semantic_visibility(&self) -> &HashSet<NodeId> {
+        &self.data.membership
+    }
+
     /// Construct a closure without dependency validation for core unit tests.
     #[cfg(test)]
     pub(crate) fn from_ordered_unchecked<I>(changes: I) -> Self
@@ -255,7 +274,7 @@ impl GraphVisibilityClosure {
     {
         let membership = ViewMembershipSet::from_ordered(changes);
         Self {
-            data: Arc::new(GraphVisibilityData {
+            data: Arc::new(EffectiveProjectionData {
                 dependency_first: membership.ordered,
                 membership: membership.membership,
             }),

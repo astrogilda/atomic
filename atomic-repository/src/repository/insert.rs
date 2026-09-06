@@ -1741,6 +1741,7 @@ impl Repository {
                     .ok_or_else(|| RepositoryError::ViewNotFound {
                         name: view_name.clone(),
                     })?;
+                self.ensure_change_allowed_in_view(&txn, &view_name, &change)?;
                 if let Some(change_id) = txn
                     .get_internal(hash)
                     .map_err(|error| RepositoryError::Database(error.to_string()))?
@@ -1823,6 +1824,8 @@ impl Repository {
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        self.ensure_change_allowed_in_view(&txn, &view_name, &change)?;
 
         // Check if the change's edges are already in the global GRAPH.
         //
@@ -2153,7 +2156,16 @@ impl Repository {
     pub fn write_recorded(
         &self,
         outcome: &RecordOutcome,
+        options: InsertOptions,
+    ) -> Result<InsertOutcome, RepositoryError> {
+        self.write_recorded_replacing(outcome, options, None)
+    }
+
+    pub(super) fn write_recorded_replacing(
+        &self,
+        outcome: &RecordOutcome,
         mut options: InsertOptions,
+        removal: Option<(&str, Hash)>,
     ) -> Result<InsertOutcome, RepositoryError> {
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
@@ -2173,6 +2185,9 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        self.ensure_change_allowed_in_view(&txn, view_name, change)?;
+
         // Register the change to get an internal ID
         let change_id = txn
             .register_change(hash)
@@ -2181,7 +2196,6 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         // Determine which view to use
-        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
         let preserve_existing_tree_paths = view_name != self.current_view;
         let tree_projection = self.plan_tree_projection(
             &mut txn,
@@ -2196,7 +2210,7 @@ impl Repository {
         // Apply to the graph
         // For write_recorded, the change is always new (just recorded), so
         // already_in_graph is always false.
-        let apply_outcome = write_change_to_graph(
+        let mut apply_outcome = write_change_to_graph(
             &mut txn, view_name, change_id, hash, change, &options,
             false, // always_in_graph: freshly recorded changes are never in the graph yet
         )
@@ -2208,6 +2222,40 @@ impl Repository {
             view_name,
             preserve_existing_tree_paths,
         )?;
+
+        if let Some((removal_view_name, removed_hash)) = removal {
+            let mut removal_view = txn
+                .get_view(removal_view_name)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: removal_view_name.to_string(),
+                })?;
+            let removed_id = txn
+                .get_internal(&removed_hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: removed_hash.to_base32(),
+                })?;
+            txn.del_change(&mut removal_view, removed_id, &removed_hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ChangeNotInView {
+                    hash: removed_hash.to_base32(),
+                    view: removal_view_name.to_string(),
+                })?;
+            txn.update_view(&removal_view)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            if removal_view_name == view_name {
+                let final_view = txn
+                    .get_view(view_name)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: view_name.to_string(),
+                    })?;
+                apply_outcome.new_state = final_view.state;
+                apply_outcome.sequence = final_view.change_count;
+            }
+        }
 
         // Commit the transaction
         let commit_start = std::time::Instant::now();

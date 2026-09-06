@@ -103,6 +103,10 @@ pub enum GlobalizeError {
         reason: String,
     },
 
+    /// An inode attribute operation is malformed or unsupported.
+    #[error("Invalid inode attribute operation for {path}: {reason}")]
+    InvalidAttribute { path: String, reason: String },
+
     /// A database error occurred during globalization.
     #[error("Database error: {0}")]
     Pristine(Box<PristineError>),

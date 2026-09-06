@@ -900,6 +900,7 @@ mod native_derived;
 mod operation;
 mod path_claim;
 mod session_kg;
+mod set_id_index;
 mod tag;
 mod tree;
 mod triples;

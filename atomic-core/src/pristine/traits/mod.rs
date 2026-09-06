@@ -53,8 +53,8 @@ pub use triples::{KgMutTxnT, KgTxnT};
 pub use vault::{VaultEntryMeta, VaultMutTxnT, VaultTxnT};
 pub use vertex_ext::VertexExt;
 pub use view::{
-    GraphVisibilityClosure, StoredConflict, StoredConflictKind, ViewMembershipSet, ViewScope,
-    ViewState, ViewTxnT,
+    EffectiveProjectionClosure, GraphVisibilityClosure, StoredConflict, StoredConflictKind,
+    ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
 };
 pub use working_copy::{
     decode_working_copy_record, encode_working_copy_record, WorkingCopyMutTxnT, WorkingCopyRecord,

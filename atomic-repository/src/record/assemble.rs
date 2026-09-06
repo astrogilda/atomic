@@ -432,7 +432,11 @@ pub fn filter_files<'a>(
             // Must be a recordable change (modified, added, deleted)
             matches!(
                 f.status(),
-                FileStatus::Modified | FileStatus::Added | FileStatus::Deleted
+                FileStatus::Modified
+                    | FileStatus::Added
+                    | FileStatus::Deleted
+                    | FileStatus::TypeChanged
+                    | FileStatus::PermissionsChanged
             )
         })
         .filter(|f| options.should_include(&f.path().to_string_lossy()))

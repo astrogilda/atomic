@@ -43,6 +43,7 @@
 //! ```
 
 use super::atom::{Atom, EdgeUpdate, Insertion, NewEdge};
+use super::attribute::InodeAttr;
 use super::encoding::Encoding;
 use super::local::Local;
 use crate::{EdgeFlags, GraphNode, Hash, Position};
@@ -324,6 +325,21 @@ pub enum GraphOp<H> {
         /// Inode edges to delete
         inode: EdgeUpdate<H>,
     },
+
+    /// Add a causal value to an inode attribute register.
+    ///
+    /// Attribute operations contain no graph atoms. Application appends an
+    /// immutable event associated with the containing change; causally later
+    /// values supersede observed values while concurrent values remain visible.
+    /// This variant is appended to preserve all legacy enum discriminants.
+    SetAttr {
+        /// Stable graph position of the inode being changed.
+        inode: Position<H>,
+        /// Path retained for human-readable output.
+        path: String,
+        /// Canonical attribute value.
+        value: InodeAttr,
+    },
 }
 
 impl<H: PartialEq> GraphOp<H> {
@@ -450,6 +466,15 @@ impl<H: PartialEq> GraphOp<H> {
 
 impl GraphOp<Option<Hash>> {
     pub(crate) fn validate_serialized_name_conflict(&self) -> Result<(), String> {
+        if let GraphOp::SetAttr { inode, path, value } = self {
+            if path.is_empty() {
+                return Err("SetAttr requires a non-empty path".to_string());
+            }
+            if inode.change == Some(Hash::NONE) {
+                return Err("SetAttr cannot target ROOT".to_string());
+            }
+            value.validate().map_err(|error| error.to_string())?;
+        }
         self.validate_name_conflict()?;
         let (operation, name) = match self {
             GraphOp::SolveNameConflict { name, .. } => ("SolveNameConflict", name),
@@ -516,7 +541,8 @@ impl<H> GraphOp<H> {
             | GraphOp::DirDel { path, .. }
             | GraphOp::DirUndel { path, .. }
             | GraphOp::SolveNameConflict { path, .. }
-            | GraphOp::UnsolveNameConflict { path, .. } => Some(path),
+            | GraphOp::UnsolveNameConflict { path, .. }
+            | GraphOp::SetAttr { path, .. } => Some(path),
 
             GraphOp::Edit { local, .. }
             | GraphOp::Replacement { local, .. }
@@ -568,6 +594,7 @@ impl<H> GraphOp<H> {
                 | GraphOp::FileDel { .. }
                 | GraphOp::FileUndel { .. }
                 | GraphOp::FileMove { .. }
+                | GraphOp::SetAttr { .. }
         )
     }
 
@@ -631,6 +658,7 @@ impl<H> GraphOp<H> {
             GraphOp::ResurrectZombies { .. } => "ResurrectZombies",
             GraphOp::AddRoot { .. } => "AddRoot",
             GraphOp::DelRoot { .. } => "DelRoot",
+            GraphOp::SetAttr { .. } => "SetAttr",
         }
     }
 }
@@ -662,6 +690,7 @@ impl<H: fmt::Debug> fmt::Display for GraphOp<H> {
             }
             GraphOp::AddRoot { .. } => write!(f, "AddRoot"),
             GraphOp::DelRoot { .. } => write!(f, "DelRoot"),
+            GraphOp::SetAttr { path, value, .. } => write!(f, "SetAttr: {path} {value:?}"),
         }
     }
 }
@@ -764,9 +793,12 @@ impl<'a, H> Iterator for HunkAtomIter<'a, H> {
             (GraphOp::DirDel { del, .. }, 0) => Some(AtomRef::EdgeUpdate(del)),
             (GraphOp::DirDel { .. }, _) => None,
 
-            // DirUndel: undel
+            // DirUndel: del
             (GraphOp::DirUndel { undel, .. }, 0) => Some(AtomRef::EdgeUpdate(undel)),
             (GraphOp::DirUndel { .. }, _) => None,
+
+            // Attribute events are applied outside the edge graph.
+            (GraphOp::SetAttr { .. }, _) => None,
         };
 
         if result.is_some() {
@@ -825,6 +857,7 @@ impl<H> GraphOp<H> {
             GraphOp::DirAdd { .. } => 2,
             GraphOp::DirDel { .. } => 1,
             GraphOp::DirUndel { .. } => 1,
+            GraphOp::SetAttr { .. } => 0,
         }
     }
 }

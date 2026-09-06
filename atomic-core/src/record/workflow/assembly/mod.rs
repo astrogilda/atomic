@@ -433,11 +433,15 @@ where
                 shift_graph_op_content(&mut op, shift);
                 ctx.add_hunk(op);
             }
-            // Collect CRDT ops if present
-            if !file.opaque_generated() {
-                if let Some(crdt_ops) = file.crdt_ops() {
-                    ctx.add_file_ops(crdt_ops.clone());
+            // Opaque files retain their trunk lifecycle but deliberately omit
+            // line/token semantics. Attribute operations still need that stable
+            // trunk identity.
+            if let Some(crdt_ops) = file.crdt_ops() {
+                let mut crdt_ops = crdt_ops.clone();
+                if file.opaque_generated() {
+                    crdt_ops.line_ops_mut().clear();
                 }
+                ctx.add_file_ops(crdt_ops);
             }
             let glob_ms = glob_start.elapsed().as_millis();
             if glob_ms > 100 {
@@ -481,12 +485,16 @@ where
                 // OrphanBranch on every line.  Falling back to
                 // `file.crdt_ops()` (pre-enrichment) preserves the legacy
                 // shape for files globalize couldn't enrich.
-                if !file.opaque_generated() {
-                    if let Some(enriched_ops) = globalized.file_ops() {
-                        ctx.add_file_ops(enriched_ops.clone());
-                    } else if let Some(crdt_ops) = file.crdt_ops() {
-                        ctx.add_file_ops(crdt_ops.clone());
+                if file.opaque_generated() {
+                    if let Some(crdt_ops) = file.crdt_ops() {
+                        let mut trunk_only = crdt_ops.clone();
+                        trunk_only.line_ops_mut().clear();
+                        ctx.add_file_ops(trunk_only);
                     }
+                } else if let Some(enriched_ops) = globalized.file_ops() {
+                    ctx.add_file_ops(enriched_ops.clone());
+                } else if let Some(crdt_ops) = file.crdt_ops() {
+                    ctx.add_file_ops(crdt_ops.clone());
                 }
 
                 let hunk_count = globalized.hunks().len();

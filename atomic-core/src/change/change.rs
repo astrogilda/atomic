@@ -949,6 +949,7 @@ impl Change {
                     collect_edge_update_hashes(name, table)?;
                     collect_edge_update_hashes(inode, table)?;
                 }
+                GraphOp::SetAttr { inode, .. } => collect_position_hash(inode, table)?,
             }
         }
 

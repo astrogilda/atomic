@@ -638,7 +638,14 @@ fn test_ambiguous_raw_rename_remains_delete_add_with_loss_evidence() {
     let evidence = outcome.move_evidence().unwrap().unwrap();
     assert!(evidence.authoritative_moves.is_empty());
     assert!(evidence.probable_moves.is_empty());
-    let LossNote::RenameUnresolved { candidates } = evidence.loss_notes.iter().next().unwrap();
+    let candidates = evidence
+        .loss_notes
+        .iter()
+        .find_map(|loss| match loss {
+            LossNote::RenameUnresolved { candidates } => Some(candidates),
+            LossNote::EmptyDirectory { .. } => None,
+        })
+        .expect("ambiguous rename loss note");
     assert_eq!(candidates.len(), 2);
 
     assert_eq!(repo.get_file_inode("old.txt").unwrap(), None);

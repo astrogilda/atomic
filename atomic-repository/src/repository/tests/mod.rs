@@ -8,9 +8,11 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+mod attribute_tests;
 mod capability_tests;
 mod change_tests;
 mod conflict_surface_tests;
+mod content_filter_tests;
 mod cross_view_merge_tests;
 mod delete_propagation_tests;
 mod directory_lifecycle_tests;
@@ -33,6 +35,7 @@ mod record_duplication_tests;
 mod record_tests;
 mod rename_tests;
 mod shadow_lock_tests;
+mod snapshot_tests;
 mod status_tests;
 
 mod tracking_tests;

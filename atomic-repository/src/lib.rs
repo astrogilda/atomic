@@ -89,6 +89,7 @@
 // Core modules
 pub mod apply;
 pub mod changestore;
+pub mod content_filter;
 pub mod error;
 pub mod ignore;
 pub mod manifest;
@@ -137,6 +138,12 @@ pub use content_search::{
 
 // Change store exports
 pub use changestore::{ChangeStore, ChangeStoreError, ChangeStoreResult, DEFAULT_CACHE_CAPACITY};
+
+// Content-filter exports
+pub use content_filter::{
+    is_git_lfs_pointer, looks_binary, ContentFilter, ContentFilterError, FilterDirection,
+    FilteredContent, GitAttributesFilter,
+};
 
 // Error exports
 pub use error::*;

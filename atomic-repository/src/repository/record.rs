@@ -78,6 +78,21 @@ impl Repository {
         header: ChangeHeader,
         options: RecordOptions,
     ) -> Result<RecordOutcome, RecordError> {
+        self.record_with_lifecycle(
+            working_copy,
+            header,
+            options,
+            super::snapshot::RecordLifecycle::Durable,
+        )
+    }
+
+    pub(super) fn record_with_lifecycle(
+        &self,
+        working_copy: WorkingCopyId,
+        header: ChangeHeader,
+        options: RecordOptions,
+        lifecycle: super::snapshot::RecordLifecycle,
+    ) -> Result<RecordOutcome, RecordError> {
         self.validate_working_copy(working_copy)
             .map_err(RecordError::Repository)?;
         let desired_view = self
@@ -96,8 +111,10 @@ impl Repository {
             }));
         }
 
+        let target_view = lifecycle.target_view(&desired_view).to_string();
+
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
-        use atomic_core::output::{FileSystem, Memory};
+        use atomic_core::output::Memory;
         use atomic_core::record::workflow::{
             assemble_change, record_added_file, record_deleted_file, record_modified_file,
             record_moved_file, record_undeleted_file, DetectedFile, RecordedFile,
@@ -183,6 +200,12 @@ impl Repository {
         let mut errors: Vec<(String, String)> = Vec::new();
 
         let core_options = options.to_core_options();
+        let opaque_core_options = core_options
+            .clone()
+            .max_file_size(usize::MAX)
+            .skip_binary(false);
+        let content_filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
+        use crate::content_filter::ContentFilter;
 
         // Create a memory working copy for the recording workflow
         let memory_wc = Memory::new();
@@ -254,11 +277,12 @@ impl Repository {
             &projected_present,
             &projected_absent,
             &self.root,
+            &content_filter,
             options.get_detect_raw_renames(),
         )?;
         let FileMovePlanning {
             moves: planned_moves,
-            evidence: move_evidence,
+            evidence: mut move_evidence,
             unresolved_destinations,
             fresh_additions,
         } = move_planning;
@@ -320,19 +344,154 @@ impl Repository {
             return Err(RecordError::NothingToRecord);
         }
 
-        let filesystem_working_copy = FileSystem::from_root(&self.root);
+        #[derive(Clone)]
+        struct PendingAttribute {
+            path: String,
+            position: Option<Position<NodeId>>,
+            trunk: Option<atomic_core::crdt::TrunkId>,
+            value: atomic_core::change::InodeAttr,
+            dependencies: Vec<Hash>,
+        }
+
+        let visible_attribute_changes: std::collections::HashSet<NodeId> = shared_graph_visibility
+            .iter_dependency_first()
+            .copied()
+            .collect();
+        let mut pending_attributes = Vec::<PendingAttribute>::new();
+        for entry in &files_to_record {
+            if entry.status() == FileStatus::Deleted
+                || entry
+                    .details()
+                    .is_some_and(|details| details == "directory")
+            {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            // A name-conflict resolution selects one existing claimant later in
+            // the content phase. There is no new FileAdd inode to receive attrs;
+            // the selected claimant retains its causal mode/kind state.
+            if projected_name_conflicts.contains_key(&path) {
+                continue;
+            }
+            let attrs = super::attributes::working_inode_attrs(&self.root.join(&path))
+                .map_err(RecordError::Repository)?;
+            let position = entry
+                .inode()
+                .and_then(|inode| shared_txn.inode_position(inode).ok().flatten());
+            let trunk = entry.inode().and_then(|inode| {
+                use atomic_core::crdt::tables::decode_trunk_id;
+                use atomic_core::pristine::CrdtTxnT;
+                shared_txn
+                    .get_crdt_inode_trunk(inode.get())
+                    .ok()
+                    .flatten()
+                    .map(|key| decode_trunk_id(&key))
+            });
+            let projected = position
+                .map(|position| {
+                    atomic_core::output::project_inode_attributes(
+                        &shared_txn,
+                        position,
+                        &visible_attribute_changes,
+                    )
+                    .map_err(|error| RecordError::Database(error.to_string()))
+                })
+                .transpose()?;
+            if projected
+                .as_ref()
+                .is_some_and(|value| value.is_conflicted())
+            {
+                return Err(RecordError::Database(format!(
+                    "cannot record '{}' while its inode attributes conflict",
+                    path
+                )));
+            }
+            let expected = projected
+                .map(|value| value.materialization)
+                .unwrap_or_default();
+            let attribute_dependencies = |value: atomic_core::change::InodeAttr| {
+                let Some(position) = position else {
+                    return Ok(Vec::new());
+                };
+                let state = atomic_core::pristine::InodeAttrTxnT::resolve_inode_attr(
+                    &shared_txn,
+                    position,
+                    value.name(),
+                    &visible_attribute_changes,
+                )
+                .map_err(|error| RecordError::Database(error.to_string()))?;
+                state
+                    .events()
+                    .iter()
+                    .map(|event| {
+                        shared_txn
+                            .get_external(event.introduced_by)
+                            .map_err(|error| RecordError::Database(error.to_string()))?
+                            .ok_or_else(|| {
+                                RecordError::Database(format!(
+                                    "attribute event change {:?} has no external hash",
+                                    event.introduced_by
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            if position.is_none() || expected.mode != attrs.mode {
+                let value = atomic_core::change::InodeAttr::Mode(attrs.mode);
+                pending_attributes.push(PendingAttribute {
+                    path: path.clone(),
+                    position,
+                    trunk,
+                    value,
+                    dependencies: attribute_dependencies(value)?,
+                });
+            }
+            if position.is_none() || expected.kind != attrs.kind {
+                let value = atomic_core::change::InodeAttr::Kind(attrs.kind);
+                pending_attributes.push(PendingAttribute {
+                    path,
+                    position,
+                    trunk,
+                    value,
+                    dependencies: attribute_dependencies(value)?,
+                });
+            }
+        }
+
         for planned in planned_moves {
+            let raw = crate::content_filter::read_working_bytes(&self.root.join(&planned.new_path))
+                .map_err(|error| {
+                    RecordError::Database(format!(
+                        "failed to read moved path '{}': {error}",
+                        planned.new_path
+                    ))
+                })?;
+            let filtered = content_filter
+                .clean(std::path::Path::new(&planned.new_path), &raw)
+                .map_err(|error| RecordError::Database(error.to_string()))?;
+            for warning in &filtered.warnings {
+                log::warn!("record: {warning}");
+            }
+            let opaque = content_filter.is_git_tracked(std::path::Path::new(&planned.new_path))
+                && (filtered.bytes.len() as u64 > options.max_file_size()
+                    || crate::content_filter::looks_binary(&filtered.bytes));
+            let moved_working_copy = Memory::new();
+            moved_working_copy.add_file(&planned.new_path, &filtered.bytes);
             let (trunk, branches) =
                 existing_crdt_identity(&shared_txn, planned.inode, &shared_graph_visibility)?;
             let detected = DetectedFile::moved(&planned.old_path, &planned.new_path)
                 .with_inode(planned.inode)
                 .with_position(planned.claimant);
-            let recorded = record_moved_file(
-                &filesystem_working_copy,
+            let mut recorded = record_moved_file(
+                &moved_working_copy,
                 &detected,
                 &planned.old_content,
                 None,
-                &core_options,
+                if opaque {
+                    &opaque_core_options
+                } else {
+                    &core_options
+                },
                 planned.inode,
                 planned.claimant,
                 planned.source,
@@ -340,6 +499,13 @@ impl Repository {
                 (!branches.is_empty()).then_some(branches.as_slice()),
             )
             .map_err(RecordError::Database)?;
+            if opaque {
+                recorded.set_opaque_generated(true);
+                log::warn!(
+                    "record: Git-tracked '{}' is large or binary; preserving exact repository bytes as opaque content",
+                    planned.new_path
+                );
+            }
 
             stats.files_recorded += 1;
             stats.hunks_created += recorded.hunk_count() + 1;
@@ -404,6 +570,13 @@ impl Repository {
                     // that this directory was added.
                     stats.directories_recorded += 1;
                     stats.vertices_added += 2; // name span + inode span
+                    if std::fs::read_dir(&full_path)
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false)
+                    {
+                        move_evidence
+                            .insert_loss(crate::record::LossNote::empty_directory(path.clone()));
+                    }
                     recorded_paths.push(format!("{}/ (directory)", path));
 
                     let recorded = if let Some(absent) = projected_absent.get(&path) {
@@ -435,30 +608,52 @@ impl Repository {
                         path,
                         full_path.display()
                     );
-                    match std::fs::read(&full_path) {
-                        Ok(content) => {
-                            log::debug!("record: read {} bytes from '{}'", content.len(), path);
-                            // Check size limit
-                            if content.len() as u64 > options.max_file_size() {
+                    match crate::content_filter::read_working_bytes(&full_path) {
+                        Ok(working_content) => {
+                            let filtered = content_filter
+                                .clean(std::path::Path::new(&path), &working_content)
+                                .map_err(|error| RecordError::Database(error.to_string()))?;
+                            for warning in &filtered.warnings {
+                                log::warn!("record: {warning}");
+                            }
+                            let content = filtered.bytes;
+                            log::debug!(
+                                "record: read {} repository bytes from '{}'",
+                                content.len(),
+                                path
+                            );
+                            let git_tracked =
+                                content_filter.is_git_tracked(std::path::Path::new(&path));
+                            let opaque = git_tracked
+                                && (content.len() as u64 > options.max_file_size()
+                                    || crate::content_filter::looks_binary(&content));
+                            if content.len() as u64 > options.max_file_size() && !opaque {
                                 if options.skip_binary() {
                                     skipped_paths.push(path.clone());
                                     stats.files_skipped += 1;
                                     continue;
-                                } else {
-                                    return Err(RecordError::FileTooLarge {
-                                        path: path.clone(),
-                                        size: content.len() as u64,
-                                        limit: options.max_file_size(),
-                                    });
                                 }
+                                return Err(RecordError::FileTooLarge {
+                                    path: path.clone(),
+                                    size: content.len() as u64,
+                                    limit: options.max_file_size(),
+                                });
                             }
 
-                            // Write to memory working copy
+                            // Only repository bytes enter the recording workflow.
                             memory_wc.add_file(&path, &content);
 
                             let mut detected = DetectedFile::added(&path);
                             let recorded_result = if fresh_additions.contains(&path) {
-                                record_added_file(&memory_wc, &detected, &core_options)
+                                record_added_file(
+                                    &memory_wc,
+                                    &detected,
+                                    if opaque {
+                                        &opaque_core_options
+                                    } else {
+                                        &core_options
+                                    },
+                                )
                             } else if let Some(absent) = projected_absent.get(&path) {
                                 if absent.directory {
                                     Err("Projected undelete changes directory kind to file"
@@ -497,15 +692,37 @@ impl Repository {
                                         &absent.deleted_by,
                                         &old_content,
                                         None,
-                                        &core_options,
+                                        if opaque {
+                                            &opaque_core_options
+                                        } else {
+                                            &core_options
+                                        },
                                         trunk,
                                         (!branches.is_empty()).then_some(branches.as_slice()),
                                     )
                                 }
                             } else {
-                                record_added_file(&memory_wc, &detected, &core_options)
+                                record_added_file(
+                                    &memory_wc,
+                                    &detected,
+                                    if opaque {
+                                        &opaque_core_options
+                                    } else {
+                                        &core_options
+                                    },
+                                )
                             };
 
+                            let recorded_result = recorded_result.map(|mut recorded| {
+                                if opaque {
+                                    recorded.set_opaque_generated(true);
+                                    log::warn!(
+                                        "record: Git-tracked '{}' is large or binary; preserving exact repository bytes as opaque content",
+                                        path
+                                    );
+                                }
+                                recorded
+                            });
                             match recorded_result {
                                 Ok(recorded) => {
                                     log::debug!(
@@ -705,8 +922,9 @@ impl Repository {
                     }
                 }
 
-                FileStatus::Modified => {
-                    // Collect for parallel processing below.
+                FileStatus::Modified | FileStatus::TypeChanged | FileStatus::PermissionsChanged => {
+                    // Attribute-only changes still use the normal content path;
+                    // an empty content diff is retained by pending_attributes.
                     modified_work.push((path.clone(), full_path.clone(), file_t0));
                 }
 
@@ -734,19 +952,31 @@ impl Repository {
             Recorded(String, Box<RecordedFile>, Option<PreparedNameResolution>),
             Skipped(String, Option<PreparedNameResolution>),
             Error(String, String),
+            Fatal(RecordError),
         }
 
         let par_results: Vec<ModifiedResult> = modified_work
             .par_iter()
             .map(|(path, _full_path, _)| {
+                let working = match crate::content_filter::read_working_bytes(&self.root.join(path)) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return ModifiedResult::Error(path.clone(), error.to_string()),
+                };
+                let filtered = match content_filter.clean(std::path::Path::new(path), &working) {
+                    Ok(filtered) => filtered,
+                    Err(error) => {
+                        return ModifiedResult::Fatal(RecordError::Database(error.to_string()))
+                    }
+                };
+                for warning in &filtered.warnings {
+                    log::warn!("record: {warning}");
+                }
+                let repository_bytes = filtered.bytes;
+                let opaque = content_filter.is_git_tracked(std::path::Path::new(path))
+                    && (repository_bytes.len() as u64 > options.max_file_size()
+                        || crate::content_filter::looks_binary(&repository_bytes));
                 let resolution = match projected_name_conflicts.get(path) {
                     Some(conflict) => {
-                        let working = match std::fs::read(self.root.join(path)) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                return ModifiedResult::Error(path.clone(), error.to_string())
-                            }
-                        };
                         match prepare_name_resolution(
                             &shared_txn,
                             &shared_cached_txn,
@@ -754,7 +984,7 @@ impl Repository {
                             &shared_graph_visibility,
                             path,
                             conflict,
-                            &working,
+                            &repository_bytes,
                         ) {
                             Ok(resolution) => Some(resolution),
                             Err(error) => {
@@ -865,8 +1095,15 @@ impl Repository {
                     atomic_core::record::workflow::DetectedFile::modified(path.as_str());
                 detected.inode = Some(file_inode);
                 detected.position = Some(file_position);
-                let filesystem_working_copy = FileSystem::from_root(&self.root);
-                let file_options = if had_fork_structure {
+                let filtered_working_copy = Memory::new();
+                filtered_working_copy.add_file(path, &repository_bytes);
+                let file_options = if opaque {
+                    log::warn!(
+                        "record: Git-tracked '{}' is large or binary; preserving exact repository bytes as opaque content",
+                        path
+                    );
+                    opaque_core_options.clone().force_whole_file_replace(true)
+                } else if had_fork_structure {
                     if conflicted_paths.contains(path.as_str()) {
                         // The fork is a surfaced conflict this record is
                         // resolving — the normal resolve-over-markers flow.
@@ -891,7 +1128,7 @@ impl Repository {
                     core_options.clone()
                 };
                 match record_modified_file(
-                    &filesystem_working_copy,
+                    &filtered_working_copy,
                     &detected,
                     &old_content,
                     crdt_old_content.as_deref(),
@@ -902,7 +1139,10 @@ impl Repository {
                     Ok(recorded) if recorded.is_empty() => {
                         ModifiedResult::Skipped(path.clone(), resolution)
                     }
-                    Ok(recorded) => {
+                    Ok(mut recorded) => {
+                        if opaque {
+                            recorded.set_opaque_generated(true);
+                        }
                         ModifiedResult::Recorded(path.clone(), Box::new(recorded), resolution)
                     }
                     Err(e) => ModifiedResult::Error(path.clone(), e),
@@ -959,6 +1199,7 @@ impl Repository {
                     errors.push((path, msg));
                     stats.errors += 1;
                 }
+                ModifiedResult::Fatal(error) => return Err(error),
             }
         }
 
@@ -972,7 +1213,10 @@ impl Repository {
         }
 
         // Check if we actually recorded anything
-        if recorded_files.is_empty() && name_resolution_ops.is_empty() {
+        if recorded_files.is_empty()
+            && name_resolution_ops.is_empty()
+            && pending_attributes.is_empty()
+        {
             return Err(RecordError::NothingToRecord);
         }
 
@@ -1010,6 +1254,82 @@ impl Repository {
             )?
             .into_change()
         };
+        let created_attribute_targets: std::collections::HashMap<String, Position<Option<Hash>>> =
+            change
+                .hunks()
+                .iter()
+                .filter_map(|operation| match operation {
+                    GraphOp::FileAdd {
+                        add_inode, path, ..
+                    } => Some((
+                        path.clone(),
+                        Position {
+                            change: None,
+                            pos: add_inode.start,
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect();
+        let semantic_trunks: std::collections::HashMap<String, atomic_core::crdt::TrunkId> = change
+            .file_ops()
+            .iter()
+            .map(|ops| (ops.path().to_string(), ops.trunk_id()))
+            .collect();
+        for pending in pending_attributes {
+            let target = match pending.position {
+                Some(position) => {
+                    let hash = shared_txn
+                        .get_external(position.change)
+                        .map_err(|error| RecordError::Database(error.to_string()))?
+                        .ok_or_else(|| {
+                            RecordError::Database(format!(
+                                "attribute target change {:?} has no external hash",
+                                position.change
+                            ))
+                        })?;
+                    change.hashed.dependencies.push(hash);
+                    Position {
+                        change: Some(hash),
+                        pos: position.pos,
+                    }
+                }
+                None => *created_attribute_targets
+                    .get(&pending.path)
+                    .ok_or_else(|| {
+                        RecordError::Database(format!(
+                            "new attribute path '{}' has no FileAdd inode",
+                            pending.path
+                        ))
+                    })?,
+            };
+            change.hashed.dependencies.extend(pending.dependencies);
+            change.add_hunk(GraphOp::SetAttr {
+                inode: target,
+                path: pending.path.clone(),
+                value: pending.value,
+            });
+
+            let trunk = pending
+                .trunk
+                .or_else(|| semantic_trunks.get(&pending.path).copied())
+                .ok_or_else(|| {
+                    RecordError::Database(format!(
+                        "attribute path '{}' has no semantic trunk",
+                        pending.path
+                    ))
+                })?;
+            let semantic = match pending.value {
+                atomic_core::change::InodeAttr::Mode(mode) => {
+                    atomic_core::change::FileOps::set_mode(trunk, pending.path, mode)
+                        .map_err(|error| RecordError::Database(error.to_string()))?
+                }
+                atomic_core::change::InodeAttr::Kind(kind) => {
+                    atomic_core::change::FileOps::set_kind(trunk, pending.path, kind)
+                }
+            };
+            change.add_file_ops(semantic);
+        }
         for operation in name_resolution_ops {
             change.add_hunk(operation);
         }
@@ -1024,6 +1344,8 @@ impl Repository {
             crate::record::merge_move_evidence(&mut change, &move_evidence)
                 .map_err(|error| RecordError::ChangeStore(error.to_string()))?;
         }
+        lifecycle.verify_promotion_content(&change, self)?;
+        change = lifecycle.classify(change)?;
         if trace_record {
             eprintln!(
                 "[record] assemble_change: {:.1}ms",
@@ -1089,18 +1411,18 @@ impl Repository {
                     },
                 ));
             }
-            let (before_state, after_state, sequence) = {
+            let (before_state, after_state, transitions, operation_changes) = {
                 let txn = self.pristine.read_txn().map_err(|error| {
                     RecordError::Repository(RepositoryError::Database(error.to_string()))
                 })?;
                 let view = txn
-                    .get_view(&effective_view)
+                    .get_view(&target_view)
                     .map_err(|error| {
                         RecordError::Repository(RepositoryError::Database(error.to_string()))
                     })?
                     .ok_or_else(|| {
                         RecordError::Repository(RepositoryError::ViewNotFound {
-                            name: effective_view.clone(),
+                            name: target_view.clone(),
                         })
                     })?;
                 let before_record = txn
@@ -1113,14 +1435,102 @@ impl Repository {
                             id: working_copy,
                         })
                     })?;
-                let sequence = view.change_count;
-                let after_view_state = view.state.next(&computed_hash);
+
+                let removal = lifecycle.removal();
+                let sequence = if removal
+                    .as_ref()
+                    .is_some_and(|(view_name, _)| *view_name == target_view)
+                {
+                    view.change_count.saturating_sub(1)
+                } else {
+                    view.change_count
+                };
+                let mut after_view_state = Merkle::ZERO;
+                for row in txn.iter_changes(&view, 0).map_err(|error| {
+                    RecordError::Repository(RepositoryError::Database(error.to_string()))
+                })? {
+                    let (_, node_id, _) = row.map_err(|error| {
+                        RecordError::Repository(RepositoryError::Database(error.to_string()))
+                    })?;
+                    let hash = txn
+                        .get_external(node_id)
+                        .map_err(|error| {
+                            RecordError::Repository(RepositoryError::Database(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            RecordError::Repository(RepositoryError::ChangeNotFound {
+                                hash: node_id.to_string(),
+                            })
+                        })?;
+                    if removal.as_ref().is_some_and(|(view_name, removed)| {
+                        *view_name == target_view && *removed == hash
+                    }) {
+                        continue;
+                    }
+                    after_view_state = after_view_state.next(&hash);
+                }
+                after_view_state = after_view_state.next(&computed_hash);
+
                 let mut after_record = before_record.clone();
-                after_record.desired_state = after_view_state;
+                if target_view == desired_view {
+                    after_record.desired_state = after_view_state;
+                }
+                let mut transitions = Vec::new();
+                let mut operation_changes = vec![computed_hash];
+                if let Some((removal_view_name, removed)) = removal {
+                    let removal_view = txn
+                        .get_view(removal_view_name)
+                        .map_err(|error| {
+                            RecordError::Repository(RepositoryError::Database(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            RecordError::Repository(RepositoryError::ViewNotFound {
+                                name: removal_view_name.to_string(),
+                            })
+                        })?;
+                    let removed_id = txn
+                        .get_internal(&removed)
+                        .map_err(|error| {
+                            RecordError::Repository(RepositoryError::Database(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            RecordError::Repository(RepositoryError::ChangeNotFound {
+                                hash: removed.to_base32(),
+                            })
+                        })?;
+                    let removed_sequence = txn
+                        .get_change_seq(&removal_view, removed_id)
+                        .map_err(|error| {
+                            RecordError::Repository(RepositoryError::Database(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            RecordError::Repository(RepositoryError::ChangeNotInView {
+                                hash: removed.to_base32(),
+                                view: removal_view_name.to_string(),
+                            })
+                        })?;
+                    transitions.push(MetadataTransition {
+                        target: MetadataTarget::ViewChange {
+                            view: removal_view_name.to_string(),
+                            change: removed,
+                        },
+                        expected_old: MetadataValue::Sequence(removed_sequence),
+                        expected_new: MetadataValue::Absent,
+                    });
+                    operation_changes.push(removed);
+                }
+                transitions.push(MetadataTransition {
+                    target: MetadataTarget::ViewChange {
+                        view: target_view.clone(),
+                        change: computed_hash,
+                    },
+                    expected_old: MetadataValue::Absent,
+                    expected_new: MetadataValue::Sequence(sequence),
+                });
                 (
                     RepoStateRef {
                         view: Some(ViewStateRef {
-                            name: effective_view.clone(),
+                            name: target_view.clone(),
                             state: view.state,
                             set_id: None,
                         }),
@@ -1129,14 +1539,15 @@ impl Repository {
                     },
                     RepoStateRef {
                         view: Some(ViewStateRef {
-                            name: effective_view.clone(),
+                            name: target_view.clone(),
                             state: after_view_state,
                             set_id: None,
                         }),
                         working_copy: Some(super::operation::working_copy_state_ref(after_record)),
                         git: None,
                     },
-                    sequence,
+                    transitions,
+                    operation_changes,
                 )
             };
             let operation = self
@@ -1146,15 +1557,8 @@ impl Repository {
                     None,
                     before_state,
                     after_state,
-                    vec![MetadataTransition {
-                        target: MetadataTarget::ViewChange {
-                            view: effective_view.clone(),
-                            change: computed_hash,
-                        },
-                        expected_old: MetadataValue::Absent,
-                        expected_new: MetadataValue::Sequence(sequence),
-                    }],
-                    vec![computed_hash],
+                    transitions,
+                    operation_changes,
                     ActorRef::System {
                         name: "repository-record".to_string(),
                     },
@@ -1194,109 +1598,115 @@ impl Repository {
         // the TREE and INODES entries for FileAdd hunks, which is necessary
         // for the file to be recognized as tracked with graph content.
         if options.get_apply_after_record() && outcome.was_saved() {
-            let apply_opts = InsertOptions::default().view(&effective_view);
+            let apply_opts = InsertOptions::default().view(&target_view);
             let apply_t0 = std::time::Instant::now();
-            match self.write_recorded(&outcome, apply_opts) {
+            match self.write_recorded_replacing(&outcome, apply_opts, lifecycle.removal()) {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
-                    self.refresh_working_copy_desired_state(working_copy)
-                        .map_err(RecordError::Repository)?;
+                    if target_view == desired_view {
+                        self.refresh_working_copy_desired_state(working_copy)
+                            .map_err(RecordError::Repository)?;
+                    }
 
                     // Update file index for all recorded/added files.
                     // This snapshots the filesystem metadata + content hash AFTER
                     // the record, so subsequent status() calls can skip unchanged
                     // files (mtime+size match) or avoid graph reconstruction
                     // (compare stored content hash instead).
-                    if let Ok(mut idx_txn) = self.pristine.write_txn() {
-                        let file_index_start = std::time::Instant::now();
-                        for path_str in outcome.recorded_files() {
-                            // Strip directory markers like "dir/ (directory)"
-                            let clean_path =
-                                path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
-                            let abs_path = self.root.join(clean_path);
-                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                                use std::time::SystemTime;
-                                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                                let duration = mtime
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default();
-                                let content_hash = std::fs::read(&abs_path)
-                                    .map(|bytes| Hash::of(&bytes))
-                                    .unwrap_or(Hash::ZERO);
-                                let _ = idx_txn.put_working_copy_file_index(
-                                    working_copy,
-                                    clean_path,
-                                    duration.as_secs() as i64,
-                                    duration.subsec_nanos(),
-                                    metadata.len(),
-                                    &content_hash,
-                                );
-                            }
-                        }
-
-                        // Also update FILE_INDEX for skipped files.
-                        //
-                        // Files are skipped when their graph content already
-                        // matches the working copy (old == new). Without this,
-                        // files missing a FILE_INDEX entry are perpetually
-                        // reported as Modified by status (conservative mtime
-                        // check) and perpetually skipped by record (content
-                        // unchanged) — an infinite loop.
-                        for path_str in outcome.skipped_files() {
-                            let clean_path =
-                                path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
-                            let abs_path = self.root.join(clean_path);
-                            if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                                use std::time::SystemTime;
-                                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                                let duration = mtime
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default();
-                                let content_hash = std::fs::read(&abs_path)
-                                    .map(|bytes| Hash::of(&bytes))
-                                    .unwrap_or(Hash::ZERO);
-                                let _ = idx_txn.put_working_copy_file_index(
-                                    working_copy,
-                                    clean_path,
-                                    duration.as_secs() as i64,
-                                    duration.subsec_nanos(),
-                                    metadata.len(),
-                                    &content_hash,
-                                );
-                            }
-                        }
-
-                        // Remove FILE_INDEX entries for deleted and moved-from
-                        // paths so stale source metadata cannot survive a rename.
-                        for path_str in outcome.deleted_files() {
-                            let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
-                        }
-                        for path_str in &move_source_paths {
-                            let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
-                        }
-
-                        // Clear persisted conflict state for recorded files:
-                        // recording without markers IS the resolution.
-                        let record_view = effective_view.clone();
-                        if let Ok(Some(view)) = idx_txn.get_view(&record_view) {
+                    if target_view == desired_view {
+                        if let Ok(mut idx_txn) = self.pristine.write_txn() {
+                            let file_index_start = std::time::Instant::now();
                             for path_str in outcome.recorded_files() {
+                                // Strip directory markers like "dir/ (directory)"
                                 let clean_path =
                                     path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
-                                if let Ok(Some(inode)) = idx_txn.get_inode(clean_path) {
+                                let abs_path = self.root.join(clean_path);
+                                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                    use std::time::SystemTime;
+                                    let mtime =
+                                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                    let duration = mtime
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default();
+                                    let content_hash = std::fs::read(&abs_path)
+                                        .map(|bytes| Hash::of(&bytes))
+                                        .unwrap_or(Hash::ZERO);
+                                    let _ = idx_txn.put_working_copy_file_index(
+                                        working_copy,
+                                        clean_path,
+                                        duration.as_secs() as i64,
+                                        duration.subsec_nanos(),
+                                        metadata.len(),
+                                        &content_hash,
+                                    );
+                                }
+                            }
+
+                            // Also update FILE_INDEX for skipped files.
+                            //
+                            // Files are skipped when their graph content already
+                            // matches the working copy (old == new). Without this,
+                            // files missing a FILE_INDEX entry are perpetually
+                            // reported as Modified by status (conservative mtime
+                            // check) and perpetually skipped by record (content
+                            // unchanged) — an infinite loop.
+                            for path_str in outcome.skipped_files() {
+                                let clean_path =
+                                    path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                                let abs_path = self.root.join(clean_path);
+                                if let Ok(metadata) = std::fs::metadata(&abs_path) {
+                                    use std::time::SystemTime;
+                                    let mtime =
+                                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                                    let duration = mtime
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default();
+                                    let content_hash = std::fs::read(&abs_path)
+                                        .map(|bytes| Hash::of(&bytes))
+                                        .unwrap_or(Hash::ZERO);
+                                    let _ = idx_txn.put_working_copy_file_index(
+                                        working_copy,
+                                        clean_path,
+                                        duration.as_secs() as i64,
+                                        duration.subsec_nanos(),
+                                        metadata.len(),
+                                        &content_hash,
+                                    );
+                                }
+                            }
+
+                            // Remove FILE_INDEX entries for deleted and moved-from
+                            // paths so stale source metadata cannot survive a rename.
+                            for path_str in outcome.deleted_files() {
+                                let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
+                            }
+                            for path_str in &move_source_paths {
+                                let _ = idx_txn.del_working_copy_file_index(working_copy, path_str);
+                            }
+
+                            // Clear persisted conflict state for recorded files:
+                            // recording without markers IS the resolution.
+                            let record_view = target_view.clone();
+                            if let Ok(Some(view)) = idx_txn.get_view(&record_view) {
+                                for path_str in outcome.recorded_files() {
+                                    let clean_path =
+                                        path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                                    if let Ok(Some(inode)) = idx_txn.get_inode(clean_path) {
+                                        let _ = idx_txn.del_conflicts(view.id, inode.get());
+                                    }
+                                }
+                                for inode in &resolved_name_conflict_inodes {
                                     let _ = idx_txn.del_conflicts(view.id, inode.get());
                                 }
                             }
-                            for inode in &resolved_name_conflict_inodes {
-                                let _ = idx_txn.del_conflicts(view.id, inode.get());
-                            }
-                        }
 
-                        let _ = idx_txn.commit();
-                        if trace_record {
-                            eprintln!(
-                                "[record] file_index_update complete elapsed={:?}",
-                                file_index_start.elapsed()
-                            );
+                            let _ = idx_txn.commit();
+                            if trace_record {
+                                eprintln!(
+                                    "[record] file_index_update complete elapsed={:?}",
+                                    file_index_start.elapsed()
+                                );
+                            }
                         }
                     }
                 }
@@ -1539,6 +1949,7 @@ fn plan_file_moves(
     present: &std::collections::HashMap<String, super::name_resolution::ProjectedPathClaim>,
     absent: &std::collections::HashMap<String, super::deferred_tree::ProjectedAbsent>,
     root: &Path,
+    content_filter: &dyn crate::content_filter::ContentFilter,
     detect_heuristic_moves: bool,
 ) -> Result<FileMovePlanning, RecordError> {
     use crate::record::{
@@ -1698,25 +2109,32 @@ fn plan_file_moves(
     // With detection enabled, only content evidence can justify a
     // `ProbableMove`. This prevents unrelated bytes recreated at an old path
     // from inheriting the current inode.
-    let mut destinations: Vec<(String, Vec<u8>, Option<Inode>)> = entries
-        .iter()
-        .filter_map(|entry| {
-            let path = entry.path().to_string_lossy().to_string();
-            let expected_inode = match entry.status() {
-                FileStatus::Untracked => None,
-                FileStatus::Added if historical_destinations.contains(&path) => {
-                    Some(absent.get(&path)?.inode)
-                }
-                _ => return None,
-            };
-            if used_new.contains(&path) || !root.join(&path).is_file() {
-                return None;
+    let mut destinations: Vec<(String, Vec<u8>, Option<Inode>)> = Vec::new();
+    for entry in entries {
+        let path = entry.path().to_string_lossy().to_string();
+        let expected_inode = match entry.status() {
+            FileStatus::Untracked => None,
+            FileStatus::Added if historical_destinations.contains(&path) => {
+                let Some(projected) = absent.get(&path) else {
+                    continue;
+                };
+                Some(projected.inode)
             }
-            std::fs::read(root.join(&path))
-                .ok()
-                .map(|bytes| (path, bytes, expected_inode))
-        })
-        .collect();
+            _ => continue,
+        };
+        if used_new.contains(&path) || !root.join(&path).is_file() {
+            continue;
+        }
+        let working_bytes = crate::content_filter::read_working_bytes(&root.join(&path))
+            .map_err(|error| RecordError::Database(error.to_string()))?;
+        let filtered = content_filter
+            .clean(Path::new(&path), &working_bytes)
+            .map_err(|error| RecordError::Database(error.to_string()))?;
+        for warning in &filtered.warnings {
+            log::warn!("record rename detection: {warning}");
+        }
+        destinations.push((path, filtered.bytes, expected_inode));
+    }
     destinations.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut candidates = Vec::new();

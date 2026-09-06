@@ -149,6 +149,11 @@ pub enum LossNote {
         /// Deterministically ordered evidence considered during resolution.
         candidates: BTreeSet<RenameCandidate>,
     },
+    /// Git tree projection omitted an explicitly tracked empty directory.
+    EmptyDirectory {
+        /// Repository-relative directory path.
+        path: String,
+    },
 }
 
 impl LossNote {
@@ -157,6 +162,11 @@ impl LossNote {
         Self::RenameUnresolved {
             candidates: candidates.into_iter().collect(),
         }
+    }
+
+    /// Construct a note for a directory omitted from Git tree projection.
+    pub fn empty_directory(path: impl Into<String>) -> Self {
+        Self::EmptyDirectory { path: path.into() }
     }
 }
 

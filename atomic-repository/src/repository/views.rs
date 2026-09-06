@@ -188,6 +188,9 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // Clear parent when promoting to Shared root view
         if scope.is_shared() {
@@ -245,6 +248,9 @@ impl Repository {
             None => None,
         };
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // A Shared view is a root; it never carries a parent.
         view.parent = if scope.is_shared() { None } else { parent_id };
@@ -740,6 +746,24 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
+        // Export is allowed only after the complete projection domain has been
+        // dependency-validated. The manifest still carries this view's own log;
+        // parent manifests carry inherited membership during root-to-leaf sync.
+        let projection = effective_projection_closure(&txn, &view)?;
+        for change_id in projection.iter_dependency_first().copied() {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} in view '{}' projection has no external hash",
+                        change_id.get(),
+                        name
+                    ))
+                })?;
+            self.ensure_exchangeable_change(&hash)?;
+        }
+
         let parent = match view.parent {
             Some(parent_id) => txn
                 .get_view_by_id(parent_id)
@@ -803,6 +827,15 @@ impl Repository {
                     view: manifest.name.clone(),
                     count: 1,
                     first: hash.to_base32(),
+                });
+            }
+            if self.load_change(hash)?.kind().is_snapshot() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "private snapshot {} cannot be imported into view '{}'",
+                        hash.to_base32(),
+                        manifest.name
+                    ),
                 });
             }
         }
@@ -921,6 +954,15 @@ impl Repository {
             let mut seen: HashSet<Hash> = HashSet::with_capacity(manifest.changes.len());
             for hash in &manifest.changes {
                 let change = self.load_change(hash)?;
+                if change.kind().is_snapshot() {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "private snapshot {} cannot be imported into view '{}'",
+                            hash.to_base32(),
+                            manifest.name
+                        ),
+                    });
+                }
                 for dep in change.dependencies() {
                     if seen.contains(dep) {
                         continue;

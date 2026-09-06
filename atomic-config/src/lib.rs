@@ -366,6 +366,54 @@ pub struct RepoConfig {
     /// Workspace configuration for view switching behavior.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+
+    /// Repository-byte content-filter policy.
+    #[serde(default)]
+    pub filters: ContentFilterConfig,
+}
+
+/// Bounds and external drivers used by repository-byte content filters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentFilterConfig {
+    /// Maximum wall-clock time for one external clean or smudge command.
+    #[serde(default = "default_filter_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum stdout or stderr retained from one external filter command.
+    #[serde(default = "default_filter_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Configured Git-style filter drivers, keyed by `.gitattributes` filter name.
+    #[serde(default)]
+    pub drivers: BTreeMap<String, ExternalFilterConfig>,
+}
+
+impl Default for ContentFilterConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: default_filter_timeout_ms(),
+            max_output_bytes: default_filter_output_bytes(),
+            drivers: BTreeMap::new(),
+        }
+    }
+}
+
+/// One bounded external clean/smudge driver.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExternalFilterConfig {
+    /// Command receiving working bytes on stdin and producing repository bytes.
+    pub clean: Option<String>,
+    /// Command receiving repository bytes on stdin and producing working bytes.
+    pub smudge: Option<String>,
+    /// Whether an unavailable or failed command must abort the operation.
+    #[serde(default)]
+    pub required: bool,
+}
+
+const fn default_filter_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_filter_output_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 /// Controls how ignored files are handled during view switches.

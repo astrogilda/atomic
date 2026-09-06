@@ -67,6 +67,17 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
+/// Additive inode-attribute events keyed by `(graph inode position, attribute)`.
+pub const POSITION_ATTRS: MultimapTableDefinition<&[u8; 17], &[u8; 13]> =
+    MultimapTableDefinition::new("position_attrs");
+
+/// Secondary inode-attribute index keyed by `(repository inode, attribute)`.
+///
+/// This is the metadata counterpart to `INODE_GRAPH`: callers materializing a
+/// known repository inode can retrieve its attributes without a global scan.
+pub const INODE_ATTRS: MultimapTableDefinition<&[u8; 9], &[u8; 13]> =
+    MultimapTableDefinition::new("inode_attrs");
+
 // View Tables
 
 /// View metadata
@@ -122,6 +133,14 @@ pub const VIEW_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new("
 /// Allows looking up when a change was applied to a view.
 pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
     TableDefinition::new("rev_view_changes");
+
+/// Derived order-invariant identity for each view.
+///
+/// Key: view id. Value: explicitly versioned bytes from
+/// `pristine::set_id_index`; this table is independent of order-sensitive
+/// `STATES` and may be cleared/rebuilt transactionally.
+pub const VIEW_SET_ID_INDEX: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("view_set_id_index");
 
 /// Per-view conflict state: (view_id, inode) → serialized `Vec<StoredConflict>`
 ///

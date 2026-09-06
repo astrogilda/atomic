@@ -447,6 +447,12 @@ impl ChangeCmd {
                             ));
                         }
                     }
+                    LossNote::EmptyDirectory { path } => {
+                        output.push_str(&format!(
+                            "  loss: empty directory '{}' omitted from Git tree projection\n",
+                            path
+                        ));
+                    }
                 }
             }
         }
@@ -888,6 +894,7 @@ fn get_hunk_path<H>(graph_op: &GraphOp<H>) -> Option<String> {
         GraphOp::ResurrectZombies { local, .. } => Some(local.path.clone()),
         GraphOp::AddRoot { .. } => None,
         GraphOp::DelRoot { .. } => None,
+        GraphOp::SetAttr { path, .. } => Some(path.clone()),
     }
 }
 
@@ -910,6 +917,7 @@ fn hunk_symbol_and_path<H>(graph_op: &GraphOp<H>) -> (&'static str, String) {
         GraphOp::ResurrectZombies { local, .. } => ("↑", local.path.clone()),
         GraphOp::AddRoot { .. } => ("◉", "(root)".to_string()),
         GraphOp::DelRoot { .. } => ("⊘", "(root)".to_string()),
+        GraphOp::SetAttr { path, .. } => ("@", path.clone()),
     }
 }
 

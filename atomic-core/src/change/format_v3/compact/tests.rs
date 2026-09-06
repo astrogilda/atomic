@@ -12,6 +12,7 @@ use crate::change::atom::{Atom, EdgeUpdate, Insertion, NewEdge};
 use crate::change::encoding::Encoding;
 use crate::change::graph_op::GraphOp;
 use crate::change::local::Local;
+use crate::change::{InodeAttr, InodeKind};
 use crate::types::{ChangePosition, EdgeFlags};
 use crate::Hash;
 use crate::Position;
@@ -54,6 +55,28 @@ fn make_name_conflict_table() -> HashDedupTable {
         table.insert(*make_hash(byte).as_bytes()).unwrap();
     }
     table
+}
+
+#[test]
+fn set_attr_compact_roundtrip_and_validation() {
+    let table = make_compactor_and_table();
+    let compactor = Compactor::new(&table);
+    let operation = GraphOp::SetAttr {
+        inode: make_position(Some(make_hash(0xBB)), 7),
+        path: "link".to_string(),
+        value: InodeAttr::Kind(InodeKind::Symlink),
+    };
+    let compact = compactor.compact_graph_op(&operation).unwrap();
+    let bytes = postcard::to_allocvec(&compact).unwrap();
+    let decoded: CompactGraphOp = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(compactor.expand_graph_op(&decoded).unwrap(), operation);
+
+    let malformed = GraphOp::SetAttr {
+        inode: make_position(Some(make_hash(0xBB)), 7),
+        path: "link".to_string(),
+        value: InodeAttr::Mode(0o1000),
+    };
+    assert!(compactor.compact_graph_op(&malformed).is_err());
 }
 
 // ── CompactGraphNode ───────────────────────────────────────────

@@ -149,11 +149,13 @@
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
+mod attribute;
 mod capability;
 mod error;
 mod inode_graph;
 pub mod ontology;
 mod path_claim;
+mod set_id_index;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;
@@ -161,6 +163,10 @@ mod txn;
 pub mod vault;
 pub mod view_graph;
 
+pub use attribute::{
+    decode_inode_attr_event, encode_inode_attr_event, InodeAttrEvent, InodeAttrMutTxnT,
+    InodeAttrState, InodeAttrTxnT, INODE_ATTR_EVENT_SIZE, INODE_ATTR_EVENT_VERSION,
+};
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
     CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SUPPORTED_REPOSITORY_CAPABILITIES,
@@ -174,17 +180,21 @@ pub use path_claim::{
     PathClaimKind, PathClaimState, PATH_CLAIM_EVENT_SIZE, PATH_CLAIM_EVENT_VERSION,
     PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
 };
+pub use set_id_index::{
+    decode_set_id_index_entry, encode_set_id_index_entry, SetIdIndexEntry, SetIdIndexMutTxnT,
+    SetIdIndexTxnT, SET_ID_INDEX_V1_SIZE, SET_ID_INDEX_VERSION,
+};
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
-    decode_working_copy_record, encode_working_copy_record, CrdtTxnT, EmbeddingsMutTxnT,
-    EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GitShaIndexMutTxnT, GitShaIndexTxnT,
-    GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes,
-    NativeDerivedIndexesMutTxnT, OperationMutTxnT, OperationTxnT, PathClaimMutTxnT, PathClaimTxnT,
-    StoredConflict, StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT,
-    VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState,
-    ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
-    WORKING_COPY_RECORD_VERSION,
+    decode_working_copy_record, encode_working_copy_record, CrdtTxnT, EffectiveProjectionClosure,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GitShaIndexMutTxnT,
+    GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT,
+    NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, OperationMutTxnT, OperationTxnT,
+    PathClaimMutTxnT, PathClaimTxnT, StoredConflict, StoredConflictKind, TagKind, TagMutTxnT,
+    TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
+    ViewMembershipSet, ViewScope, ViewState, ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord,
+    WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE, WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

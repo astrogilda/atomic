@@ -20,16 +20,6 @@ struct MaterializationPlanEntry {
 }
 
 #[cfg(unix)]
-fn materialized_regular_mode() -> u32 {
-    0o644
-}
-
-#[cfg(not(unix))]
-fn materialized_regular_mode() -> u32 {
-    0o666
-}
-
-#[cfg(unix)]
 fn materialized_directory_mode() -> u32 {
     0o755
 }
@@ -37,6 +27,60 @@ fn materialized_directory_mode() -> u32 {
 #[cfg(not(unix))]
 fn materialized_directory_mode() -> u32 {
     0o666
+}
+
+fn remove_existing_for_kind(path: &Path) -> Result<(), RepositoryError> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn materialize_inode_path(
+    path: &Path,
+    content: &[u8],
+    materialization: atomic_core::output::InodeMaterialization,
+) -> Result<(), RepositoryError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    remove_existing_for_kind(path)?;
+    match materialization.kind {
+        atomic_core::change::InodeKind::Regular => {
+            std::fs::write(path, content)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(u32::from(materialization.mode)),
+                )?;
+            }
+        }
+        atomic_core::change::InodeKind::Symlink => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                std::os::unix::fs::symlink(std::ffi::OsString::from_vec(content.to_vec()), path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "symlink materialization is unsupported on this platform".to_string(),
+                });
+            }
+        }
+        atomic_core::change::InodeKind::Gitlink => {
+            std::fs::create_dir(path)?;
+            std::fs::write(path.join(".git"), content)?;
+        }
+    }
+    Ok(())
 }
 
 /// Return the 1-based line number of the first Atomic conflict-start marker
@@ -350,8 +394,49 @@ impl Repository {
                 }),
             };
         }
+
+        let materialization = projection
+            .present
+            .get(&normalized)
+            .filter(|item| !item.is_directory)
+            .map(|item| {
+                atomic_core::output::project_inode_attributes(
+                    &txn,
+                    item.position,
+                    visibility.attribute_visibility(),
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))
+            })
+            .transpose()?;
+        if materialization
+            .as_ref()
+            .is_some_and(|value| value.is_conflicted())
+        {
+            return Err(RepositoryError::Output(format!(
+                "cannot switch '{}' with conflicting inode attributes",
+                path
+            )));
+        }
+        let kind = materialization
+            .map(|value| value.materialization.kind)
+            .unwrap_or(atomic_core::change::InodeKind::Regular);
         drop(txn);
-        self.get_file_content_on_view(path, view_name)
+        let Some(repository_bytes) = self.get_file_content_on_view(path, view_name)? else {
+            return Ok(None);
+        };
+        if kind != atomic_core::change::InodeKind::Regular
+            || first_conflict_marker_line(&repository_bytes).is_some()
+        {
+            return Ok(Some(repository_bytes));
+        }
+        use crate::content_filter::ContentFilter;
+        let filtered = crate::content_filter::GitAttributesFilter::for_repository(&self.root)
+            .smudge(Path::new(path), &repository_bytes)
+            .map_err(|error| RepositoryError::Output(error.to_string()))?;
+        for warning in &filtered.warnings {
+            log::warn!("switch: {warning}");
+        }
+        Ok(Some(filtered.bytes))
     }
 
     fn remove_absent_entries(
@@ -779,12 +864,8 @@ impl Repository {
             let observed = self.observe_filesystem_effect(working_copy, &target)?;
             let mut expected_new = entry.expected_new;
             if let EffectValue::File(new) = &mut expected_new {
-                match &observed {
-                    EffectValue::File(old) if old.kind == new.kind => new.mode = old.mode,
-                    EffectValue::Absent => {
-                        new.mode = self.materialized_creation_mode(new.mode)?;
-                    }
-                    _ => {}
+                if matches!(observed, EffectValue::Absent) {
+                    new.mode = self.materialized_creation_mode(new.mode)?;
                 }
             }
             if observed == expected_new {
@@ -1019,6 +1100,23 @@ impl Repository {
             })
             .collect();
 
+        let mut inode_materialization = std::collections::HashMap::new();
+        for item in &file_items {
+            let projected = atomic_core::output::project_inode_attributes(
+                &txn,
+                item.position,
+                visibility.attribute_visibility(),
+            )
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if projected.is_conflicted() {
+                return Err(RepositoryError::Output(format!(
+                    "cannot materialize '{}' with conflicting inode attributes: {:?}",
+                    item.path, projected.conflicts
+                )));
+            }
+            inode_materialization.insert(item.path.clone(), projected.materialization);
+        }
+
         let total_files = file_items.len();
         let skipped_in_filter = items.iter().filter(|i| !i.is_directory).count() - total_files;
 
@@ -1037,6 +1135,8 @@ impl Repository {
         // - Consistent, predictable per-file performance
         let root = &self.root;
         let store = &self.change_store;
+        let content_filter = crate::content_filter::GitAttributesFilter::for_repository(root);
+        use crate::content_filter::ContentFilter;
 
         let trace_mat = std::env::var_os("ATOMIC_TRACE_MATERIALIZE").is_some();
         let mat_start = std::time::Instant::now();
@@ -1206,7 +1306,7 @@ impl Repository {
                 let retrieve_ms = t_retrieve.elapsed();
                 let mut graph = retrieve_result.graph;
 
-                let (content, order_ms, content_ms) = if graph.is_empty() {
+                let (repository_content, order_ms, content_ms) = if graph.is_empty() {
                     (
                         Vec::new(),
                         std::time::Duration::ZERO,
@@ -1249,7 +1349,26 @@ impl Repository {
                     (writer.into_inner(), order_ms, t_content.elapsed())
                 };
 
-                let entry = MaterializedEntry::present(item.path.clone(), item.inode, content);
+                let materialization = inode_materialization
+                    .get(&item.path)
+                    .copied()
+                    .unwrap_or_default();
+                let working_content = if materialization.kind
+                    == atomic_core::change::InodeKind::Regular
+                    && first_conflict_marker_line(&repository_content).is_none()
+                {
+                    let filtered = content_filter
+                        .smudge(std::path::Path::new(&item.path), &repository_content)
+                        .map_err(|error| format!("{}: smudge: {}", item.path, error))?;
+                    for warning in &filtered.warnings {
+                        log::warn!("materialize: {warning}");
+                    }
+                    filtered.bytes
+                } else {
+                    repository_content
+                };
+                let entry =
+                    MaterializedEntry::present(item.path.clone(), item.inode, working_content);
                 let content = entry
                     .bytes()
                     .expect("parallel renderer always produces a present entry");
@@ -1262,16 +1381,28 @@ impl Repository {
                 let content_hash = Hash::of(content);
                 let rendered_bytes = content.len() as u64;
 
-                // Content-hash skip: if the file on disk already has this
-                // exact content, skip the write entirely.
+                let materialization = inode_materialization
+                    .get(&item.path)
+                    .copied()
+                    .unwrap_or_default();
+
+                // Content-hash skip also verifies graph-backed kind and mode;
+                // metadata-only changes must never disappear behind FILE_INDEX.
                 if let Some(&(idx_secs, idx_nanos, idx_size, ref idx_hash)) =
                     file_index.get(&item.path)
                 {
-                    if *idx_hash == content_hash {
+                    let attrs_match =
+                        super::attributes::working_inode_attrs(&root.join(&item.path))
+                            .map(|actual| {
+                                actual.kind == materialization.kind
+                                    && actual.mode == materialization.mode
+                            })
+                            .unwrap_or(false);
+                    if *idx_hash == content_hash && attrs_match {
                         // Verify the on-disk file still matches the index
                         // (hasn't been modified by the user since last materialize)
                         let abs_path = root.join(&item.path);
-                        if let Ok(meta) = std::fs::metadata(&abs_path) {
+                        if let Ok(meta) = std::fs::symlink_metadata(&abs_path) {
                             if meta.len() == idx_size {
                                 if let Ok(mtime) = meta.modified() {
                                     let dur = mtime
@@ -1396,12 +1527,23 @@ impl Repository {
                     desired.insert(
                         rendered.0.path().to_string(),
                         EffectValue::File(FileState {
-                            kind: FileKind::Regular,
-                            mode: items
-                                .iter()
-                                .find(|item| item.path == rendered.0.path())
-                                .map(|item| u32::from(item.metadata.permissions))
-                                .unwrap_or_else(materialized_regular_mode),
+                            kind: match inode_materialization
+                                .get(rendered.0.path())
+                                .copied()
+                                .unwrap_or_default()
+                                .kind
+                            {
+                                atomic_core::change::InodeKind::Regular => FileKind::Regular,
+                                atomic_core::change::InodeKind::Symlink => FileKind::Symlink,
+                                atomic_core::change::InodeKind::Gitlink => FileKind::Gitlink,
+                            },
+                            mode: u32::from(
+                                inode_materialization
+                                    .get(rendered.0.path())
+                                    .copied()
+                                    .unwrap_or_default()
+                                    .mode,
+                            ),
                             content: rendered.1,
                         }),
                     );
@@ -1520,22 +1662,14 @@ impl Repository {
                 .bytes()
                 .expect("parallel renderer always produces a present entry");
             let abs_path = root.join(&path);
+            let materialization = inode_materialization
+                .get(&path)
+                .copied()
+                .unwrap_or_default();
             let wrote = if let Some(executor) = effect_executor.as_deref_mut() {
                 executor.write_file(&path, content)?
             } else {
-                if let Some(parent) = abs_path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent).map_err(|error| {
-                            RepositoryError::Output(format!(
-                                "failed to create parent for '{}': {}",
-                                path, error
-                            ))
-                        })?;
-                    }
-                }
-                std::fs::write(&abs_path, content).map_err(|error| {
-                    RepositoryError::Output(format!("failed to write '{}': {}", path, error))
-                })?;
+                materialize_inode_path(&abs_path, content, materialization)?;
                 true
             };
 
@@ -1546,7 +1680,7 @@ impl Repository {
                 result.files_skipped += 1;
             }
 
-            let metadata = std::fs::metadata(&abs_path).map_err(|error| {
+            let metadata = std::fs::symlink_metadata(&abs_path).map_err(|error| {
                 RepositoryError::Output(format!(
                     "failed to stat materialized path '{}': {}",
                     path, error

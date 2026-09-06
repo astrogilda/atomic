@@ -1,7 +1,6 @@
 use super::*;
 
 use atomic_core::pristine::{GraphVisibilityClosure, ViewMembershipSet, ViewState};
-use atomic_core::types::SetId;
 
 fn map_pristine_error(error: atomic_core::pristine::PristineError) -> RepositoryError {
     RepositoryError::Database(error.to_string())
@@ -66,8 +65,7 @@ pub fn graph_visibility_closure<T: ViewTxnT>(
     txn: &T,
     view: &ViewState,
 ) -> Result<GraphVisibilityClosure, RepositoryError> {
-    let membership = view_membership(txn, view)?;
-    graph_visibility_from_membership(txn, &membership)
+    super::effective_projection_closure(txn, view)
 }
 
 /// Typed compatibility alias for callers that still use the former helper name.
@@ -92,41 +90,4 @@ pub fn collect_visible_change_ids_with_deps<T: ViewTxnT>(
     view: &ViewState,
 ) -> Result<GraphVisibilityClosure, RepositoryError> {
     graph_visibility_closure(txn, view)
-}
-
-/// Fold a view's effective direct membership into an order-invariant [`SetId`].
-///
-/// The SetId v1 domain remains membership-only: dependency closure expansion is
-/// intentionally excluded.
-pub fn view_set_id<T: ViewTxnT>(txn: &T, view: &ViewState) -> Result<SetId, RepositoryError> {
-    let membership = view_membership(txn, view)?;
-    let mut acc = SetId::ZERO;
-    for id in membership.iter().copied() {
-        let hash = txn
-            .get_external(id)
-            .map_err(map_pristine_error)?
-            .ok_or_else(|| {
-                RepositoryError::Database(format!("change {} has no external hash", id.get()))
-            })?;
-        acc = acc.add(&hash);
-    }
-    Ok(acc)
-}
-
-impl Repository {
-    /// Derive the order-invariant [`SetId`] of a view's effective direct
-    /// membership.
-    pub fn view_set_id(&self, name: &str) -> Result<SetId, RepositoryError> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        let view = txn
-            .get_view(name)
-            .map_err(map_pristine_error)?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: name.to_string(),
-            })?;
-        view_set_id(&txn, &view)
-    }
 }

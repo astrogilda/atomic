@@ -30,17 +30,18 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-2A: Complete baseline-relative snapshot lifecycle and promotion**
-  Intent: pending · Priority: high · Prerequisites: CB-FMT1 and CB-1C (done)
-  Add working-copy-private snapshot views, complete baseline-relative replacement, promotion reassembly, and snapshot exclusion from Shared views, ordinary log, and push.
+- [ ] **READY — CB-2B: Graph-safe staged/remainder snapshot split, retention, and snapshot UX**
+  Intent: pending · Priority: high · Prerequisites: CB-2A, CB-3A, and CB-3C (done)
+  Split snapshots into independently materializable staged and remainder changes, add structured inseparability refusal, retention, status, and `diff --snapshot`.
 
-### Parallel safety workstream
+### Recently completed critical path
 
-- [ ] **READY — CB-3A: Causal inode attributes and native mode/kind lifecycle**
-  Intent: pending · Priority: high · Prerequisites: CB-FMT1 and CB-N34 (done)
-  Add additive attribute registers, semantic mode/kind operations, graph-backed conflicts, and materialization/status parity.
+- [x] **DONE — CB-2A:** `ATOM::continuouslee::82` / `01M1W0QE1PVXN2PQC03AF25A69`
+- [x] **DONE — CB-3A:** `ATOM::continuouslee::83` / `01M1W0QG4GVT4ZNJ37PB661P7G`
+- [x] **DONE — CB-3B:** `ATOM::continuouslee::84` / `01M1W7NBBVSRG97GY0Y6AVYD8C`
+- [x] **DONE — CB-3C:** `ATOM::continuouslee::85` / `01M1W7NBQA8CJRMQAC84T58X6G`
 
-Phase 1 and the shared CB-FMT1 format foundation are complete.
+Phase 1, the shared CB-FMT1 format foundation, and the Phase 2/3 prerequisites for CB-2B are complete.
 
 ---
 
@@ -208,8 +209,8 @@ bounds; and strict workspace clippy with `-D warnings`.
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] READY | CB-2A | Complete baseline-relative snapshot lifecycle and promotion | FMT1, 1C | pending |
-| [ ] BLOCKED | CB-2B | Graph-safe staged/remainder snapshot split, retention, and snapshot UX | 2A, 3A, 3C | pending |
+| [x] DONE | CB-2A | Complete baseline-relative snapshot lifecycle and promotion | FMT1, 1C | `ATOM::continuouslee::82` / `01M1W0QE1PVXN2PQC03AF25A69` |
+| [ ] READY | CB-2B | Graph-safe staged/remainder snapshot split, retention, and snapshot UX | 2A, 3A, 3C | pending |
 
 ### CB-2A definition of done
 
@@ -231,9 +232,9 @@ operations return structured refusal; retention, status, and `diff --snapshot` w
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] READY | CB-3A | Causal inode attributes and native mode/kind lifecycle | FMT1, N34 | pending |
-| [ ] BLOCKED | CB-3B | Effective projection closure, SetId index, and topological-order proof | 3A, N6, N7 | pending |
-| [ ] BLOCKED | CB-3C | Repository-byte filters, opaque tracked content, and empty-directory loss notes | FMT1, 3A, N34 | pending |
+| [x] DONE | CB-3A | Causal inode attributes and native mode/kind lifecycle | FMT1, N34 | `ATOM::continuouslee::83` / `01M1W0QG4GVT4ZNJ37PB661P7G` |
+| [x] DONE | CB-3B | Effective projection closure, SetId index, and topological-order proof | 3A, N6, N7 | `ATOM::continuouslee::84` / `01M1W7NBBVSRG97GY0Y6AVYD8C` |
+| [x] DONE | CB-3C | Repository-byte filters, opaque tracked content, and empty-directory loss notes | FMT1, 3A, N34 | `ATOM::continuouslee::85` / `01M1W7NBQA8CJRMQAC84T58X6G` |
 
 ### CB-3A definition of done
 
@@ -521,7 +522,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-2A, with CB-3A independently ready.
+1. **Now:** CB-2B; CB-2A and CB-3A/3B/3C are complete.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation and format substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1 are done.
@@ -537,4 +538,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-2A intent next with CB-FMT1 and CB-1C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
+- Allocate the CB-2B intent next with CB-2A, CB-3A, and CB-3C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.

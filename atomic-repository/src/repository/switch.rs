@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 use atomic_core::operation::{
     ActorRef, EffectPlan, EffectReceiptKind, EffectTarget, EffectValue, FileKind, FileState,
@@ -95,16 +96,6 @@ fn operation_timestamp_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-#[cfg(unix)]
-fn default_regular_mode() -> u32 {
-    0o644
-}
-
-#[cfg(not(unix))]
-fn default_regular_mode() -> u32 {
-    0o666
 }
 
 #[cfg(unix)]
@@ -205,7 +196,7 @@ impl<'a> SwitchMaterializationExecutor<'a> {
                 matches!(
                     value,
                     EffectValue::File(state)
-                        if state.kind == FileKind::Regular && state.content == content_hash
+                        if state.kind != FileKind::Directory && state.content == content_hash
                 )
             })
             .ok_or_else(|| RepositoryError::InvalidOperation {
@@ -286,7 +277,7 @@ impl<'a> SwitchMaterializationExecutor<'a> {
                 .observe_filesystem_effect(self.operation_lock.working_copy(), &effect.target)?;
             let pending = if observed == effect.expected_old {
                 let content = match &effect.expected_new {
-                    EffectValue::File(state) if state.kind == FileKind::Regular => Some(
+                    EffectValue::File(state) if state.kind != FileKind::Directory => Some(
                         self.repository
                             .switch_target_file_bytes(path, target_view)?
                             .ok_or_else(|| RepositoryError::InvalidOperation {
@@ -358,7 +349,7 @@ impl super::materialize::MaterializationEffectExecutor for SwitchMaterialization
                 matches!(
                     value,
                     EffectValue::File(state)
-                        if state.kind == FileKind::Regular && state.content == content_hash
+                        if state.kind != FileKind::Directory && state.content == content_hash
                 )
             })
             .is_none()
@@ -517,6 +508,7 @@ impl Repository {
         let (
             old_files,
             new_files,
+            new_file_materialization,
             old_directories,
             new_directories,
             new_absent_files,
@@ -578,11 +570,25 @@ impl Repository {
                 .map(|entry| entry.path.clone())
                 .collect();
             let mut new_files = HashSet::new();
+            let mut new_file_materialization = HashMap::new();
             let mut new_directories = HashSet::new();
             for (path, item) in new_projection.present {
                 if item.is_directory {
                     new_directories.insert(path);
                 } else {
+                    let projected = atomic_core::output::project_inode_attributes(
+                        &txn,
+                        item.position,
+                        new_visibility.attribute_visibility(),
+                    )
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                    if projected.is_conflicted() {
+                        return Err(RepositoryError::Output(format!(
+                            "cannot switch '{}' with conflicting inode attributes: {:?}",
+                            path, projected.conflicts
+                        )));
+                    }
+                    new_file_materialization.insert(path.clone(), projected.materialization);
                     new_files.insert(path);
                 }
             }
@@ -590,6 +596,7 @@ impl Repository {
                 if conflict.sides.iter().all(|side| side.is_directory()) {
                     new_directories.insert(path);
                 } else {
+                    new_file_materialization.insert(path.clone(), Default::default());
                     new_files.insert(path);
                 }
             }
@@ -597,6 +604,7 @@ impl Repository {
             (
                 old_files,
                 new_files,
+                new_file_materialization,
                 old_directories,
                 new_directories,
                 new_absent_files,
@@ -816,12 +824,18 @@ impl Repository {
                         "target view '{view}' projects '{path}' as a file without materialized content"
                     ),
                 })?;
-            let mode = match &expected_old {
-                EffectValue::File(state) if state.kind == FileKind::Regular => state.mode,
-                _ => default_regular_mode(),
+            let materialization = new_file_materialization
+                .get(&path)
+                .copied()
+                .unwrap_or_default();
+            let kind = match materialization.kind {
+                atomic_core::change::InodeKind::Regular => FileKind::Regular,
+                atomic_core::change::InodeKind::Symlink => FileKind::Symlink,
+                atomic_core::change::InodeKind::Gitlink => FileKind::Gitlink,
             };
+            let mode = u32::from(materialization.mode);
             let expected_new = EffectValue::File(FileState {
-                kind: FileKind::Regular,
+                kind,
                 mode,
                 content: Hash::of(&bytes),
             });

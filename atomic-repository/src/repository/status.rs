@@ -90,6 +90,8 @@ impl Repository {
                 name: view_name.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
+        let content_filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
+        use crate::content_filter::ContentFilter;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
             &txn,
             &self.change_store,
@@ -97,8 +99,9 @@ impl Repository {
             &visibility,
         )?;
         let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projected_present = projection.present;
         let projected_present_paths: HashSet<PathBuf> =
-            projection.present.into_keys().map(PathBuf::from).collect();
+            projected_present.keys().map(PathBuf::from).collect();
         let projected_absent: Vec<_> = projection.absent_metadata.into_values().collect();
         let projected_name_conflicts = projection.name_conflicts;
         let persisted_name_paths: HashSet<String> = txn
@@ -308,10 +311,11 @@ impl Repository {
                 continue;
             }
 
-            // Check if file exists on disk
+            // Check if file exists on disk without following symlinks. Dangling
+            // links remain present and their target bytes are versioned content.
             stat_count += 1;
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(m) if m.is_file() => m,
+            let metadata = match std::fs::symlink_metadata(&abs_path) {
+                Ok(m) if m.is_file() || m.file_type().is_symlink() || (m.is_dir() && !is_dir) => m,
                 _ => {
                     // Foreign file not on disk — skip silently.
                     // This file is tracked globally (in TREE) but its
@@ -344,6 +348,46 @@ impl Repository {
             };
 
             found_on_disk.insert(path.clone());
+
+            if has_graph {
+                if let (Some(inode), Some(position)) = (
+                    inode,
+                    inode.and_then(|inode| txn.inode_position(inode).ok().flatten()),
+                ) {
+                    let projected = atomic_core::output::project_inode_attributes(
+                        &txn,
+                        position,
+                        visibility.attribute_visibility(),
+                    )
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                    if projected.is_conflicted() {
+                        let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Conflicted);
+                        entry.set_inode(inode);
+                        entry.set_details("inode attribute conflict".to_string());
+                        status.add_or_replace_entry(entry);
+                        continue;
+                    }
+                    let actual = super::attributes::working_inode_attrs(&abs_path)?;
+                    let facts = atomic_core::output::InodeStatusFacts::between(
+                        projected.materialization,
+                        actual.mode,
+                        actual.kind,
+                    );
+                    if facts.type_changed {
+                        let mut entry = FileStatusEntry::new(path.clone(), FileStatus::TypeChanged);
+                        entry.set_inode(inode);
+                        status.add_entry(entry);
+                        continue;
+                    }
+                    if facts.permissions_changed {
+                        let mut entry =
+                            FileStatusEntry::new(path.clone(), FileStatus::PermissionsChanged);
+                        entry.set_inode(inode);
+                        status.add_entry(entry);
+                        continue;
+                    }
+                }
+            }
 
             if has_graph && !projected_present_paths.contains(path) {
                 let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
@@ -401,16 +445,50 @@ impl Repository {
                     continue;
                 }
 
-                // mtime or size differ — hash to confirm
+                // mtime or size differ — hash to confirm. FILE_INDEX stores
+                // physical bytes for lease observation; only when that differs
+                // do we clean and compare repository bytes with graph content.
                 if options.hash_contents {
                     hash_count += 1;
-                    match hash_file_contents(&abs_path) {
-                        Ok(current_hash) => {
-                            if current_hash == cached_hash {
-                                // Content unchanged (just mtime drift) → Clean
+                    match crate::content_filter::read_working_bytes(&abs_path) {
+                        Ok(working_bytes) => {
+                            if Hash::of(&working_bytes) == cached_hash {
                                 continue;
                             }
-                            // Content changed → Modified
+                            let repository_bytes =
+                                if super::attributes::working_inode_attrs(&abs_path)?.kind
+                                    == atomic_core::change::InodeKind::Regular
+                                {
+                                    let filtered =
+                                        content_filter.clean(path, &working_bytes).map_err(
+                                            |error| RepositoryError::Output(error.to_string()),
+                                        )?;
+                                    for warning in &filtered.warnings {
+                                        log::warn!("status: {warning}");
+                                    }
+                                    filtered.bytes
+                                } else {
+                                    working_bytes
+                                };
+                            let current_hash = Hash::of(&repository_bytes);
+                            let graph_hash = projected_present
+                                .get(path_str.as_ref())
+                                .map(|item| {
+                                    super::content::retrieve_content_with_filter_fast(
+                                        &txn,
+                                        &self.change_store,
+                                        item.inode,
+                                        item.position,
+                                        atomic_core::output::alive::RetrieveOptions::new()
+                                            .with_graph_visibility(visibility.clone()),
+                                    )
+                                    .map(|bytes| Hash::of(&bytes))
+                                    .map_err(|error| RepositoryError::Database(error.to_string()))
+                                })
+                                .transpose()?;
+                            if graph_hash == Some(current_hash) {
+                                continue;
+                            }
                             let mut entry =
                                 FileStatusEntry::new(path.clone(), FileStatus::Modified);
                             if let Some(inode) = inode {
@@ -465,8 +543,41 @@ impl Repository {
                 if let Some(inode) = inode {
                     entry.set_inode(inode);
                 }
-                match hash_file_contents(&abs_path) {
-                    Ok(current_hash) => {
+                match crate::content_filter::read_working_bytes(&abs_path) {
+                    Ok(working_bytes) => {
+                        let repository_bytes = if super::attributes::working_inode_attrs(&abs_path)?
+                            .kind
+                            == atomic_core::change::InodeKind::Regular
+                        {
+                            let filtered = content_filter
+                                .clean(path, &working_bytes)
+                                .map_err(|error| RepositoryError::Output(error.to_string()))?;
+                            for warning in &filtered.warnings {
+                                log::warn!("status: {warning}");
+                            }
+                            filtered.bytes
+                        } else {
+                            working_bytes
+                        };
+                        let current_hash = Hash::of(&repository_bytes);
+                        let graph_hash = projected_present
+                            .get(path.to_string_lossy().as_ref())
+                            .map(|item| {
+                                super::content::retrieve_content_with_filter_fast(
+                                    &txn,
+                                    &self.change_store,
+                                    item.inode,
+                                    item.position,
+                                    atomic_core::output::alive::RetrieveOptions::new()
+                                        .with_graph_visibility(visibility.clone()),
+                                )
+                                .map(|bytes| Hash::of(&bytes))
+                                .map_err(|error| RepositoryError::Database(error.to_string()))
+                            })
+                            .transpose()?;
+                        if graph_hash == Some(current_hash) {
+                            continue;
+                        }
                         entry.set_current_hash(current_hash);
                     }
                     Err(_) => {

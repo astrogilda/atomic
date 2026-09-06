@@ -14,7 +14,9 @@ use crate::pristine::traits::tag::GitShaIndexTxnT;
 use crate::pristine::traits::tag::TagRecord;
 use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
-use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
+use crate::pristine::{
+    decode_set_id_index_entry, SetIdIndexTxnT, VaultEntry, VaultEntryType, VaultManifest,
+};
 use crate::types::{
     ChangePosition, EdgeFlags, EffectReceiptId, GraphNode, Hash, Inode, Merkle, NodeId,
     OperationId, Position, SerializedGraphEdge, WorkingCopyId,
@@ -127,6 +129,24 @@ impl ReadTxn {
             results.push((Inode::new(k.value()), v.value().to_string()));
         }
         Ok(results)
+    }
+}
+
+impl SetIdIndexTxnT for ReadTxn {
+    fn get_set_id_index(
+        &self,
+        view_id: u64,
+    ) -> PristineResult<Option<crate::pristine::SetIdIndexEntry>> {
+        let table = match self.txn.open_table(VIEW_SET_ID_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let result = match table.get(view_id)? {
+            Some(value) => decode_set_id_index_entry(value.value()).map(Some),
+            None => Ok(None),
+        };
+        result
     }
 }
 

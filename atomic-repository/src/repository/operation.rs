@@ -1440,6 +1440,40 @@ impl Repository {
                 }
                 write_atomic_regular(path, bytes, state.mode)?;
             }
+            EffectValue::File(state) if state.kind == FileKind::Symlink => {
+                let bytes = content.ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "symlink effect {} requires prepared target bytes",
+                        effect.ordinal
+                    ),
+                })?;
+                if Hash::of(bytes) != state.content {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "prepared symlink target for effect {} does not match expected-new hash",
+                            effect.ordinal
+                        ),
+                    });
+                }
+                write_atomic_symlink(path, bytes)?;
+            }
+            EffectValue::File(state) if state.kind == FileKind::Gitlink => {
+                let bytes = content.ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "gitlink effect {} requires prepared object-id bytes",
+                        effect.ordinal
+                    ),
+                })?;
+                if Hash::of(bytes) != state.content {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "prepared gitlink for effect {} does not match expected-new hash",
+                            effect.ordinal
+                        ),
+                    });
+                }
+                write_atomic_gitlink(path, bytes, state.mode)?;
+            }
             EffectValue::File(state) if state.kind == FileKind::Directory => {
                 let staging = self
                     .working_copy_effect_recovery_root(working_copy, operation.id())
@@ -2388,12 +2422,7 @@ impl Repository {
                     FileKind::Regular => write_atomic_regular_from_file(path, &source, state.mode),
                     FileKind::Directory => replace_directory(path, &source, state.mode),
                     FileKind::Symlink => replace_symlink(path, &source),
-                    FileKind::Gitlink => Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "filesystem recovery does not synthesize gitlink effect {}",
-                            recovery_effect.ordinal
-                        ),
-                    }),
+                    FileKind::Gitlink => replace_directory(path, &source, state.mode),
                 }
             }
             (EffectValue::WorkingCopy(state), ResolvedRecoveryTarget::WorkingCopy(id))
@@ -3386,6 +3415,8 @@ fn observe_path(path: &Path, recursive_directory: bool) -> Result<EffectValue, R
         FileKind::Symlink
     } else if file_type.is_file() {
         FileKind::Regular
+    } else if file_type.is_dir() && path.join(".git").is_file() && !recursive_directory {
+        FileKind::Gitlink
     } else if file_type.is_dir() {
         FileKind::Directory
     } else {
@@ -3401,7 +3432,7 @@ fn observe_path(path: &Path, recursive_directory: bool) -> Result<EffectValue, R
         FileKind::Symlink => Hash::of(&os_str_bytes(fs::read_link(path)?.as_os_str())),
         FileKind::Directory if recursive_directory => directory_content_hash(path)?,
         FileKind::Directory => Hash::of(b"atomic:filesystem-directory-entry:v1\0"),
-        FileKind::Gitlink => unreachable!(),
+        FileKind::Gitlink => Hash::of(&fs::read(path.join(".git"))?),
     };
     Ok(EffectValue::File(FileState {
         kind,
@@ -3505,16 +3536,65 @@ fn write_atomic_regular(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Repo
     set_mode(temporary.path(), mode)?;
     temporary.as_file_mut().sync_all()?;
     if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_dir()) {
-        return Err(RepositoryError::InvalidOperation {
-            message: format!(
-                "refusing to replace directory '{}' with a regular file",
-                path.display()
-            ),
-        });
+        if !remove_materialized_gitlink(path)? {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "refusing to replace directory '{}' with a regular file",
+                    path.display()
+                ),
+            });
+        }
     }
     temporary
         .persist(path)
         .map_err(|error| RepositoryError::Io(error.error))?;
+    sync_directory(parent)
+}
+
+fn write_atomic_symlink(path: &Path, target: &[u8]) -> Result<(), RepositoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::InvalidOperation {
+            message: format!("cannot replace symlink without parent: {}", path.display()),
+        })?;
+    fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".atomic-link-")
+        .tempdir_in(parent)?;
+    let prepared = staging.path().join(BACKUP_VALUE);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::os::unix::fs::symlink(std::ffi::OsString::from_vec(target.to_vec()), &prepared)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        return Err(RepositoryError::InvalidOperation {
+            message: "symlink effects are unsupported on this platform".to_string(),
+        });
+    }
+    remove_filesystem_effect_path(path)?;
+    fs::rename(&prepared, path)?;
+    sync_directory(parent)
+}
+
+fn write_atomic_gitlink(path: &Path, object_id: &[u8], mode: u32) -> Result<(), RepositoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::InvalidOperation {
+            message: format!("cannot replace gitlink without parent: {}", path.display()),
+        })?;
+    fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".atomic-gitlink-")
+        .tempdir_in(parent)?;
+    let prepared = staging.path().join(BACKUP_VALUE);
+    fs::create_dir(&prepared)?;
+    write_new_synced(&prepared.join(".git"), object_id)?;
+    set_mode(&prepared, mode)?;
+    remove_filesystem_effect_path(path)?;
+    fs::rename(&prepared, path)?;
     sync_directory(parent)
 }
 
@@ -3624,9 +3704,31 @@ fn create_directory_effect_path(
     sync_directory(parent)
 }
 
+fn remove_materialized_gitlink(path: &Path) -> Result<bool, RepositoryError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return Ok(false),
+    };
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || entries[0].file_name() != ".git" || !entries[0].file_type()?.is_file()
+    {
+        return Ok(false);
+    }
+    let git_file = entries.pop().expect("one checked gitlink entry").path();
+    fs::remove_file(git_file)?;
+    fs::remove_dir(path)?;
+    Ok(true)
+}
+
 fn remove_filesystem_effect_path(path: &Path) -> Result<(), RepositoryError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            if remove_materialized_gitlink(path)? {
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+                return Ok(());
+            }
             fs::remove_dir(path).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
                     RepositoryError::InvalidOperation {
