@@ -238,6 +238,16 @@ impl<'a> GitShaIndexTxnT for WriteTxn<'a> {
         Ok(self.get_by_git_sha(sha)?.is_some())
     }
 
+    fn list_git_shas(&self) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(GIT_SHA_INDEX)?;
+        let mut shas = Vec::new();
+        for item in table.iter()? {
+            let (key, _) = item?;
+            shas.push(key.value().to_string());
+        }
+        Ok(shas)
+    }
+
     fn find_by_git_sha_prefix(&self, prefix: &str) -> PristineResult<Option<NodeId>> {
         let table = self.txn.open_table(GIT_SHA_INDEX)?;
         let upper = format!("{}g", prefix);

@@ -493,15 +493,41 @@ impl Push {
 
     /// Async implementation of the push command.
     async fn run_async(&self) -> CliResult<()> {
-        // Find and open repository
+        // For an active Git bridge, run CB-4B through a read-only Atomic handle
+        // before writable open can recover/create an operation and before the
+        // first HTTP `/code` negotiation POST. Plain Atomic repositories retain
+        // their original writable-open/recovery behavior.
         let repo_root = find_repository_root()?;
+        let preflight = if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+            let readonly_repo =
+                Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
+            let local_view = self.get_local_view(&readonly_repo)?;
+            let publication = crate::commands::git::shadow::verify_bridge_publication(
+                &readonly_repo,
+                &repo_root,
+                &local_view,
+            )?
+            .ok_or_else(|| CliError::GitError {
+                message: "Git bridge publication marker disappeared during preflight".to_string(),
+            })?;
+            Some((local_view, publication))
+        } else {
+            None
+        };
+
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let (local_view, publication) = match preflight {
+            Some((local_view, publication)) => {
+                publication.reobserve(&repo, &repo_root)?;
+                (local_view, Some(publication))
+            }
+            None => (self.get_local_view(&repo)?, None),
+        };
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views: the leaf we push, and its name on the remote.
-        let local_view = self.get_local_view(&repo)?;
         let remote_view = self.get_remote_view(&local_view);
 
         // Print header
@@ -924,12 +950,20 @@ impl Push {
                     error
                 ))
             })?;
+        if let Some(publication) = &publication {
+            publication.reobserve(&repo, &repo_root)?;
+        }
         let push_operation = repo
             .prepare_remote_operation(working_copy, OperationKind::Push, &remote_name, evidence)
             .map_err(CliError::Repository)?;
 
         // Send everything in one `/code` push: objects stored + refs CAS-moved.
         if !pack.is_empty() {
+            // Close the local observation-to-remote-CAS window after operation
+            // preparation but immediately before the publication POST.
+            if let Some(publication) = &publication {
+                publication.reobserve(&repo, &repo_root)?;
+            }
             let spinner = create_spinner("Pushing to remote...");
             remote.sync_push(&pack).await.map_err(|e| {
                 finish_error(&spinner, "Push failed");

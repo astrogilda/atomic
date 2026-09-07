@@ -140,14 +140,26 @@ impl Repository {
         &self,
         hash: &Hash,
         change_bytes: &[u8],
+        change: &Change,
+    ) -> Result<Hash, RepositoryError> {
+        if atom_change_file_version(change_bytes)? == ATOM_CHANGE_FILE_VERSION_V2 {
+            self.pristine
+                .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+                .map_err(RepositoryError::from)?;
+        }
+        self.save_change_bytes_after_capability_declaration(hash, change_bytes, change)
+    }
+
+    /// Write pre-serialized bytes after the caller has declared V2 capability
+    /// before opening its graph transaction.
+    pub(crate) fn save_change_bytes_after_capability_declaration(
+        &self,
+        hash: &Hash,
+        change_bytes: &[u8],
         _change: &Change,
     ) -> Result<Hash, RepositoryError> {
         match atom_change_file_version(change_bytes)? {
-            ATOM_CHANGE_FILE_VERSION_V1 => {}
-            ATOM_CHANGE_FILE_VERSION_V2 => self
-                .pristine
-                .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
-                .map_err(RepositoryError::from)?,
+            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 => {}
             version => {
                 return Err(RepositoryError::Serialization(format!(
                     "unsupported ATOM change file-header version {version}; supported versions are 1 and 2"
@@ -155,14 +167,11 @@ impl Repository {
             }
         }
 
-        // Write the exact bytes to the file store (no re-serialization).
-        // Capability declaration is durably committed before this path mutates.
         let change_path = self.change_store.change_path(hash);
         if let Some(parent) = change_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&change_path, change_bytes)?;
-
         Ok(*hash)
     }
 

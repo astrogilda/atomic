@@ -79,7 +79,9 @@ use crate::RepositoryError;
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
 mod deferred_tree;
+mod equivalence;
 mod filter;
+mod git_observation;
 mod locks;
 mod materialize;
 mod migration;
@@ -100,11 +102,17 @@ mod working_copy;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
+pub use equivalence::{
+    compare_project_state, compare_project_to_index, compare_project_to_worktree,
+    verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
+    EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
+};
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
     view_membership_at_sequence,
 };
+pub use git_observation::{observe_git_index, observe_worktree, ObservationError};
 pub use locks::RepositoryCommonLockGuard;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,

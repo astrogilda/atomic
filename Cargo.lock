@@ -332,6 +332,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "git2",
  "ignore",
  "log",
  "postcard",

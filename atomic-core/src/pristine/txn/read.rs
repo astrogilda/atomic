@@ -2822,6 +2822,20 @@ impl GitShaIndexTxnT for ReadTxn {
         Ok(self.get_by_git_sha(sha)?.is_some())
     }
 
+    fn list_git_shas(&self) -> PristineResult<Vec<String>> {
+        let table = match self.txn.open_table(GIT_SHA_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut shas = Vec::new();
+        for item in table.iter()? {
+            let (key, _) = item?;
+            shas.push(key.value().to_string());
+        }
+        Ok(shas)
+    }
+
     fn find_by_git_sha_prefix(&self, prefix: &str) -> PristineResult<Option<NodeId>> {
         let table = match self.txn.open_table(GIT_SHA_INDEX) {
             Ok(t) => t,

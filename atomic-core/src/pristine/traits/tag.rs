@@ -202,6 +202,9 @@ pub trait GitShaIndexTxnT {
     /// Check if a Git SHA has been indexed.
     fn has_git_sha(&self, sha: &str) -> Result<bool, PristineError>;
 
+    /// List every indexed Git SHA in canonical byte order.
+    fn list_git_shas(&self) -> Result<Vec<String>, PristineError>;
+
     /// Look up by SHA prefix (7+ chars). Returns the matching NodeId
     /// or an error if the prefix is ambiguous.
     fn find_by_git_sha_prefix(&self, prefix: &str) -> Result<Option<NodeId>, PristineError>;

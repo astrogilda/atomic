@@ -1,8 +1,8 @@
 //! The `atomic git push` command — sync Atomic changes to Git.
 //!
-//! Materializes the current view's working copy, stages all changes with
-//! `git add -A`, commits with Atomic provenance trailers, and optionally
-//! pushes to the remote.
+//! Requires the current Atomic project tree, Git index, and worktree to be
+//! CB-4B equivalent, commits that already-verified tree with Atomic provenance
+//! trailers, and optionally pushes it to the remote.
 
 use std::io::IsTerminal;
 
@@ -19,9 +19,9 @@ use crate::output::{print_info, print_success, print_warning};
 
 /// Push Atomic changes to Git.
 ///
-/// Creates a Git commit from the current Atomic view's working copy state,
-/// with trailers linking back to the Atomic changes. Optionally pushes to
-/// the Git remote.
+/// Creates a Git commit from a CB-4B-verified Atomic/Git tree, with trailers
+/// binding the Atomic state, manifest, policy, object algorithm, and Git tree.
+/// Optionally pushes to the Git remote.
 ///
 /// When the current view is a **draft** and `--branch` is not given, the push
 /// targets a Git branch named after the view (`HEAD:refs/heads/<view>`),
@@ -83,22 +83,25 @@ impl Default for Push {
 
 impl Command for Push {
     fn run(&self) -> CliResult<()> {
-        // Find and open the Atomic repository
+        // Preflight through a read-only Atomic handle. This CB-4B gate happens
+        // before writable repository open can recover/create a local operation,
+        // and before any Git exclude/index/ODB/ref mutation.
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
-        let working_copy = repo
+        let readonly_repo = Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = readonly_repo
             .require_working_copy_id()
             .map_err(CliError::Repository)?;
+        let current_view = readonly_repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
+        let mut publication =
+            super::shadow::verify_git_publication(&readonly_repo, &repo_root, &current_view)?;
+        drop(readonly_repo);
 
-        // Open the Git repository
+        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
         let git_repo = GitRepository::discover(&repo_root).map_err(|_| CliError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
         })?;
-
-        // Get the physical working copy's desired view name for trailers.
-        let current_view = repo
-            .desired_view_name(working_copy)
-            .map_err(CliError::Repository)?;
 
         // Serialize the shadow-commit pipeline (SPEC §4.3): acquire the
         // repo-scoped lock OUTERMOST, before any staging or git mutation. If
@@ -109,6 +112,7 @@ impl Command for Push {
                 Some(guard) => guard,
                 None => return Ok(()),
             };
+        publication.reobserve(&repo, &repo_root)?;
 
         // Resolve the git branch this push targets. Explicit `--branch` wins;
         // otherwise a draft view maps to a git branch named after the view so
@@ -189,17 +193,20 @@ impl Command for Push {
         let new_history = &history[start_idx..];
         let new_count = new_history.len();
 
-        // Single shadow-commit pipeline (SPEC §5.2): stage the working copy and
-        // run the pre-commit Validator (V1 markers, V4 provenance) before a tree
-        // is produced. `git push` and the turn-end hook both go through this;
-        // there is no independent `add_all`/`write_tree` here. Any rule failure
-        // aborts atomically (index restored from HEAD, nothing committed).
+        // Single shadow-publication pipeline: CB-4B has already proved the
+        // index/worktree/project tree equivalent. Resolve that verified tree and
+        // enforce V1/V4 without staging or writing a replacement index/tree.
+        let marker_policy = if self.allow_conflict_markers {
+            super::shadow::ConflictMarkerPolicy::AllowExplicitly
+        } else {
+            super::shadow::ConflictMarkerPolicy::Refuse
+        };
         let tree_oid = super::shadow::stage_and_validate_tree(
             &repo,
             &git_repo,
             &repo_root,
-            &current_view,
-            self.allow_conflict_markers,
+            &publication,
+            marker_policy,
         )?;
         let tree = git_repo
             .find_tree(tree_oid)
@@ -260,7 +267,7 @@ impl Command for Push {
                         self.remote, target
                     ));
                 }
-                self.push_to_remote(&git_repo, target_override)?;
+                self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication)?;
                 print_success(&format!("Pushed to {}/{}", self.remote, target));
                 return Ok(());
             }
@@ -272,7 +279,7 @@ impl Command for Push {
         // reflects the latest view state so the next push can find this point.
         let latest_state = history.last().map(|e| e.state).unwrap_or_default();
         let commit_message =
-            self.build_commit_message(new_history, &latest_state, &current_view)?;
+            self.build_commit_message(new_history, &latest_state, &current_view, &publication)?;
 
         // Get git signature
         let sig = git_repo.signature().map_err(|e| CliError::GitError {
@@ -283,6 +290,11 @@ impl Command for Push {
         let parent = git_repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parents: Vec<&git2::Commit> = parent.as_ref().map(|p| vec![p]).unwrap_or_default();
 
+        // Close the observation-to-commit window. `commit(Some("HEAD"), ...)`
+        // writes both the commit object and the local ref, so no mutation is
+        // allowed unless every CB-4B lease still matches.
+        publication.reobserve_before_commit(&repo, &repo_root, &git_repo)?;
+
         // Create the commit
         let commit_oid = git_repo
             .commit(Some("HEAD"), &sig, &sig, &commit_message, &tree, &parents)
@@ -290,6 +302,7 @@ impl Command for Push {
                 message: format!("Failed to create commit: {}", e),
             })?;
 
+        publication.bind_committed_head(&git_repo, commit_oid)?;
         let short_oid = &commit_oid.to_string()[..8];
         if new_count > 0 {
             print_success(&format!(
@@ -308,7 +321,7 @@ impl Command for Push {
 
         // Push to remote unless --no-push
         if !self.no_push {
-            match self.push_to_remote(&git_repo, target_override) {
+            match self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication) {
                 Ok(()) => {
                     let target = self.target_branch(&git_repo, target_override);
                     print_success(&format!("Pushed to {}/{}", self.remote, target));
@@ -337,7 +350,14 @@ impl Push {
         new_history: &[HistoryEntry],
         latest_state: &Merkle,
         view: &str,
+        publication: &super::shadow::VerifiedPublication,
     ) -> CliResult<String> {
+        let latest_state = latest_state.to_base32();
+        if publication.view() != view || publication.atomic_state() != latest_state {
+            return Err(CliError::GitError {
+                message: "Atomic view/state changed after publication verification".to_string(),
+            });
+        }
         // Use custom message, synthesize from new change messages, or fall
         // back to a generic label when there are no new atomic changes (e.g.
         // manual working-copy edits).
@@ -351,8 +371,24 @@ impl Push {
 
         let mut msg = body;
         msg.push_str("\n\n");
-        msg.push_str(&format!("Atomic-View: {}\n", view));
-        msg.push_str(&format!("Atomic-State: {}\n", latest_state.to_base32()));
+        msg.push_str(&format!("Atomic-View: {}\n", publication.view()));
+        msg.push_str(&format!("Atomic-State: {}\n", publication.atomic_state()));
+        msg.push_str(&format!(
+            "Atomic-Manifest: {}\n",
+            publication.manifest_root().content_key
+        ));
+        msg.push_str(&format!(
+            "Atomic-Policy: {}\n",
+            publication.policy_root().content_key
+        ));
+        msg.push_str(&format!(
+            "Atomic-Algorithm: {}\n",
+            match publication.object_algorithm() {
+                atomic_core::operation::GitHashAlgorithm::Sha1 => "sha1",
+                atomic_core::operation::GitHashAlgorithm::Sha256 => "sha256",
+            }
+        ));
+        msg.push_str(&format!("Atomic-Tree: {}\n", publication.git_tree_oid()?));
 
         let change_hashes: Vec<String> = new_history.iter().map(|e| e.hash.to_base32()).collect();
 
@@ -520,8 +556,11 @@ impl Push {
     /// `IdentityFile ~/.ssh_keys/github` with an empty agent).
     fn push_to_remote(
         &self,
+        repo: &Repository,
+        repo_root: &std::path::Path,
         git_repo: &GitRepository,
         override_branch: Option<&str>,
+        publication: &super::shadow::VerifiedPublication,
     ) -> CliResult<()> {
         let head = git_repo.head().map_err(|e| CliError::GitError {
             message: format!("Failed to get HEAD: {}", e),
@@ -539,6 +578,9 @@ impl Push {
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
+
+        // Re-observe immediately before handing the ref effect to `git push`.
+        publication.reobserve_for_git_push(repo, repo_root, git_repo)?;
 
         // Inherit stdio so the user sees git's native output and any
         // interactive auth prompts (ssh passphrase, askpass) work.

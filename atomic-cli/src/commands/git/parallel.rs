@@ -52,7 +52,8 @@
 //! - Phase 2 (sequential write): ~5s
 //! - Total: ~35s vs ~5min with serial approach
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -70,14 +71,21 @@ use atomic_core::change::{
     Atom, Author, Change, ChangeHeader, EdgeUpdate, GraphOp, Insertion, NewEdge,
 };
 use atomic_core::change::{Encoding, Local};
+use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
+use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 use atomic_core::record::workflow::graph_op::BuiltHunk;
 use atomic_core::record::workflow::GitDiffLine;
 use atomic_core::record::workflow::RecordedFile;
 use atomic_core::record::workflow::{ancestor_directories, extract_filename, extract_parent};
 use atomic_core::types::{
-    Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position,
+    Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position, SetId,
 };
-use atomic_repository::Repository;
+use atomic_repository::{
+    compare_project_state, graph_visibility_closure, observe_git_index, observe_worktree,
+    verify_prospective_equivalence, ContentFilter, ConversionPolicy, EquivalenceClaims,
+    EquivalenceReport, GitAttributesFilter, ManifestDisposition, PlatformCapabilities, ProjectTree,
+    RepoPath, Repository, RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
+};
 
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
@@ -128,6 +136,8 @@ pub struct PushTrailer {
     pub view: String,
     /// Value of the `Atomic-State` trailer.
     pub state: Merkle,
+    /// Change roots named by the authoritative trailing block.
+    pub changes: Vec<String>,
 }
 
 /// A parsed git commit ready for Phase 2 processing.
@@ -149,6 +159,10 @@ pub struct ParsedCommit {
     pub is_empty: bool,
     /// `atomic git push` trailers, when the commit message ends with them.
     pub push_trailer: Option<PushTrailer>,
+    /// Complete Git tree represented by this commit.
+    pub tree_oid: Oid,
+    /// First-parent tree used as the incremental manifest base.
+    pub parent_tree_oid: Option<Oid>,
 }
 
 impl ParsedCommit {
@@ -253,6 +267,8 @@ pub struct ParsedFile {
     pub diff_lines: Option<Vec<GitDiffLine>>,
     /// Old path (for renames).
     pub old_path: Option<String>,
+    /// Canonical Git mode of the resulting path.
+    pub new_mode: Option<u32>,
 }
 
 /// Type of file operation.
@@ -313,6 +329,9 @@ pub struct ParallelImportOptions {
     /// view state it represents, and if that state is already known the
     /// commit adds nothing. Only populated for incremental imports.
     pub known_states: HashSet<Merkle>,
+    /// Prove parsed Git trees against the prospective Atomic projection before
+    /// source publication. This stays in-memory and never scans the worktree.
+    pub validate_equivalence: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -327,6 +346,7 @@ impl Default for ParallelImportOptions {
             preserve_working_copy: false,
             target_view: String::new(),
             known_states: HashSet::new(),
+            validate_equivalence: true,
         }
     }
 }
@@ -390,6 +410,293 @@ pub struct ParallelImporter {
     git_repo_path: PathBuf,
     options: ParallelImportOptions,
     ignore_matcher: ImportIgnoreMatcher,
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedImportCommit {
+    parsed: ParsedCommit,
+    prospective: ProjectTree,
+    verified: VerifiedProspectiveEquivalence,
+}
+
+pub(crate) struct ProspectiveImportPlan {
+    commits: Vec<VerifiedImportCommit>,
+}
+
+impl ProspectiveImportPlan {
+    pub(crate) fn expected_git_tree(&self) -> Option<GitObjectId> {
+        self.commits
+            .last()
+            .map(|commit| commit.verified.expected_git_tree().clone())
+    }
+
+    pub(crate) fn changed_paths(&self) -> Vec<PathBuf> {
+        let mut paths = std::collections::BTreeSet::new();
+        for commit in &self.commits {
+            for file in &commit.parsed.files {
+                paths.insert(PathBuf::from(&file.path));
+                if let Some(old_path) = &file.old_path {
+                    paths.insert(PathBuf::from(old_path));
+                }
+            }
+        }
+        paths.into_iter().collect()
+    }
+}
+
+struct ProspectiveProjectTree {
+    policy: ConversionPolicy,
+    entries: BTreeMap<RepoPath, RepositoryEntry>,
+    manifests: HashMap<Oid, ProjectTree>,
+}
+
+impl ProspectiveProjectTree {
+    fn new(policy: ConversionPolicy, current: Option<ProjectTree>) -> CliResult<Self> {
+        let mut manifests = HashMap::new();
+        let entries = if let Some(project) = current {
+            let oid = Oid::from_bytes(project.git.root.as_bytes())
+                .map_err(|error| git_error(format!("invalid projected Git tree: {error}")))?;
+            let entries = project
+                .manifest
+                .entries
+                .iter()
+                .cloned()
+                .map(|entry| (entry.path.clone(), entry))
+                .collect();
+            manifests.insert(oid, project);
+            entries
+        } else {
+            BTreeMap::new()
+        };
+        Ok(Self {
+            policy,
+            entries,
+            manifests,
+        })
+    }
+
+    fn apply_commit(
+        &mut self,
+        parsed: &ParsedCommit,
+    ) -> CliResult<(ProjectTree, VerifiedProspectiveEquivalence)> {
+        if let Some(parent) = parsed.parent_tree_oid {
+            if let Some(project) = self.manifests.get(&parent) {
+                self.entries = project
+                    .manifest
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect();
+            }
+        } else {
+            self.entries.clear();
+        }
+
+        for file in &parsed.files {
+            if file.operation == FileOperation::Renamed {
+                if let Some(old_path) = &file.old_path {
+                    self.entries.remove(
+                        &RepoPath::from_bytes(old_path.as_bytes()).map_err(|e| {
+                            git_error(format!("invalid Git path '{old_path}': {e}"))
+                        })?,
+                    );
+                }
+            }
+            let path = RepoPath::from_bytes(file.path.as_bytes())
+                .map_err(|e| git_error(format!("invalid Git path '{}': {e}", file.path)))?;
+            if file.operation == FileOperation::Deleted {
+                self.entries.remove(&path);
+                continue;
+            }
+            let bytes = file.new_content.clone().ok_or_else(|| {
+                git_error(format!(
+                    "commit {} omitted bytes for '{}'",
+                    parsed.git_sha, file.path
+                ))
+            })?;
+            let mode = file.new_mode.ok_or_else(|| {
+                git_error(format!(
+                    "commit {} omitted mode for '{}'",
+                    parsed.git_sha, file.path
+                ))
+            })?;
+            let repository_mode = match mode {
+                0o100644 => 0o644,
+                0o100755 => 0o755,
+                _ => {
+                    return Err(git_error(format!(
+                        "unsupported prospective Git mode {mode:#o} at '{}'",
+                        file.path
+                    )))
+                }
+            };
+            let disposition = self
+                .policy
+                .exclusions
+                .exclusion(&path)
+                .map(ManifestDisposition::Excluded)
+                .unwrap_or(ManifestDisposition::Included);
+            let entry = RepositoryEntry::new(
+                path.clone(),
+                bytes,
+                repository_mode,
+                atomic_core::change::InodeKind::Regular,
+                None,
+                disposition,
+            )
+            .map_err(|e| git_error(format!("cannot build prospective entry: {e}")))?;
+            self.entries.insert(path, entry);
+        }
+
+        let manifest = RepositoryManifest::new(
+            SetId::ZERO,
+            self.policy.root().content_key,
+            self.entries.values().cloned().collect(),
+        )
+        .map_err(|e| git_error(format!("cannot build prospective manifest: {e}")))?;
+        let project = ProjectTree::from_manifest(manifest, &self.policy)
+            .map_err(|e| git_error(format!("cannot fold prospective manifest: {e}")))?;
+        let expected = git_object_id(self.policy.object_format, parsed.tree_oid)?;
+        let verified = verify_prospective_equivalence(&project, &expected).map_err(|e| {
+            git_error(format!(
+                "commit {} failed prospective equivalence: {e}",
+                parsed.git_sha
+            ))
+        })?;
+        self.manifests.insert(parsed.tree_oid, project.clone());
+        Ok((project, verified))
+    }
+}
+
+pub(crate) fn conversion_policy(git: &GitRepository) -> CliResult<ConversionPolicy> {
+    let config = git
+        .config()
+        .map_err(|error| git_error(format!("cannot read Git configuration: {error}")))?;
+    let object_format = match config.get_string("extensions.objectFormat") {
+        Ok(value) if value.eq_ignore_ascii_case("sha1") => GitHashAlgorithm::Sha1,
+        Ok(value) if value.eq_ignore_ascii_case("sha256") => GitHashAlgorithm::Sha256,
+        Ok(value) => {
+            return Err(git_error(format!(
+                "unsupported Git object algorithm '{value}'"
+            )))
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => GitHashAlgorithm::Sha1,
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot read Git object algorithm: {error}"
+            )))
+        }
+    };
+    let mut policy = ConversionPolicy::new(object_format);
+    policy.platform = PlatformCapabilities {
+        lossless_unix_paths: cfg!(unix),
+        symlinks: config.get_bool("core.symlinks").unwrap_or(cfg!(unix)),
+        executable_bit: config.get_bool("core.filemode").unwrap_or(cfg!(unix)),
+        case_sensitive: !config.get_bool("core.ignorecase").unwrap_or(false),
+        unicode_normalizing: config.get_bool("core.precomposeunicode").unwrap_or(false),
+    };
+    Ok(policy)
+}
+
+pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> CliResult<GitObjectId> {
+    GitObjectId::new(algorithm, oid.as_bytes().to_vec()).map_err(|error| {
+        git_error(format!(
+            "Git object ID {oid} does not match {algorithm:?}: {error}"
+        ))
+    })
+}
+
+fn validate_import_tree_capabilities(
+    git: &GitRepository,
+    tree: &Tree<'_>,
+    prefix: &str,
+) -> CliResult<()> {
+    for entry in tree.iter() {
+        let name = entry
+            .name()
+            .ok_or_else(|| git_error("Git import path is not valid UTF-8"))?;
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match (entry.kind(), entry.filemode()) {
+            (Some(ObjectType::Tree), 0o040000) => {
+                let child = git.find_tree(entry.id()).map_err(|error| {
+                    git_error(format!("cannot read Git tree '{path}': {error}"))
+                })?;
+                validate_import_tree_capabilities(git, &child, &path)?;
+            }
+            (Some(ObjectType::Blob), 0o100644) => {}
+            (_, mode) => {
+                return Err(git_error(format!(
+                    "Git import cannot preserve required mode/kind {mode:#o} at '{path}'"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_complete_equivalence(
+    repository: &Repository,
+    view: &str,
+    root: &Path,
+    git: &GitRepository,
+    context: &str,
+) -> CliResult<()> {
+    let policy = conversion_policy(git)?;
+    let project = repository
+        .project_tree(view, &policy)
+        .map_err(|error| git_error(format!("cannot project Atomic tree: {error}")))?;
+    let index = observe_git_index(root, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git index: {error}")))?;
+    let filter = GitAttributesFilter::for_repository(root);
+    let observed = observe_worktree(root, Some(&index), &filter, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
+    let tree = git
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .and_then(|commit| commit.tree())
+        .map_err(|error| git_error(format!("cannot read Git HEAD tree: {error}")))?;
+    let claims = EquivalenceClaims {
+        object_algorithm: Some(policy.object_format),
+        git_tree_root: Some(git_object_id(policy.object_format, tree.id())?),
+        ..EquivalenceClaims::default()
+    };
+    let report = compare_project_state(&project, &index, &observed, &policy, &claims);
+    if report.is_equivalent() {
+        Ok(())
+    } else {
+        Err(equivalence_error(context, &report))
+    }
+}
+
+pub(crate) fn equivalence_error(context: &str, report: &EquivalenceReport) -> CliError {
+    let detail = report
+        .mismatches
+        .iter()
+        .map(|mismatch| {
+            let path = mismatch
+                .path
+                .as_ref()
+                .map(|path| path.escaped())
+                .unwrap_or_else(|| "<repository>".to_string());
+            format!(
+                "{:?}/{:?} {}: expected {}, actual {}",
+                mismatch.layer, mismatch.kind, path, mismatch.expected, mismatch.actual
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    git_error(format!("{context} failed complete equivalence: {detail}"))
+}
+
+fn git_error(message: impl Into<String>) -> CliError {
+    CliError::GitError {
+        message: message.into(),
+    }
 }
 
 fn is_generated_diff_skip_path(path: &str) -> bool {
@@ -935,11 +1242,11 @@ fn graph_first_skip_summary(skips: &[GraphFirstSkip], parsed: &ParsedCommit) -> 
         .join("; ")
 }
 
-fn trace_git_import_enabled() -> bool {
+pub(crate) fn trace_git_import_enabled() -> bool {
     std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some()
 }
 
-fn trace_git_import(message: impl AsRef<str>) {
+pub(crate) fn trace_git_import(message: impl AsRef<str>) {
     if trace_git_import_enabled() {
         eprintln!("[git-import] {}", message.as_ref());
     }
@@ -2387,6 +2694,273 @@ impl ParallelImporter {
         }
     }
 
+    pub(crate) fn validate_branch_prospectively(
+        &self,
+        branch_name: &str,
+        source: Option<&Repository>,
+    ) -> CliResult<ProspectiveImportPlan> {
+        let total_start = Instant::now();
+        let git = self.open_git_repo()?;
+        let policy = conversion_policy(&git)?;
+        let step = Instant::now();
+        let commit_oids = self.collect_commit_oids(&git, branch_name)?;
+        trace_git_import(format!("collect commits: {:?}", step.elapsed()));
+        let step = Instant::now();
+        let current = match source {
+            Some(source) if source.view_exists(branch_name).map_err(CliError::from)? => {
+                Some(source.project_tree(branch_name, &policy).map_err(|error| {
+                    git_error(format!("cannot project current Atomic tree: {error}"))
+                })?)
+            }
+            _ => None,
+        };
+        trace_git_import(format!("project current Atomic tree: {:?}", step.elapsed()));
+        if commit_oids.is_empty() {
+            return Ok(ProspectiveImportPlan {
+                commits: Vec::new(),
+            });
+        }
+
+        for oid in &commit_oids {
+            let tree = git
+                .find_commit(*oid)
+                .and_then(|commit| commit.tree())
+                .map_err(|error| git_error(format!("cannot read Git tree for {oid}: {error}")))?;
+            validate_import_tree_capabilities(&git, &tree, "")?;
+        }
+
+        let step = Instant::now();
+        let parsed_commits = self.phase1_parse(&commit_oids)?;
+        trace_git_import(format!("parse commits: {:?}", step.elapsed()));
+        let step = Instant::now();
+        let mut prospective = ProspectiveProjectTree::new(policy.clone(), current)?;
+        let mut verified_commits = Vec::with_capacity(parsed_commits.len());
+        for parsed in parsed_commits {
+            let (project, verified) = prospective.apply_commit(&parsed)?;
+
+            let claimed_hashes = parse_atomic_changes_trailer(&parsed.full_message());
+            if let Some(trailer) = &parsed.push_trailer {
+                if !self_push_state_known(trailer, branch_name, &self.options.known_states) {
+                    return Err(git_error(format!(
+                        "commit {} carries an unverifiable Atomic-State/Atomic-View claim",
+                        parsed.git_sha
+                    )));
+                }
+                self.verify_claimed_state(source, branch_name, &parsed, trailer, &policy)?;
+                self.validate_claimed_change_roots(source, &parsed, &trailer.changes)?;
+            } else if claimed_hashes.is_some() {
+                self.verify_claimed_change_closure(
+                    source,
+                    branch_name,
+                    &parsed,
+                    claimed_hashes.as_deref(),
+                    &policy,
+                )?;
+            }
+
+            verified_commits.push(VerifiedImportCommit {
+                parsed,
+                prospective: project,
+                verified,
+            });
+        }
+
+        trace_git_import(format!("prospective fold: {:?}", step.elapsed()));
+        if let Some(last) = verified_commits.last() {
+            self.verify_changed_worktree_paths(
+                &last.prospective,
+                &verified_commits,
+                branch_name,
+                &git,
+            )?;
+        }
+        trace_git_import(format!("prospective total: {:?}", total_start.elapsed()));
+        Ok(ProspectiveImportPlan {
+            commits: verified_commits,
+        })
+    }
+
+    fn verify_changed_worktree_paths(
+        &self,
+        prospective: &ProjectTree,
+        commits: &[VerifiedImportCommit],
+        branch_name: &str,
+        git: &GitRepository,
+    ) -> CliResult<()> {
+        if git
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().map(str::to_owned))
+            .as_deref()
+            != Some(branch_name)
+        {
+            return Ok(());
+        }
+        let root = git
+            .workdir()
+            .ok_or_else(|| git_error("checked-out import branch has no worktree"))?;
+        let filter = GitAttributesFilter::for_repository(root);
+        let mut changed = std::collections::BTreeSet::new();
+        for commit in commits {
+            for file in &commit.parsed.files {
+                changed.insert(file.path.as_str());
+                if let Some(old_path) = file.old_path.as_deref() {
+                    changed.insert(old_path);
+                }
+            }
+        }
+        let expected: BTreeMap<_, _> = prospective
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_bytes(), entry))
+            .collect();
+        for path in changed {
+            let repo_path = RepoPath::from_bytes(path.as_bytes())
+                .map_err(|error| git_error(format!("invalid changed path '{path}': {error}")))?;
+            let physical = root.join(path);
+            let Some(entry) = expected.get(repo_path.as_bytes()) else {
+                if physical.symlink_metadata().is_ok() {
+                    return Err(git_error(format!(
+                        "deleted Git path '{path}' is still present in the worktree"
+                    )));
+                }
+                continue;
+            };
+            if entry.disposition != ManifestDisposition::Included
+                || entry.kind != atomic_core::change::InodeKind::Regular
+            {
+                continue;
+            }
+            let bytes = fs::read(&physical).map_err(|error| {
+                git_error(format!(
+                    "cannot read changed worktree path '{path}': {error}"
+                ))
+            })?;
+            let cleaned = filter.clean(Path::new(path), &bytes).map_err(|error| {
+                git_error(format!(
+                    "cannot clean changed worktree path '{path}': {error}"
+                ))
+            })?;
+            if cleaned.bytes != entry.repository_bytes {
+                return Err(git_error(format!(
+                    "changed worktree path '{path}' does not match the verified Git tree"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_claimed_state(
+        &self,
+        source: Option<&Repository>,
+        branch_name: &str,
+        parsed: &ParsedCommit,
+        trailer: &PushTrailer,
+        policy: &ConversionPolicy,
+    ) -> CliResult<()> {
+        let source = source.ok_or_else(|| {
+            git_error(format!(
+                "commit {} claims Atomic state but no Atomic repository exists",
+                parsed.git_sha
+            ))
+        })?;
+        let state_project = source
+            .project_tree_at_state(branch_name, trailer.state, policy)
+            .map_err(|error| {
+                git_error(format!(
+                    "commit {} carries an unverifiable Atomic state: {error}",
+                    parsed.git_sha
+                ))
+            })?;
+        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        verify_prospective_equivalence(&state_project, &expected).map_err(|error| {
+            git_error(format!(
+                "commit {} carries a forged Atomic state: {error}",
+                parsed.git_sha
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn validate_claimed_change_roots(
+        &self,
+        source: Option<&Repository>,
+        parsed: &ParsedCommit,
+        encoded_hashes: &[String],
+    ) -> CliResult<()> {
+        let source = source.ok_or_else(|| {
+            git_error(format!(
+                "commit {} claims Atomic changes but no Atomic repository exists",
+                parsed.git_sha
+            ))
+        })?;
+        for encoded in encoded_hashes {
+            let hash = ContentHash::from_base32(encoded.as_bytes()).ok_or_else(|| {
+                git_error(format!(
+                    "commit {} carries invalid Atomic-Changes value '{encoded}'",
+                    parsed.git_sha
+                ))
+            })?;
+            source.load_change(&hash).map_err(|error| {
+                git_error(format!(
+                    "commit {} references unavailable Atomic change {encoded}: {error}",
+                    parsed.git_sha
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn verify_claimed_change_closure(
+        &self,
+        source: Option<&Repository>,
+        branch_name: &str,
+        parsed: &ParsedCommit,
+        encoded_hashes: Option<&[String]>,
+        policy: &ConversionPolicy,
+    ) -> CliResult<()> {
+        let source = source.ok_or_else(|| {
+            git_error(format!(
+                "commit {} claims Atomic provenance but no Atomic repository exists",
+                parsed.git_sha
+            ))
+        })?;
+        let encoded_hashes = encoded_hashes.ok_or_else(|| {
+            git_error(format!(
+                "commit {} claims Atomic state without an Atomic-Changes closure",
+                parsed.git_sha
+            ))
+        })?;
+        let hashes = encoded_hashes
+            .iter()
+            .map(|encoded| {
+                ContentHash::from_base32(encoded.as_bytes()).ok_or_else(|| {
+                    git_error(format!(
+                        "commit {} carries invalid Atomic-Changes value '{encoded}'",
+                        parsed.git_sha
+                    ))
+                })
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        let closure = source
+            .project_tree_for_change_closure(branch_name, &hashes, policy)
+            .map_err(|error| {
+                git_error(format!(
+                    "commit {} carries an unverifiable Atomic change closure: {error}",
+                    parsed.git_sha
+                ))
+            })?;
+        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        verify_prospective_equivalence(&closure, &expected).map_err(|error| {
+            git_error(format!(
+                "commit {} carries a forged Atomic change closure: {error}",
+                parsed.git_sha
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Import commits from a branch into an Atomic repository.
     ///
     /// Commits are processed in **batches** to keep memory bounded and show
@@ -2399,96 +2973,43 @@ impl ParallelImporter {
         branch_name: &str,
         repo: &mut Repository,
     ) -> CliResult<ImportStats> {
+        let plan = self.validate_branch_prospectively(branch_name, Some(repo))?;
+        self.import_prevalidated(branch_name, repo, plan)
+    }
+
+    pub(crate) fn import_prevalidated(
+        &self,
+        branch_name: &str,
+        repo: &mut Repository,
+        plan: ProspectiveImportPlan,
+    ) -> CliResult<ImportStats> {
         let working_copy = repo
             .require_working_copy_id()
             .map_err(|e| CliError::Internal(e.into()))?;
         let mut stats = ImportStats::default();
 
-        // Open git repo for this thread
-        let git_repo = self.open_git_repo()?;
-
-        // Collect commit OIDs in topological order
-        let commit_oids = self.collect_commit_oids(&git_repo, branch_name)?;
-        stats.commits_found = commit_oids.len();
-
-        if commit_oids.is_empty() {
+        stats.commits_found = plan.commits.len();
+        stats.commits_parsed = plan.commits.len();
+        if plan.commits.is_empty() {
             return Ok(stats);
         }
 
-        let total = commit_oids.len();
-        let batch_size = Self::batch_size_for(total);
-
-        print_info(&format!(
-            "Importing {} commits in batches of {}...",
-            total, batch_size
-        ));
-
+        let total = plan.commits.len();
+        print_info(&format!("Importing {total} preflight-verified commits..."));
         let import_start = Instant::now();
-        let mut commits_written = 0usize;
         let mut line_index = ImportLineIndex::default();
-        let mut all_imported_commits: Vec<ImportedCommitInfo> = Vec::new();
-
-        for (batch_idx, chunk) in commit_oids.chunks(batch_size).enumerate() {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = (batch_start + chunk.len()).min(total);
-
-            print_info(&format!(
-                "Batch {}: parsing commits {}-{} of {}...",
-                batch_idx + 1,
-                batch_start,
-                batch_end,
-                total
-            ));
-
-            // Phase 1: Parallel git parsing for this batch
-            let parse_start = Instant::now();
-            let parsed_commits = self.phase1_parse(chunk)?;
-            let parse_elapsed = parse_start.elapsed();
-
-            stats.phase1_duration += parse_elapsed;
-            stats.commits_parsed += parsed_commits.len();
-
-            if parsed_commits.is_empty() {
-                continue;
-            }
-
-            // Phase 2: Sequential write for this batch
-            let write_start = Instant::now();
-            let (write_stats, batch_imported) =
-                self.phase2_write(repo, &parsed_commits, &mut line_index)?;
-            let write_elapsed = write_start.elapsed();
-
-            stats.phase2_duration += write_elapsed;
-            stats.changes_written += write_stats.changes_written;
-            stats.empty_commits += write_stats.empty_commits;
-            stats.merge_commits += write_stats.merge_commits;
-            stats.self_push_skipped += write_stats.self_push_skipped;
-            stats.squash_inserted += write_stats.squash_inserted;
-            stats.squash_skipped += write_stats.squash_skipped;
-            stats.files_processed += write_stats.files_processed;
-
-            commits_written += write_stats.changes_written
-                + write_stats.empty_commits
-                + write_stats.merge_commits
-                + write_stats.squash_inserted;
-            all_imported_commits.extend(batch_imported);
-
-            let total_elapsed = import_start.elapsed();
-            let avg_ms = if commits_written > 0 {
-                total_elapsed.as_secs_f64() * 1000.0 / commits_written as f64
-            } else {
-                0.0
-            };
-
-            print_info(&format!(
-                "Batch {} done: parsed {:.1}s, wrote {:.1}s ({} changes, avg {:.1}ms/commit)",
-                batch_idx + 1,
-                parse_elapsed.as_secs_f64(),
-                write_elapsed.as_secs_f64(),
-                write_stats.changes_written,
-                avg_ms,
-            ));
-        }
+        let write_start = Instant::now();
+        let (write_stats, all_imported_commits) =
+            self.phase2_write(repo, &plan.commits, &mut line_index)?;
+        let write_elapsed = write_start.elapsed();
+        stats.phase2_duration = write_elapsed;
+        stats.changes_written = write_stats.changes_written;
+        stats.empty_commits = write_stats.empty_commits;
+        stats.merge_commits = write_stats.merge_commits;
+        stats.self_push_skipped = write_stats.self_push_skipped;
+        stats.squash_inserted = write_stats.squash_inserted;
+        stats.squash_skipped = write_stats.squash_skipped;
+        stats.files_processed = write_stats.files_processed;
 
         let total_elapsed = import_start.elapsed();
         print_info(&format!(
@@ -2534,6 +3055,14 @@ impl ParallelImporter {
                     print_warning(&format!("Post-import classification failed: {}", e));
                 }
             }
+        }
+
+        if self.options.validate_equivalence {
+            // The typed prospective plan already proved the complete target
+            // tree. Disk-driven reconciliation would both duplicate that work
+            // and incorrectly make ambient working-copy files authoritative.
+            self.phase3_finalize(&stats)?;
+            return Ok(stats);
         }
 
         if self.options.preserve_working_copy {
@@ -2675,14 +3204,38 @@ impl ParallelImporter {
             message: format!("Branch '{}' has no target commit", branch_name),
         })?;
 
+        // Incremental single-branch import is the latency-sensitive path. Walk
+        // the first-parent chain from the tip and stop at the imported frontier
+        // instead of rev-walking and filtering the repository's entire history.
+        if self.options.incremental && self.options.mainline_only {
+            let mut newest_first = Vec::new();
+            let mut cursor = Some(target_oid);
+            while let Some(oid) = cursor {
+                if self.options.imported_shas.contains(&oid.to_string()) {
+                    break;
+                }
+                newest_first.push(oid);
+                let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+                    message: format!("Failed to load commit {oid}: {e}"),
+                })?;
+                cursor = if commit.parent_count() == 0 {
+                    None
+                } else {
+                    Some(commit.parent_id(0).map_err(|e| CliError::GitError {
+                        message: format!("Failed to read first parent of {oid}: {e}"),
+                    })?)
+                };
+            }
+            newest_first.reverse();
+            return Ok(newest_first);
+        }
+
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
-
         revwalk.push(target_oid).map_err(|e| CliError::GitError {
             message: format!("Failed to push target to revwalk: {}", e),
         })?;
-
         if self.options.mainline_only {
             revwalk
                 .simplify_first_parent()
@@ -2690,8 +3243,6 @@ impl ParallelImporter {
                     message: format!("Failed to simplify revwalk to first-parent history: {}", e),
                 })?;
         }
-
-        // Topological order, oldest first
         revwalk
             .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
             .map_err(|e| CliError::GitError {
@@ -2703,15 +3254,11 @@ impl ParallelImporter {
             let oid = oid_result.map_err(|e| CliError::GitError {
                 message: format!("Revwalk error: {}", e),
             })?;
-
-            // Skip already imported commits in incremental mode
             if self.options.incremental && self.options.imported_shas.contains(&oid.to_string()) {
                 continue;
             }
-
             oids.push(oid);
         }
-
         Ok(oids)
     }
 
@@ -2788,7 +3335,7 @@ impl ParallelImporter {
     fn phase2_write(
         &self,
         repo: &mut Repository,
-        commits: &[ParsedCommit],
+        commits: &[VerifiedImportCommit],
         line_index: &mut ImportLineIndex,
     ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
         let working_copy = repo
@@ -2800,7 +3347,8 @@ impl ParallelImporter {
         let phase2_start = Instant::now();
         let mut batch_start = Instant::now();
 
-        for (idx, parsed) in commits.iter().enumerate() {
+        for (idx, candidate) in commits.iter().enumerate() {
+            let parsed = &candidate.parsed;
             // Commits created by `atomic git push` whose referenced view
             // state is already present add nothing — skip them entirely.
             if should_skip_self_push(parsed, &self.options) {
@@ -2851,7 +3399,7 @@ impl ParallelImporter {
             // Fail closed on a partial import. Earlier successfully written
             // commits remain indexed, so an incremental retry resumes from
             // them instead of publishing a silent hole in the Git history.
-            let info = self.write_commit(repo, parsed, line_index)?;
+            let info = self.write_commit(repo, parsed, line_index, &candidate.verified)?;
             if parsed.is_empty {
                 stats.empty_commits += 1;
             } else if parsed.is_merge {
@@ -2871,8 +3419,8 @@ impl ParallelImporter {
         let repo_root = repo.root().to_path_buf();
         let mut index_entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
-        for parsed in commits {
-            for file in &parsed.files {
+        for candidate in commits {
+            for file in &candidate.parsed.files {
                 if file.operation == FileOperation::Deleted {
                     continue;
                 }
@@ -3051,6 +3599,7 @@ impl ParallelImporter {
         repo: &mut Repository,
         parsed: &ParsedCommit,
         line_index: &mut ImportLineIndex,
+        verified: &VerifiedProspectiveEquivalence,
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
@@ -3080,7 +3629,7 @@ impl ParallelImporter {
 
         // Handle empty commits
         if parsed.is_empty {
-            return self.write_empty_commit(repo, parsed, header);
+            return self.write_empty_commit(repo, parsed, header, verified);
         }
 
         line_index
@@ -3130,6 +3679,7 @@ impl ParallelImporter {
                 graph_change,
                 &graph_deleted_paths,
                 self.options.preserve_working_copy,
+                verified,
                 Default::default(),
             );
             let write_ms = write_start.elapsed().as_millis();
@@ -3535,6 +4085,7 @@ impl ParallelImporter {
                 metadata,
                 &deleted_paths,
                 self.options.preserve_working_copy,
+                verified,
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -3626,6 +4177,7 @@ impl ParallelImporter {
         repo: &mut Repository,
         parsed: &ParsedCommit,
         header: ChangeHeader,
+        verified: &VerifiedProspectiveEquivalence,
     ) -> CliResult<ImportedCommitInfo> {
         let commit_start = Instant::now();
         let metadata = self.build_git_metadata(parsed, true, false);
@@ -3636,6 +4188,7 @@ impl ParallelImporter {
                 metadata,
                 &[],
                 self.options.preserve_working_copy,
+                verified,
                 Default::default(),
             )
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -4318,6 +4871,8 @@ fn parse_commit(
         is_merge,
         is_empty,
         push_trailer: parse_push_trailer(commit.message().unwrap_or("")),
+        tree_oid: tree.id(),
+        parent_tree_oid: parent_tree.as_ref().map(Tree::id),
     })
 }
 
@@ -4332,17 +4887,22 @@ fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
 
     let mut view = None;
     let mut state = None;
+    let mut changes = Vec::new();
     for line in last_paragraph.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("Atomic-View:") {
             view = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("Atomic-State:") {
             state = Merkle::from_base32(value.trim().as_bytes());
-        } else if line.starts_with("Atomic-Changes:") {
-            // Optional trailer; not needed for self-push detection (we only
-            // care about view + state here). The authoritative collection of
-            // these hashes for ReviewGate provenance happens in
-            // `parse_atomic_changes_trailer`, which scans the whole message.
+        } else if let Some(value) = line.strip_prefix("Atomic-Changes:") {
+            changes.extend(split_atomic_changes_value(value));
+        } else if line.starts_with("Atomic-Manifest:")
+            || line.starts_with("Atomic-Policy:")
+            || line.starts_with("Atomic-Algorithm:")
+            || line.starts_with("Atomic-Tree:")
+        {
+            // These publication claims are verified by the prospective/state
+            // project-tree comparisons rather than trusted as identities.
         } else {
             // Non-trailer content in the final paragraph — not a commit
             // produced by `atomic git push`.
@@ -4353,6 +4913,7 @@ fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
     Some(PushTrailer {
         view: view?,
         state: state?,
+        changes,
     })
 }
 
@@ -4503,6 +5064,8 @@ fn parse_diff_files(
             old_content,
             diff_lines,
             old_path,
+            new_mode: (operation != FileOperation::Deleted)
+                .then(|| canonical_git_mode(new_file.mode())),
         });
     }
 
@@ -4564,6 +5127,7 @@ fn parse_diff_files_via_git_cli(
                     old_content: None,
                     diff_lines: None,
                     old_path: None,
+                    new_mode: git_mode_at(tree, path),
                 });
             }
             'M' => {
@@ -4575,6 +5139,7 @@ fn parse_diff_files_via_git_cli(
                     old_content: get_file_content(git_repo, parent_tree, path).ok(),
                     diff_lines: None,
                     old_path: None,
+                    new_mode: git_mode_at(tree, path),
                 });
             }
             'D' => {
@@ -4586,6 +5151,7 @@ fn parse_diff_files_via_git_cli(
                     old_content: get_file_content(git_repo, parent_tree, path).ok(),
                     diff_lines: None,
                     old_path: None,
+                    new_mode: None,
                 });
             }
             'R' => {
@@ -4600,6 +5166,7 @@ fn parse_diff_files_via_git_cli(
                     old_content: get_file_content(git_repo, parent_tree, old_path).ok(),
                     diff_lines: None,
                     old_path: Some(old_path.to_string()),
+                    new_mode: git_mode_at(tree, path),
                 });
             }
             'C' => {
@@ -4612,6 +5179,7 @@ fn parse_diff_files_via_git_cli(
                     old_content: None,
                     diff_lines: None,
                     old_path: old_path.map(|path| path.to_string()),
+                    new_mode: git_mode_at(tree, path),
                 });
             }
             _ => {}
@@ -4619,6 +5187,23 @@ fn parse_diff_files_via_git_cli(
     }
 
     Ok(files)
+}
+
+fn canonical_git_mode(mode: git2::FileMode) -> u32 {
+    match mode {
+        git2::FileMode::Tree => 0o040000,
+        git2::FileMode::Blob | git2::FileMode::BlobGroupWritable => 0o100644,
+        git2::FileMode::BlobExecutable => 0o100755,
+        git2::FileMode::Link => 0o120000,
+        git2::FileMode::Commit => 0o160000,
+        git2::FileMode::Unreadable => 0,
+    }
+}
+
+fn git_mode_at(tree: &Tree<'_>, path: &str) -> Option<u32> {
+    tree.get_path(Path::new(path))
+        .ok()
+        .map(|entry| entry.filemode() as u32)
 }
 
 /// Get file content from a git tree.
@@ -4679,6 +5264,20 @@ mod tests {
     use super::*;
 
     fn added_commit(path: &str, content: &[u8]) -> ParsedCommit {
+        let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+        let entry = RepositoryEntry::new(
+            RepoPath::from_bytes(path.as_bytes()).unwrap(),
+            content.to_vec(),
+            0o644,
+            atomic_core::change::InodeKind::Regular,
+            None,
+            ManifestDisposition::Included,
+        )
+        .unwrap();
+        let manifest =
+            RepositoryManifest::new(SetId::ZERO, policy.root().content_key, vec![entry]).unwrap();
+        let project = ProjectTree::from_manifest(manifest, &policy).unwrap();
+        let tree_oid = Oid::from_bytes(project.git.root.as_bytes()).unwrap();
         ParsedCommit {
             git_sha: "0123456789abcdef".to_string(),
             short_sha: "01234567".to_string(),
@@ -4696,12 +5295,86 @@ mod tests {
                 old_content: None,
                 diff_lines: None,
                 old_path: None,
+                new_mode: Some(0o100644),
             }],
             parent_index: None,
             is_merge: false,
             is_empty: false,
             push_trailer: None,
+            tree_oid,
+            parent_tree_oid: None,
         }
+    }
+
+    fn verified_for(parsed: &ParsedCommit) -> VerifiedProspectiveEquivalence {
+        ProspectiveProjectTree::new(ConversionPolicy::new(GitHashAlgorithm::Sha1), None)
+            .unwrap()
+            .apply_commit(parsed)
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn warm_prospective_preflight_is_deterministic_and_millisecond_scale() {
+        let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+        let entries = (0..2_000)
+            .map(|index| {
+                let path =
+                    RepoPath::from_bytes(format!("src/file-{index:04}.rs").as_bytes()).unwrap();
+                RepositoryEntry::new(
+                    path,
+                    format!("pub const VALUE_{index}: usize = {index};\n").into_bytes(),
+                    0o644,
+                    atomic_core::change::InodeKind::Regular,
+                    None,
+                    ManifestDisposition::Included,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let baseline = ProjectTree::from_manifest(
+            RepositoryManifest::new(SetId::ZERO, policy.root().content_key, entries.clone())
+                .unwrap(),
+            &policy,
+        )
+        .unwrap();
+        let mut changed_entries = entries;
+        let changed_path = RepoPath::from_bytes(b"src/file-1000.rs").unwrap();
+        changed_entries[1_000] = RepositoryEntry::new(
+            changed_path,
+            b"pub const VALUE_1000: usize = 42;\n".to_vec(),
+            0o644,
+            atomic_core::change::InodeKind::Regular,
+            None,
+            ManifestDisposition::Included,
+        )
+        .unwrap();
+        let expected = ProjectTree::from_manifest(
+            RepositoryManifest::new(SetId::ZERO, policy.root().content_key, changed_entries)
+                .unwrap(),
+            &policy,
+        )
+        .unwrap();
+        let mut parsed = added_commit("src/file-1000.rs", b"pub const VALUE_1000: usize = 42;\n");
+        parsed.files[0].operation = FileOperation::Modified;
+        parsed.parent_tree_oid = Some(Oid::from_bytes(baseline.git.root.as_bytes()).unwrap());
+        parsed.tree_oid = Oid::from_bytes(expected.git.root.as_bytes()).unwrap();
+
+        let mut prospective = ProspectiveProjectTree::new(policy, Some(baseline)).unwrap();
+        let started = Instant::now();
+        let (first, _) = prospective.apply_commit(&parsed).unwrap();
+        let elapsed = started.elapsed();
+        let (second, _) = prospective.apply_commit(&parsed).unwrap();
+        eprintln!(
+            "CB-4B warm prospective preflight: {:.3}ms for 2,000 files / 1 changed entry",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(first.manifest.root(), second.manifest.root());
+        assert_eq!(first.git.root, expected.git.root);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "warm prospective preflight took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -4794,8 +5467,9 @@ mod tests {
             true,
         )
         .unwrap();
+        let first_verified = verified_for(&parsed);
         let first = repo
-            .write_import_graph_change(change, &deleted, false, Default::default())
+            .write_import_graph_change(change, &deleted, false, &first_verified, Default::default())
             .unwrap();
         assert_eq!(
             repo.get_file_content("src/domain/model.rs").unwrap(),
@@ -4819,8 +5493,15 @@ mod tests {
         )
         .unwrap();
         assert!(second_change.dependencies().contains(&first.hash));
+        let second_verified = verified_for(&second);
         reopened
-            .write_import_graph_change(second_change, &second_deleted, false, Default::default())
+            .write_import_graph_change(
+                second_change,
+                &second_deleted,
+                false,
+                &second_verified,
+                Default::default(),
+            )
             .unwrap();
 
         drop(reopened);
@@ -4951,6 +5632,8 @@ mod tests {
                 "feat: test\n\nAtomic-View: {}\nAtomic-State: {}",
                 view, state_b32
             )),
+            tree_oid: Oid::zero(),
+            parent_tree_oid: None,
         }
     }
 
@@ -5059,6 +5742,65 @@ mod tests {
         let stats = ImportStats::default();
         assert_eq!(stats.commits_found, 0);
         assert_eq!(stats.changes_written, 0);
+    }
+
+    #[test]
+    fn incremental_first_parent_collection_stops_at_indexed_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_repo = GitRepository::init(dir.path()).unwrap();
+        let signature = git2::Signature::now("Atomic", "atomic@example.com").unwrap();
+        let tree_oid = {
+            let mut index = git_repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = git_repo.find_tree(tree_oid).unwrap();
+        let first_oid = git_repo
+            .commit(Some("HEAD"), &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        let mut parent_oid = first_oid;
+        for number in 0..250 {
+            let parent = git_repo.find_commit(parent_oid).unwrap();
+            parent_oid = git_repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    &format!("history {number}"),
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+        }
+        let frontier = parent_oid;
+        let parent = git_repo.find_commit(parent_oid).unwrap();
+        let tip = git_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "one-line incremental commit",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let branch = git_repo.head().unwrap().shorthand().unwrap().to_string();
+        let options = ParallelImportOptions {
+            incremental: true,
+            imported_shas: HashSet::from([frontier.to_string()]),
+            mainline_only: true,
+            ..ParallelImportOptions::default()
+        };
+        let importer = ParallelImporter::new(&git_repo, options);
+
+        let started = Instant::now();
+        let collected = importer.collect_commit_oids(&git_repo, &branch).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(collected, vec![tip]);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "incremental frontier lookup took {elapsed:?}"
+        );
     }
 
     #[test]

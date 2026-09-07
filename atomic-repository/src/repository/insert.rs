@@ -834,6 +834,7 @@ impl Repository {
         unhashed: serde_json::Value,
         deleted_paths: &[String],
         preserve_existing_tree_paths: bool,
+        _verified: &VerifiedProspectiveEquivalence,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use atomic_core::record::workflow::assemble_change;
@@ -841,6 +842,9 @@ impl Repository {
 
         let mut timings = ImportWriteTimings::default();
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        self.pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .map_err(RepositoryError::from)?;
 
         let mut txn = self
             .pristine
@@ -890,7 +894,7 @@ impl Repository {
         debug_assert_eq!(hash, verified_hash);
 
         let save_start = std::time::Instant::now();
-        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
+        self.save_change_bytes_after_capability_declaration(&hash, &v3_bytes, &final_change)?;
         timings.save_ms = save_start.elapsed().as_millis();
 
         let change_id = txn
@@ -966,11 +970,15 @@ impl Repository {
         change: Change,
         deleted_paths: &[String],
         preserve_existing_tree_paths: bool,
+        _verified: &VerifiedProspectiveEquivalence,
         options: InsertOptions,
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         validate_import_deleted_paths(&change, deleted_paths)?;
         let mut timings = ImportWriteTimings::default();
         let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        self.pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .map_err(RepositoryError::from)?;
 
         let mut txn = self
             .pristine
@@ -1058,7 +1066,7 @@ impl Repository {
         }
 
         let save_start = std::time::Instant::now();
-        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
+        self.save_change_bytes_after_capability_declaration(&hash, &v3_bytes, &final_change)?;
         timings.save_ms = save_start.elapsed().as_millis();
 
         let change_id = txn
@@ -1075,6 +1083,7 @@ impl Repository {
             deleted_paths,
             preserve_existing_tree_paths,
         )?;
+
         tree_projection.apply_prerequisites(&mut txn)?;
 
         let apply_start = std::time::Instant::now();
@@ -1531,12 +1540,14 @@ impl Repository {
         {
             let mut graph_batch = atomic_core::apply::CachedWriteGraphTxn::new(&*txn)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
             for (inode, flag, source, target) in pending_edges {
                 graph_batch
                     .add_edge_with_reverse(inode, flag, source, target, change_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
             }
         }
+
         let graph_ms = graph_start.elapsed().as_millis();
 
         // Phase 1 of git import writes the graph truth and stores semantic
@@ -2872,6 +2883,18 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.has_git_sha(git_sha)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+
+    /// List indexed Git SHAs without loading historical change objects.
+    pub fn indexed_git_shas(&self) -> Result<Vec<String>, RepositoryError> {
+        use atomic_core::pristine::GitShaIndexTxnT;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.list_git_shas()
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 

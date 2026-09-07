@@ -1,30 +1,358 @@
-//! The shadow-commit pipeline — the single path that stages a shadow commit and
-//! runs the pre-commit Validator before a git tree is produced.
+//! The shadow-publication pipeline and its CB-4B equivalence capability.
 //!
-//! Per `SPEC-single-materializer-validator.md` (§5), exactly one code path may
-//! stage the shadow working copy and hand a candidate to the Validator.
-//! `atomic git push` and the turn-end hook both go through
-//! [`stage_and_validate_tree`], so no other path independently
-//! `git add -A`/`write_tree`s the tree. Any Validator rule failure aborts
-//! atomically: the git index is restored from HEAD and nothing is committed.
+//! `atomic git push`, native push with an active bridge, and shadow projection
+//! build an Atomic `ProjectTree`, observe Git index/worktree state read-only,
+//! and require an equivalent report before any publication mutation. The
+//! already-equivalent index supplies the tree; this module never stages an
+//! unchecked candidate merely to make validation pass.
 //!
 //! Validator rules enforced here (pre-commit):
 //! - **V1** — no unresolved conflict markers (shares `record`'s detector).
 //! - **V4** — no git-excluded provenance path (`.atomic/`, `.vault/`,
 //!   `.atomicignore`) is ever staged.
 //!
-//! V2 (tree↔view coherence) and V3 (git↔state agreement) are added here in later
-//! phases, ahead of `write_tree`, so every shadow commit passes the same gate.
+//! V2 (tree↔view coherence) is the CB-4B joint report. V3 remains the Git
+//! history/Atomic-state lineage check in `git::push`.
 
 use std::io::IsTerminal;
 use std::path::Path;
 
 use git2::Repository as GitRepository;
 
-use atomic_repository::Repository;
+use atomic_config::ContentFilterConfig;
+use atomic_core::operation::GitHashAlgorithm;
+use atomic_objects::content_key;
+use atomic_repository::{
+    compare_project_state, observe_git_index, observe_worktree, ConversionPolicy,
+    EquivalenceClaims, GitAttributesFilter, ManifestRoot, Repository,
+};
 
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
+
+/// Marker handling is explicit at the publication boundary; callers cannot
+/// accidentally smuggle an unchecked boolean into the validator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConflictMarkerPolicy {
+    Refuse,
+    AllowExplicitly,
+}
+
+/// Private capability proving that the Atomic project tree, Git index, and
+/// physical worktree were equivalent under one concrete conversion policy.
+///
+/// Construction is intentionally restricted to [`verify_git_publication`].
+/// Every publication mutation path requires this value and re-observes its
+/// leases immediately before its final ref/network effect.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedPublication {
+    view: String,
+    atomic_state: String,
+    policy: ConversionPolicy,
+    manifest_root: ManifestRoot,
+    index_root: ManifestRoot,
+    worktree_root: ManifestRoot,
+    git_tree: atomic_core::operation::GitObjectId,
+    git_head: Option<git2::Oid>,
+}
+
+impl VerifiedPublication {
+    pub(crate) fn view(&self) -> &str {
+        &self.view
+    }
+
+    pub(crate) fn atomic_state(&self) -> &str {
+        &self.atomic_state
+    }
+
+    pub(crate) fn manifest_root(&self) -> &ManifestRoot {
+        &self.manifest_root
+    }
+
+    pub(crate) fn policy_root(&self) -> ManifestRoot {
+        self.policy.root()
+    }
+
+    pub(crate) fn object_algorithm(&self) -> GitHashAlgorithm {
+        self.policy.object_format
+    }
+
+    pub(crate) fn git_tree(&self) -> &atomic_core::operation::GitObjectId {
+        &self.git_tree
+    }
+
+    pub(crate) fn git_tree_oid(&self) -> CliResult<git2::Oid> {
+        if self.git_tree.algorithm() != GitHashAlgorithm::Sha1 {
+            return Err(git_error(format!(
+                "Git publication through libgit2 does not support {:?} repositories",
+                self.git_tree.algorithm()
+            )));
+        }
+        git2::Oid::from_bytes(self.git_tree.as_bytes()).map_err(|error| {
+            git_error(format!(
+                "verified Git tree has an invalid object identity: {error}"
+            ))
+        })
+    }
+
+    pub(crate) fn bind_committed_head(
+        &mut self,
+        git_repo: &GitRepository,
+        commit_oid: git2::Oid,
+    ) -> CliResult<()> {
+        let commit = git_repo.find_commit(commit_oid).map_err(|error| {
+            git_error(format!(
+                "cannot bind published Git commit {commit_oid}: {error}"
+            ))
+        })?;
+        if commit.tree_id() != self.git_tree_oid()? {
+            return Err(git_error(
+                "refusing to bind a Git commit whose tree differs from the verified project tree",
+            ));
+        }
+        let observed = git_repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .ok_or_else(|| {
+                git_error("cannot bind publication to an unborn or symbolic-only HEAD")
+            })?;
+        if observed != commit_oid {
+            return Err(git_error(format!(
+                "Git HEAD changed while binding publication: expected {commit_oid}, found {observed}"
+            )));
+        }
+        self.git_head = Some(commit_oid);
+        Ok(())
+    }
+
+    pub(crate) fn reobserve_before_commit(
+        &self,
+        repo: &Repository,
+        repo_root: &Path,
+        git_repo: &GitRepository,
+    ) -> CliResult<()> {
+        self.reobserve(repo, repo_root)?;
+        let observed = git_repo.head().ok().and_then(|head| head.target());
+        if observed != self.git_head {
+            return Err(git_error(format!(
+                "Git HEAD lease changed before commit: expected {:?}, found {:?}",
+                self.git_head, observed
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reobserve_for_git_push(
+        &self,
+        repo: &Repository,
+        repo_root: &Path,
+        git_repo: &GitRepository,
+    ) -> CliResult<()> {
+        self.reobserve(repo, repo_root)?;
+        let expected = self
+            .git_head
+            .ok_or_else(|| git_error("cannot publish an unborn Git HEAD"))?;
+        let head = git_repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .map_err(|error| git_error(format!("cannot re-observe Git HEAD: {error}")))?;
+        if head.id() != expected || head.tree_id() != self.git_tree_oid()? {
+            return Err(git_error(format!(
+                "Git HEAD lease changed before push: expected commit {expected} with tree {}, found commit {} with tree {}",
+                self.git_tree_oid()?,
+                head.id(),
+                head.tree_id()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Re-observe every lease represented by this capability. This rejects an
+    /// Atomic view/state change, policy change, index edit, or worktree edit.
+    pub(crate) fn reobserve(&self, repo: &Repository, repo_root: &Path) -> CliResult<()> {
+        let current = verify_git_publication(repo, repo_root, &self.view)?;
+        if current.policy != self.policy
+            || current.atomic_state != self.atomic_state
+            || current.manifest_root != self.manifest_root
+            || current.index_root != self.index_root
+            || current.worktree_root != self.worktree_root
+            || current.git_tree != self.git_tree
+        {
+            return Err(git_error(
+                "publication state changed after equivalence verification; retry from fresh observations",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Verify a mandatory CB-4B publication gate for a Git-backed command.
+pub(crate) fn verify_git_publication(
+    repo: &Repository,
+    repo_root: &Path,
+    view: &str,
+) -> CliResult<VerifiedPublication> {
+    let git_repo = GitRepository::discover(repo_root)
+        .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
+    let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
+    verify_git_publication_with_policy(repo, repo_root, view, policy, filters)
+}
+
+/// Whether native publication must run the Git bridge gate.
+pub(crate) fn bridge_publication_required(repo_root: &Path) -> bool {
+    GitRepository::discover(repo_root)
+        .map(|repository| shadow_sync_active(&repository))
+        .unwrap_or(false)
+}
+
+/// Native Atomic publication is unchanged without an active Git shadow. Once
+/// the shadow marker exists, however, publication is gated fail-closed.
+pub(crate) fn verify_bridge_publication(
+    repo: &Repository,
+    repo_root: &Path,
+    view: &str,
+) -> CliResult<Option<VerifiedPublication>> {
+    let Ok(git_repo) = GitRepository::discover(repo_root) else {
+        return Ok(None);
+    };
+    if !shadow_sync_active(&git_repo) {
+        return Ok(None);
+    }
+    let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
+    verify_git_publication_with_policy(repo, repo_root, view, policy, filters).map(Some)
+}
+
+fn verify_git_publication_with_policy(
+    repo: &Repository,
+    repo_root: &Path,
+    view: &str,
+    policy: ConversionPolicy,
+    filters: ContentFilterConfig,
+) -> CliResult<VerifiedPublication> {
+    let project = repo.project_tree(view, &policy).map_err(|error| {
+        git_error(format!(
+            "cannot build Atomic publication project tree: {error}"
+        ))
+    })?;
+    let filter = GitAttributesFilter::new(repo_root, filters);
+    let index = observe_git_index(repo_root, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git index: {error}")))?;
+    let worktree = observe_worktree(repo_root, Some(&index), &filter, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
+    let claims = EquivalenceClaims {
+        manifest_version: Some(project.manifest.version),
+        object_algorithm: Some(project.git.algorithm),
+        manifest_root: Some(project.manifest.root().content_key.clone()),
+        conversion_policy_root: Some(policy.root().content_key),
+        git_tree_root: Some(project.git.root.clone()),
+    };
+    let report = compare_project_state(&project, &index, &worktree, &policy, &claims);
+    if !report.is_equivalent() {
+        let details = report
+            .mismatches
+            .iter()
+            .take(8)
+            .map(|mismatch| {
+                let path = mismatch
+                    .path
+                    .as_ref()
+                    .map(|path| format!(" at '{}'", path.escaped()))
+                    .unwrap_or_default();
+                format!(
+                    "{:?}/{:?}{path}: expected {}, observed {}",
+                    mismatch.layer, mismatch.kind, mismatch.expected, mismatch.actual
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(git_error(format!(
+            "CB-4B publication equivalence failed for view '{view}': {details}. No publication mutation was attempted"
+        )));
+    }
+    let atomic_state = repo
+        .get_view_info(view)
+        .map_err(CliError::Repository)?
+        .state_base32();
+    let git_head = GitRepository::discover(repo_root)
+        .ok()
+        .and_then(|repository| repository.head().ok().and_then(|head| head.target()));
+    Ok(VerifiedPublication {
+        view: view.to_string(),
+        atomic_state,
+        policy,
+        manifest_root: project.manifest.root(),
+        index_root: index.root(),
+        worktree_root: worktree.root(),
+        git_tree: project.git.root,
+        git_head,
+    })
+}
+
+fn current_conversion_policy(
+    repo_root: &Path,
+    git_repo: &GitRepository,
+) -> CliResult<(ConversionPolicy, ContentFilterConfig)> {
+    let config = git_repo
+        .config()
+        .map_err(|error| git_error(format!("cannot read Git configuration: {error}")))?;
+    let object_format = match config.get_string("extensions.objectFormat") {
+        Ok(value) if value.eq_ignore_ascii_case("sha1") => GitHashAlgorithm::Sha1,
+        Ok(value) if value.eq_ignore_ascii_case("sha256") => GitHashAlgorithm::Sha256,
+        Ok(value) => {
+            return Err(git_error(format!(
+                "unsupported Git object algorithm '{value}'"
+            )))
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => GitHashAlgorithm::Sha1,
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot read Git object algorithm: {error}"
+            )))
+        }
+    };
+    let mut policy = ConversionPolicy::new(object_format);
+    policy.platform.executable_bit = config.get_bool("core.filemode").unwrap_or(cfg!(unix));
+    policy.platform.symlinks = config.get_bool("core.symlinks").unwrap_or(cfg!(unix));
+    policy.platform.case_sensitive = !config.get_bool("core.ignorecase").unwrap_or(false);
+    policy.platform.unicode_normalizing =
+        config.get_bool("core.precomposeunicode").unwrap_or(false);
+
+    let repo_config = atomic_config::RepoConfig::load(&repo_root.join(".atomic/config.toml"))
+        .map_err(|error| git_error(format!("cannot load Atomic content-filter policy: {error}")))?;
+    let mut relevant = Vec::new();
+    relevant.extend_from_slice(format!("object={object_format:?}\n").as_bytes());
+    relevant.extend_from_slice(
+        format!(
+            "filemode={}\nsymlinks={}\nignorecase={}\nprecomposeunicode={}\ntimeout={}\nmax-output={}\n",
+            policy.platform.executable_bit,
+            policy.platform.symlinks,
+            !policy.platform.case_sensitive,
+            policy.platform.unicode_normalizing,
+            repo_config.filters.timeout_ms,
+            repo_config.filters.max_output_bytes
+        )
+        .as_bytes(),
+    );
+    policy.relevant_git_config = content_key(&relevant);
+    policy.filter_driver_versions = repo_config
+        .filters
+        .drivers
+        .iter()
+        .map(|(name, driver)| {
+            content_key(
+                format!(
+                    "{name}\0{}\0{}\0{}",
+                    driver.clean.as_deref().unwrap_or(""),
+                    driver.smudge.as_deref().unwrap_or(""),
+                    driver.required
+                )
+                .as_bytes(),
+            )
+        })
+        .collect();
+    Ok((policy, repo_config.filters))
+}
 
 /// Result of coordinating an Atomic view switch with its local Git shadow.
 #[derive(Debug)]
@@ -170,22 +498,35 @@ pub(crate) fn sync_git_head_to_view(
     let target_ref = format!("refs/heads/{view}");
     let snapshot = GitSwitchSnapshot::capture(&git_repo, &target_ref)?;
     let sync_result = (|| -> CliResult<()> {
+        let publication = verify_git_publication(repo, repo_root, view)?;
         // Never bypass V1 for a switch: a conflicted materialization cannot be
         // checkpointed as clean Git evidence.
-        let tree_oid = stage_and_validate_tree(repo, &git_repo, repo_root, view, false)?;
-        let state = repo
-            .get_view_info(view)
-            .map_err(CliError::Repository)?
-            .state_base32();
-        let commit =
-            find_or_create_switch_projection(&git_repo, &target_ref, view, &state, tree_oid)?;
-        update_target_ref(&git_repo, &target_ref, commit)?;
+        let tree_oid = stage_and_validate_tree(
+            repo,
+            &git_repo,
+            repo_root,
+            &publication,
+            ConflictMarkerPolicy::Refuse,
+        )?;
+        publication.reobserve(repo, repo_root)?;
+        let commit = find_or_create_switch_projection(
+            &git_repo,
+            &target_ref,
+            view,
+            publication.atomic_state(),
+            tree_oid,
+            &publication,
+        )?;
+        publication.reobserve(repo, repo_root)?;
+        update_target_ref(&git_repo, &target_ref, commit, &publication)?;
+        publication.reobserve(repo, repo_root)?;
         git_repo.set_head(&target_ref).map_err(|error| {
             git_error(format!(
                 "cannot point Git HEAD at shadow branch '{view}': {error}"
             ))
         })?;
-        align_index_to_tree(&git_repo, tree_oid)?;
+        publication.reobserve(repo, repo_root)?;
+        align_index_to_tree(&git_repo, tree_oid, &publication)?;
         Ok(())
     })();
 
@@ -214,7 +555,13 @@ fn find_or_create_switch_projection(
     view: &str,
     state: &str,
     tree_oid: git2::Oid,
+    publication: &VerifiedPublication,
 ) -> CliResult<git2::Oid> {
+    if publication.view() != view || publication.git_tree_oid()? != tree_oid {
+        return Err(git_error(
+            "shadow projection does not match verified publication",
+        ));
+    }
     let parent_oid = match git_repo.find_reference(target_ref) {
         Ok(reference) => {
             let commit = reference.peel_to_commit().map_err(|error| {
@@ -271,7 +618,9 @@ fn update_target_ref(
     git_repo: &GitRepository,
     target_ref: &str,
     commit: git2::Oid,
+    publication: &VerifiedPublication,
 ) -> CliResult<()> {
+    let _verified_tree = publication.git_tree_oid()?;
     match git_repo.find_reference(target_ref) {
         Ok(mut reference) => {
             if reference.target() != Some(commit) {
@@ -302,7 +651,14 @@ fn update_target_ref(
     Ok(())
 }
 
-fn align_index_to_tree(git_repo: &GitRepository, tree_oid: git2::Oid) -> CliResult<()> {
+fn align_index_to_tree(
+    git_repo: &GitRepository,
+    tree_oid: git2::Oid,
+    publication: &VerifiedPublication,
+) -> CliResult<()> {
+    if publication.git_tree_oid()? != tree_oid {
+        return Err(git_error("refusing to align index to an unverified tree"));
+    }
     let tree = git_repo.find_tree(tree_oid).map_err(|error| {
         git_error(format!(
             "cannot read shadow projection tree while aligning Git index: {error}"
@@ -437,26 +793,26 @@ pub(crate) fn acquire_shadow_lock(
     }
 }
 
-/// Stage the current working copy for a shadow commit, run the pre-commit
-/// Validator, and return the candidate git tree OID.
+/// Validate the already-observed index for a shadow commit and return its tree.
 ///
-/// This is the sole shadow-commit staging path (SPEC §5.2). On any Validator
-/// failure it aborts atomically — the index is restored from HEAD so git is left
-/// byte-identical — and returns an error naming the failing rule.
+/// CB-4B requires the index and worktree to be equivalent before this function
+/// can be called. This path therefore does not stage or write an ODB tree; it
+/// only enforces the marker/provenance rules and resolves the verified tree.
 pub(crate) fn stage_and_validate_tree(
     repo: &Repository,
     git_repo: &GitRepository,
     repo_root: &Path,
-    view: &str,
-    allow_conflict_markers: bool,
+    publication: &VerifiedPublication,
+    conflict_markers: ConflictMarkerPolicy,
 ) -> CliResult<git2::Oid> {
+    let view = publication.view();
     let working_copy = repo
         .require_working_copy_id()
         .map_err(CliError::Repository)?;
 
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
-    if !allow_conflict_markers {
+    if conflict_markers == ConflictMarkerPolicy::Refuse {
         if let Some((path, line)) = repo
             .first_working_copy_conflict_marker(working_copy)
             .map_err(CliError::Repository)?
@@ -489,28 +845,15 @@ pub(crate) fn stage_and_validate_tree(
     // Best-effort (an unwritable .git/info is caught by the V4 guard below).
     let _ = super::import::ensure_git_shadow_excludes(git_repo.path());
 
-    // Stage everything: git add -A (add_all + update_all handles new files and
-    // deletions).
-    let mut index = git_repo.index().map_err(|e| CliError::GitError {
+    // CB-4B already proved that the read-only index exactly represents the
+    // Atomic project tree. Do not restage or write an ODB tree here: doing so
+    // would turn validation itself into a mutation and reopen a TOCTOU window.
+    let index = git_repo.index().map_err(|e| CliError::GitError {
         message: format!("Failed to open git index: {}", e),
-    })?;
-    index
-        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-        .map_err(|e| CliError::GitError {
-            message: format!("Failed to stage files: {}", e),
-        })?;
-    index
-        .update_all(["*"].iter(), None)
-        .map_err(|e| CliError::GitError {
-            message: format!("Failed to update index: {}", e),
-        })?;
-    index.write().map_err(|e| CliError::GitError {
-        message: format!("Failed to write index: {}", e),
     })?;
 
     // ── Rule V4 — no provenance / excluded path may be staged ───────────────
     if let Some(bad) = first_forbidden_shadow_path(&index) {
-        restore_index_from_head(git_repo);
         if !std::io::stderr().is_terminal() {
             append_shadow_validate_log(repo_root, "V4", view, &format!("path={}", bad));
         }
@@ -529,129 +872,13 @@ pub(crate) fn stage_and_validate_tree(
         });
     }
 
-    let tree_oid = index.write_tree().map_err(|e| CliError::GitError {
-        message: format!("Failed to write tree: {}", e),
+    let tree_oid = publication.git_tree_oid()?;
+    git_repo.find_tree(tree_oid).map_err(|error| {
+        git_error(format!(
+            "verified index tree {tree_oid} is absent from the Git object database: {error}"
+        ))
     })?;
-
-    // ── Rule V2 — tree ↔ view coherence (SPEC §6.2) ─────────────────────────
-    // The staged tree must correspond to what the current view materializes.
-    // Cost-safe / incremental: only paths that differ between the candidate
-    // tree and git HEAD are checked, each against the view's recorded content.
-    if let Some((path, reason)) = first_incoherent_path(repo, git_repo, tree_oid, view)? {
-        restore_index_from_head(git_repo);
-        if !std::io::stderr().is_terminal() {
-            append_shadow_validate_log(
-                repo_root,
-                "V2",
-                view,
-                &format!("path={} reason={}", path, reason),
-            );
-        }
-        print_warning(&format!(
-            "Refusing to shadow-commit: '{}' {} (SPEC V2).",
-            path, reason
-        ));
-        return Err(CliError::GitError {
-            message: format!(
-                "'{}' {} — the working copy diverges from the current view '{}'. Record \
-                 your changes (or reconcile the view) so the shadow tree matches the \
-                 recorded state. No commit was created.",
-                path, reason, view
-            ),
-        });
-    }
-
     Ok(tree_oid)
-}
-
-/// Return the first changed path whose staged content does not correspond to the
-/// current view's recorded content, as `(path, reason)`, or `None` if the
-/// candidate tree is coherent with the view (Rule V2, SPEC §6.2).
-///
-/// Only paths that differ between the candidate tree and git HEAD are examined
-/// (the incremental form), so the check costs one `get_file_content_on_view` per
-/// changed path rather than a full-view materialize. Provenance / excluded paths
-/// are skipped — Rule V4 owns them.
-fn first_incoherent_path(
-    repo: &Repository,
-    git_repo: &GitRepository,
-    candidate_tree_oid: git2::Oid,
-    view: &str,
-) -> CliResult<Option<(String, String)>> {
-    let candidate_tree =
-        git_repo
-            .find_tree(candidate_tree_oid)
-            .map_err(|e| CliError::GitError {
-                message: format!("Failed to load candidate tree: {}", e),
-            })?;
-    let head_tree = git_repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_commit().ok())
-        .and_then(|c| c.tree().ok());
-
-    let diff = git_repo
-        .diff_tree_to_tree(head_tree.as_ref(), Some(&candidate_tree), None)
-        .map_err(|e| CliError::GitError {
-            message: format!("Failed to diff candidate tree: {}", e),
-        })?;
-
-    for delta in diff.deltas() {
-        let (path, in_candidate) = match delta.status() {
-            git2::Delta::Deleted => match delta.old_file().path().and_then(|p| p.to_str()) {
-                Some(p) => (p.to_string(), false),
-                None => continue,
-            },
-            _ => match delta.new_file().path().and_then(|p| p.to_str()) {
-                Some(p) => (p.to_string(), true),
-                None => continue,
-            },
-        };
-
-        // Rule V4 owns provenance / git-excluded paths; V2 ignores them.
-        if is_forbidden_shadow_path(&path) {
-            continue;
-        }
-
-        let view_content = repo
-            .get_file_content_on_view(&path, view)
-            .map_err(CliError::Repository)?;
-
-        if in_candidate {
-            // The staged blob must equal what the view materializes for this path.
-            let staged = git_repo.find_blob(delta.new_file().id()).ok();
-            match (
-                staged.as_ref().map(|b| b.content()),
-                view_content.as_deref(),
-            ) {
-                (Some(s), Some(v)) if s == v => {}
-                (Some(_), Some(_)) => {
-                    return Ok(Some((
-                        path,
-                        "staged content differs from the view's recorded content".to_string(),
-                    )));
-                }
-                (Some(_), None) => {
-                    return Ok(Some((
-                        path,
-                        "is not recorded by the view (record it first)".to_string(),
-                    )));
-                }
-                // Non-blob entries (submodules/symlinks) carry no textual
-                // content to reconcile; leave them to git's own handling.
-                (None, _) => {}
-            }
-        } else if view_content.is_some() {
-            // The path was dropped from the tree, but the view still records it:
-            // the candidate omits a change the view accounts for.
-            return Ok(Some((
-                path,
-                "is still recorded by the view but missing from the tree".to_string(),
-            )));
-        }
-    }
-
-    Ok(None)
 }
 
 /// Append a `shadow-validate:<rule>` entry to `.atomic/hook-errors.log` (SPEC
@@ -702,22 +929,6 @@ fn first_forbidden_shadow_path(index: &git2::Index) -> Option<String> {
 /// provenance path that Rule V4 forbids from any shadow commit.
 fn is_forbidden_shadow_path(path: &str) -> bool {
     path == ".atomicignore" || path.starts_with(".atomic/") || path.starts_with(".vault/")
-}
-
-/// Discard a candidate staging by restoring the git index from HEAD's tree,
-/// leaving git byte-identical to its pre-operation state (the working copy is
-/// never touched). Best-effort.
-fn restore_index_from_head(git_repo: &GitRepository) {
-    if let Ok(tree) = git_repo
-        .head()
-        .and_then(|h| h.peel_to_commit())
-        .and_then(|c| c.tree())
-    {
-        if let Ok(mut index) = git_repo.index() {
-            let _ = index.read_tree(&tree);
-            let _ = index.write();
-        }
-    }
 }
 
 #[cfg(test)]

@@ -155,9 +155,9 @@ pub enum ExclusionPolicy {
 }
 
 impl ExclusionPolicy {
-    fn exclusion(self, path: &RepoPath) -> Option<ExclusionReason> {
+    pub fn exclusion(self, path: &RepoPath) -> Option<ExclusionReason> {
         let first = path.components().next().unwrap_or_default();
-        if first == b".atomic" {
+        if first == b".atomic" || path.as_bytes() == b".atomicignore" {
             Some(ExclusionReason::AtomicPrivate)
         } else if first == b".vault" && self == Self::BridgePrivate {
             Some(ExclusionReason::VaultPrivate)
@@ -411,16 +411,21 @@ pub struct GitIndexEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitIndexState {
     pub version: u8,
+    pub index_version: u32,
     pub object_format: GitHashAlgorithm,
     pub entries: Vec<GitIndexEntry>,
+    /// Exact tree represented by ordinary stage-0 entries, when one exists.
+    pub tree: Option<GitObjectId>,
 }
 
 impl GitIndexState {
     pub fn new(object_format: GitHashAlgorithm, entries: Vec<GitIndexEntry>) -> Self {
         Self {
             version: GIT_INDEX_STATE_VERSION,
+            index_version: 2,
             object_format,
             entries,
+            tree: None,
         }
     }
 
@@ -430,7 +435,9 @@ impl GitIndexState {
         let mut encoder = Encoder::new();
         encoder.tag(b"atomic.git-index-state");
         encoder.u8(self.version);
+        encoder.u32(self.index_version);
         encoder.u8(algorithm_tag(self.object_format));
+        encoder.git_oid(self.tree.as_ref());
         encoder.u32(entries.len() as u32);
         for entry in entries {
             encoder.bytes(entry.path.as_bytes());
@@ -465,10 +472,17 @@ pub enum PhysicalKind {
 pub struct WorktreeEntry {
     pub path: RepoPath,
     pub physical_kind: PhysicalKind,
+    /// Repository kind supplied by the stage-0 index, when available.
+    pub repository_kind: Option<InodeKind>,
+    pub gitlink: Option<GitObjectId>,
     pub mode: Option<u16>,
     pub size: u64,
+    pub worktree_bytes: Vec<u8>,
     pub worktree_content: ObjectKey,
+    pub repository_bytes_after_clean: Option<Vec<u8>>,
     pub repository_content_after_clean: Option<ObjectKey>,
+    pub disposition: ManifestDisposition,
+    pub filter_warnings: Vec<String>,
     pub filter_error: Option<String>,
 }
 
@@ -509,15 +523,28 @@ impl WorktreeObservation {
                 PhysicalKind::Symlink => 2,
                 PhysicalKind::Other => 3,
             });
+            encoder.u8(entry.repository_kind.map_or(u8::MAX, InodeKind::as_byte));
+            encoder.git_oid(entry.gitlink.as_ref());
             encoder.u16(entry.mode.unwrap_or(u16::MAX));
             encoder.u64(entry.size);
+            encoder.bytes(&entry.worktree_bytes);
             encoder.bytes(entry.worktree_content.as_bytes());
+            encoder.optional_bytes(entry.repository_bytes_after_clean.as_deref());
             encoder.optional_bytes(
                 entry
                     .repository_content_after_clean
                     .as_deref()
                     .map(str::as_bytes),
             );
+            encoder.u8(match entry.disposition {
+                ManifestDisposition::Included => 0,
+                ManifestDisposition::Excluded(ExclusionReason::AtomicPrivate) => 1,
+                ManifestDisposition::Excluded(ExclusionReason::VaultPrivate) => 2,
+            });
+            encoder.u32(entry.filter_warnings.len() as u32);
+            for warning in &entry.filter_warnings {
+                encoder.bytes(warning.as_bytes());
+            }
             encoder.optional_bytes(entry.filter_error.as_deref().map(str::as_bytes));
         }
         encoder.finish()
@@ -899,7 +926,7 @@ fn parse_tree_entries(
     Ok(entries)
 }
 
-fn git_object_id(
+pub(super) fn git_object_id(
     algorithm: GitHashAlgorithm,
     kind: GitObjectKind,
     bytes: &[u8],
@@ -1012,9 +1039,147 @@ impl Repository {
             RepositoryManifest::new(identity.set_id, policy.root().content_key, entries)?;
         ProjectTree::from_manifest(manifest, policy)
     }
+
+    /// Project a historical state of a view without mutating or materializing it.
+    pub fn project_tree_at_state(
+        &self,
+        view_name: &str,
+        state: Merkle,
+        policy: &ConversionPolicy,
+    ) -> Result<ProjectTree, ProjectTreeError> {
+        let txn = self.pristine.read_txn().map_err(repo_error)?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(repo_error)?
+            .ok_or_else(|| ProjectTreeError::Repository(format!("view '{view_name}' not found")))?;
+        let mut max_sequence = None;
+        for row in txn.iter_changes(&view, 0).map_err(repo_error)? {
+            let (sequence, _change, candidate_state) = row.map_err(repo_error)?;
+            if candidate_state == state {
+                max_sequence = Some(sequence + 1);
+                break;
+            }
+        }
+        let max_sequence = max_sequence.ok_or_else(|| {
+            ProjectTreeError::Repository(format!(
+                "state {} is not present in view '{view_name}'",
+                state
+            ))
+        })?;
+        let membership = super::view_membership_at_sequence(&txn, &view, max_sequence)
+            .map_err(ProjectTreeError::from)?;
+        let mut roots = Vec::with_capacity(membership.len());
+        for change_id in membership.iter() {
+            roots.push(
+                txn.get_external(*change_id)
+                    .map_err(repo_error)?
+                    .ok_or_else(|| {
+                        ProjectTreeError::Repository(format!(
+                            "visible change {} has no external hash",
+                            change_id.get()
+                        ))
+                    })?,
+            );
+        }
+        drop(txn);
+        self.project_tree_for_change_closure(view_name, &roots, policy)
+    }
+
+    /// Project the complete tree represented by explicit Atomic change roots and
+    /// their validated dependency closure, without creating or mutating a view.
+    pub fn project_tree_for_change_closure(
+        &self,
+        view_name: &str,
+        roots: &[Hash],
+        policy: &ConversionPolicy,
+    ) -> Result<ProjectTree, ProjectTreeError> {
+        use atomic_core::pristine::{EffectiveProjectionClosure, ViewMembershipSet};
+
+        if !policy.platform.lossless_unix_paths {
+            return Err(ProjectTreeError::UnsupportedPlatformPath);
+        }
+        let txn = self.pristine.read_txn().map_err(repo_error)?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(repo_error)?
+            .ok_or_else(|| ProjectTreeError::Repository(format!("view '{view_name}' not found")))?;
+        let mut root_ids = Vec::with_capacity(roots.len());
+        for hash in roots {
+            root_ids.push(txn.get_internal(hash).map_err(repo_error)?.ok_or_else(|| {
+                ProjectTreeError::Repository(format!("change {hash} is not registered"))
+            })?);
+        }
+        let membership = ViewMembershipSet::from_ordered(root_ids);
+        let closure = EffectiveProjectionClosure::try_from_membership(&txn, &membership)
+            .map_err(repo_error)?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            closure.graph_visibility(),
+        )
+        .map_err(ProjectTreeError::from)?;
+        let projection = self
+            .project_tree_for_visibility(&txn, &claim_visibility)
+            .map_err(ProjectTreeError::from)?;
+        if !projection.name_conflicts.is_empty() {
+            let mut paths: Vec<_> = projection.name_conflicts.keys().cloned().collect();
+            paths.sort();
+            return Err(ProjectTreeError::Repository(format!(
+                "unresolved path claims: {}",
+                paths.join(", ")
+            )));
+        }
+        let mut entries = Vec::new();
+        for item in projection
+            .present
+            .values()
+            .filter(|item| !item.is_directory)
+        {
+            let path = RepoPath::from_bytes(item.path.as_bytes())?;
+            let disposition = policy
+                .exclusions
+                .exclusion(&path)
+                .map(ManifestDisposition::Excluded)
+                .unwrap_or(ManifestDisposition::Included);
+            let attrs =
+                project_inode_attributes(&txn, item.position, closure.attribute_visibility())
+                    .map_err(repo_error)?;
+            if attrs.is_conflicted() {
+                return Err(ProjectTreeError::Repository(format!(
+                    "inode attributes conflict at '{}'",
+                    path.escaped()
+                )));
+            }
+            let materialization = attrs.materialization;
+            let bytes = super::content::retrieve_content_with_filter_fast(
+                &txn,
+                &self.change_store,
+                item.inode,
+                item.position,
+                RetrieveOptions::new().with_graph_visibility(closure.clone()),
+            )
+            .map_err(|error| ProjectTreeError::Repository(error.to_string()))?;
+            let gitlink = if materialization.kind == InodeKind::Gitlink {
+                Some(parse_gitlink_bytes(policy.object_format, &bytes)?)
+            } else {
+                None
+            };
+            entries.push(RepositoryEntry::new(
+                path,
+                bytes,
+                materialization.mode,
+                materialization.kind,
+                gitlink,
+                disposition,
+            )?);
+        }
+        let manifest = RepositoryManifest::new(SetId::ZERO, policy.root().content_key, entries)?;
+        ProjectTree::from_manifest(manifest, policy)
+    }
 }
 
-fn git_oid_hex(oid: &GitObjectId) -> Vec<u8> {
+pub(super) fn git_oid_hex(oid: &GitObjectId) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = Vec::with_capacity(oid.as_bytes().len() * 2);
     for byte in oid.as_bytes() {
@@ -1088,6 +1253,8 @@ pub enum ProjectTreeError {
     UnsupportedGitMode(u32),
     #[error("manifest conversion-policy root does not match the supplied policy")]
     PolicyRootMismatch,
+    #[error("prospective import tree mismatch: expected {expected}, got {actual}")]
+    ProspectiveTreeMismatch { expected: String, actual: String },
     #[error("repository projection failed: {0}")]
     Repository(String),
     #[error("truncated canonical encoding")]
@@ -1234,11 +1401,7 @@ mod tests {
     fn model_roots_are_deterministic_and_sensitive() {
         let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
         assert_eq!(policy.root(), policy.clone().root());
-        let index = GitIndexState {
-            version: GIT_INDEX_STATE_VERSION,
-            object_format: GitHashAlgorithm::Sha1,
-            entries: vec![],
-        };
+        let index = GitIndexState::new(GitHashAlgorithm::Sha1, vec![]);
         assert_eq!(index.root(), index.clone().root());
         let observation = WorktreeObservation {
             version: WORKTREE_OBSERVATION_VERSION,

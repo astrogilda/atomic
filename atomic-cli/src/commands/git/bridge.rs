@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use atomic_core::operation::GitObjectId;
 use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 use atomic_core::types::WorkingCopyId;
 use atomic_repository::{
-    graph_visibility_closure, InsertOptions, Repository, RepositoryError, StatusOptions,
+    compare_project_to_worktree, graph_visibility_closure, observe_git_index, observe_worktree,
+    verify_prospective_equivalence, GitAttributesFilter, GitObjectKind, InsertOptions, ProjectTree,
+    Repository, RepositoryError, StatusOptions,
 };
 use clap::{Parser, Subcommand};
 use git2::{
@@ -19,6 +22,7 @@ use super::observation::{
     observe_git, observe_head, BridgeCheckpointObservation, GitObservation, HeadObservation,
     ObservationError,
 };
+use super::parallel::{conversion_policy, equivalence_error, verify_complete_equivalence};
 use super::{hooks, Import};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -180,7 +184,7 @@ fn switch(target: &str) -> CliResult<()> {
     let root = find_repository_root()?;
     let checkpoint = read_workspace_metadata(&root)?
         .ok_or_else(|| git_error("bridge switch requires an existing checkpoint; run 'atomic git bridge reconcile' first"))?;
-    let target_state = {
+    let (target_state, target_project) = {
         let repo = Repository::open(&root).map_err(CliError::from)?;
         let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
         let git = open_git(&root)?;
@@ -201,7 +205,13 @@ fn switch(target: &str) -> CliResult<()> {
         let current_paths = git_head_paths(&git)?;
         let target_paths = git_branch_paths(&git, target)?;
         plan_switch_collisions(&root, &current_paths, &target_paths).map_err(git_error)?;
-        target_state
+        let policy = conversion_policy(&git)?;
+        let target_project = repo.project_tree(target, &policy).map_err(|error| {
+            git_error(format!(
+                "cannot build complete prospective projection for Atomic view '{target}': {error}"
+            ))
+        })?;
+        (target_state, target_project)
     };
 
     // After collision-specific checks, require the full clean/equality invariant.
@@ -230,11 +240,9 @@ fn switch(target: &str) -> CliResult<()> {
             "Atomic materialization did not produce a clean target view",
         ));
     }
-    let target_files = read_filesystem(&root)?;
-
     let git = open_git(&root)?;
     require_clean_git_index(&git)?;
-    let target_tree_oid = write_git_tree(&git, &target_files)?;
+    let target_tree_oid = write_project_tree(&git, &target_project)?;
     let target_commit_oid =
         find_or_create_target_commit(&git, target, target_tree_oid, &target_state)?;
     let target_ref = format!("refs/heads/{target}");
@@ -440,6 +448,27 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
         let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
         let view_exists = repo.view_exists(&view).map_err(CliError::from)?;
         if git_head == checkpoint.git_head && !view_exists {
+            let source_state = repo
+                .get_view_info(&checkpoint.view)
+                .map_err(CliError::from)?
+                .state
+                .to_string();
+            if source_state != checkpoint.atomic_state {
+                return Err(git_error(format!(
+                    "bridge checkpoint claims Atomic state {} for view '{}', but the actual state is {}",
+                    checkpoint.atomic_state, checkpoint.view, source_state
+                )));
+            }
+            let git = open_git(root)?;
+            verify_complete_equivalence(
+                &repo,
+                &checkpoint.view,
+                root,
+                &git,
+                "branch-only bridge adoption",
+            )?;
+            drop(git);
+
             // Validate and resolve the complete dependency closure before the
             // first mutation. A legacy source with missing dependency metadata
             // must not leave a partially created adoption view behind.
@@ -532,6 +561,81 @@ pub(crate) enum CheckpointRefresh {
 /// No-Git repositories and intentional branch/view mismatches are no-ops. The
 /// latter is required by bridge incremental raw-switch adoption: `Import::run`
 /// preserves the old Atomic pointer until `import_git_to_atomic` aligns it.
+pub(crate) fn refresh_checkpoint_after_verified_import(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    git: &GitRepository,
+    view: &str,
+    expected_tree: &GitObjectId,
+) -> CliResult<CheckpointRefresh> {
+    if repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::from)?
+        != view
+    {
+        return Ok(CheckpointRefresh::SkippedViewMismatch);
+    }
+    let head = git
+        .head()
+        .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
+    if head.shorthand() != Some(view) {
+        return Ok(CheckpointRefresh::SkippedViewMismatch);
+    }
+    let commit = head
+        .peel_to_commit()
+        .map_err(|error| git_error(format!("cannot resolve Git HEAD: {error}")))?;
+    let tree = commit
+        .tree()
+        .map_err(|error| git_error(format!("cannot read Git HEAD tree: {error}")))?;
+    if tree.id().as_bytes() != expected_tree.as_bytes() {
+        return Err(git_error(
+            "Git HEAD changed after prospective import verification",
+        ));
+    }
+
+    let policy = conversion_policy(git)?;
+    let project = repo
+        .project_tree(view, &policy)
+        .map_err(|error| git_error(format!("cannot verify imported Atomic tree: {error}")))?;
+    verify_prospective_equivalence(&project, expected_tree)
+        .map_err(|error| git_error(format!("imported Atomic tree diverged from Git: {error}")))?;
+
+    let observation = observe_git(repo.root()).map_err(observation_error)?;
+    let GitObservation::Repository(observed) = observation else {
+        return Ok(CheckpointRefresh::SkippedNoGit);
+    };
+    let HeadObservation::Attached { symref, oid } = observed.head else {
+        return Ok(CheckpointRefresh::SkippedUnsupportedHead);
+    };
+    let tree_id = tree.id().to_string();
+    let atomic_state = repo
+        .get_view_info(view)
+        .map_err(CliError::from)?
+        .state
+        .to_string();
+    let checkpoint = BridgeCheckpoint {
+        version: checkpoint::CHECKPOINT_VERSION,
+        view: view.to_string(),
+        atomic_state,
+        atomic_manifest_root: Some(checkpoint::ManifestRootEvidence::git_tree(&tree_id)),
+        git_head_symref: Some(symref),
+        git_head: oid.to_string(),
+        git_tree: tree_id.clone(),
+        git_manifest_root: Some(checkpoint::ManifestRootEvidence::git_tree(&tree_id)),
+        git_index_tree: observed.index.tree_oid.map(|oid| oid.to_string()),
+        git_index_digest: Some(observed.index.canonical_digest.0),
+        git_refs_digest: Some(observed.refs_digest.0),
+        git_admin: Some(checkpoint::GitAdminIdentity {
+            worktree_root: observed.paths.worktree_root,
+            worktree_git_dir: observed.paths.worktree_git_dir,
+            common_dir: observed.paths.common_dir,
+            index_path: observed.paths.index_path,
+        }),
+    };
+    checkpoint::write_checkpoint(repo.root(), &checkpoint).map_err(checkpoint_error)?;
+    Ok(CheckpointRefresh::Refreshed)
+}
+
 pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<CheckpointRefresh> {
     let observation = observe_git(root).map_err(observation_error)?;
     let GitObservation::Repository(git) = observation else {
@@ -569,13 +673,7 @@ fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
     let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
     let git = open_git(root)?;
     let (branch, head, tree) = require_matching_clean_workspaces(&repo, working_copy, &git, true)?;
-    let git_files = read_git_tree(&git, &tree)?;
-    let worktree_files = read_filesystem(root)?;
-    compare_file_sets(&git_files, &worktree_files).map_err(|error| {
-        git_error(format!(
-            "Git HEAD and the Atomic-clean working tree differ: {error}"
-        ))
-    })?;
+    verify_complete_equivalence(&repo, &branch, root, &git, "Git bridge verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
         .map_err(CliError::from)?
@@ -756,11 +854,27 @@ fn project_atomic_to_git(
     }
     require_clean_git_index(git)?;
 
-    // Atomic status proved that the current filesystem is the materialization
-    // of this view. The final RFC replaces this MVP bridge with ProjectTree
-    // computed directly from GraphVisibilityClosure.
-    let filesystem_files = read_filesystem(root)?;
-    let tree_oid = write_git_tree(git, &filesystem_files)?;
+    // Build and verify the complete graph-derived projection before creating
+    // any Git object, commit, ref, or index mutation. The Git index may still
+    // describe the old HEAD on an Atomic→Git reconcile, so only the worktree
+    // layer is applicable until the new tree is published.
+    let policy = conversion_policy(git)?;
+    let project = repo
+        .project_tree(&desired_view, &policy)
+        .map_err(|error| git_error(format!("cannot build complete Atomic projection: {error}")))?;
+    let index = observe_git_index(root, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git index: {error}")))?;
+    let filter = GitAttributesFilter::for_repository(root);
+    let worktree = observe_worktree(root, Some(&index), &filter, &policy)
+        .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
+    let report = compare_project_to_worktree(&project, &worktree, &policy);
+    if !report.is_equivalent() {
+        return Err(equivalence_error(
+            "Atomic-to-Git bridge projection",
+            &report,
+        ));
+    }
+    let tree_oid = write_project_tree(git, &project)?;
     let tree = git
         .find_tree(tree_oid)
         .map_err(|error| git_error(format!("cannot read projected Git tree: {error}")))?;
@@ -824,6 +938,40 @@ fn staged_delta(status: Status) -> bool {
             | Status::INDEX_TYPECHANGE
             | Status::CONFLICTED,
     )
+}
+
+fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<Oid> {
+    if project.git.algorithm != atomic_core::operation::GitHashAlgorithm::Sha1 {
+        return Err(git_error(format!(
+            "libgit2 cannot safely publish {:?} Atomic projections",
+            project.git.algorithm
+        )));
+    }
+    let odb = git
+        .odb()
+        .map_err(|error| git_error(format!("cannot open Git object database: {error}")))?;
+    for (expected, object) in project.git.objects.iter() {
+        let kind = match object.kind {
+            GitObjectKind::Blob => ObjectType::Blob,
+            GitObjectKind::Tree => ObjectType::Tree,
+        };
+        let written = odb.write(kind, &object.bytes).map_err(|error| {
+            git_error(format!(
+                "cannot write projected Git {kind:?} object: {error}"
+            ))
+        })?;
+        if written.as_bytes() != expected.as_bytes() {
+            return Err(git_error(format!(
+                "Git object database returned {written} for projected object {expected:?}"
+            )));
+        }
+    }
+    Oid::from_bytes(project.git.root.as_bytes()).map_err(|error| {
+        git_error(format!(
+            "projected Git tree identity {:?} is unsupported: {error}",
+            project.git.root
+        ))
+    })
 }
 
 #[derive(Default)]

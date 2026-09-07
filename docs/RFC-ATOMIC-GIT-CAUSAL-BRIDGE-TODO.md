@@ -30,9 +30,9 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-4B: Stage/worktree observation and complete equivalence integration**
-  Intent: pending · Priority: high · Prerequisite: CB-4A (done)
-  Add stage-aware index/worktree builders, structured mismatch reports, and full push/import equivalence enforcement.
+- [ ] **READY — CB-4C: `FILE_INDEX_V2`, change-source tiers, and performance gates**
+  Intent: pending · Priority: high · Prerequisites: CB-4A and CB-4B (done)
+  Add racy-stat-safe file indexing, verified scan/fsmonitor/Watchman candidate tiers, and 100k-file warm performance gates.
 
 ### Recently completed critical path
 
@@ -42,6 +42,7 @@ next.
 - [x] **DONE — CB-3B:** `ATOM::continuouslee::84` / `01M1W7NBBVSRG97GY0Y6AVYD8C`
 - [x] **DONE — CB-3C:** `ATOM::continuouslee::85` / `01M1W7NBQA8CJRMQAC84T58X6G`
 - [x] **DONE — CB-4A:** `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B`
+- [x] **DONE — CB-4B:** `ATOM::continuouslee::88` / `01M1WFS2NX3Z0X81ZC7AKY5ZFV`
 
 Phase 1, the shared CB-FMT1 format foundation, and the Phase 2/3 prerequisites for CB-2B are complete.
 
@@ -266,8 +267,8 @@ away with explicit `LossNote::EmptyDirectory`.
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
 | [x] DONE | CB-4A | Canonical manifest model and Atomic/Git tree builders | 2B, 3B, 3C, N9 | `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B` |
-| [ ] READY | CB-4B | Stage/worktree observation and complete equivalence integration | 4A | pending |
-| [ ] BLOCKED | CB-4C | `FILE_INDEX_V2`, change-source tiers, and performance gates | 4A, 4B | pending |
+| [x] DONE | CB-4B | Stage/worktree observation and complete equivalence integration | 4A | `ATOM::continuouslee::88` / `01M1WFS2NX3Z0X81ZC7AKY5ZFV` |
+| [ ] READY | CB-4C | `FILE_INDEX_V2`, change-source tiers, and performance gates | 4A, 4B | pending |
 
 ### CB-4A definition of done
 
@@ -524,7 +525,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-4B; CB-2A/2B, CB-3A/3B/3C, and CB-4A are complete.
+1. **Now:** CB-4C; CB-2A/2B, CB-3A/3B/3C, and CB-4A/4B are complete.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation and format substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1 are done.
@@ -540,4 +541,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-4B intent next with CB-4A encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
+- Allocate the CB-4C intent next with CB-4A and CB-4B encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.

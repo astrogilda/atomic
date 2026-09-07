@@ -2,6 +2,12 @@ use super::*;
 use crate::record::RecordOptions;
 use crate::status::StatusOptions;
 
+fn verified_projection(repo: &Repository) -> VerifiedProspectiveEquivalence {
+    let policy = ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
+    let project = repo.project_tree(repo.current_view(), &policy).unwrap();
+    verify_prospective_equivalence(&project, &project.git.root).unwrap()
+}
+
 /// Test that status shows files as Clean after recording.
 ///
 /// This is a regression test for the issue where files still showed
@@ -1147,6 +1153,7 @@ fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
             base_change.change().clone(),
             &[],
             false,
+            &verified_projection(&source),
             InsertOptions::default(),
         )
         .unwrap();
@@ -1168,6 +1175,7 @@ fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
             incremental.change().clone(),
             &[],
             false,
+            &verified_projection(&source),
             InsertOptions::default(),
         )
         .unwrap();

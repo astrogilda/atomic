@@ -6,6 +6,12 @@ use crate::tracking::{
 use crate::unrecord::UnrecordOptions;
 use atomic_core::pristine::{directory_flags, TreeTxnT};
 
+fn verified_projection(repo: &Repository) -> VerifiedProspectiveEquivalence {
+    let policy = ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
+    let project = repo.project_tree(repo.current_view(), &policy).unwrap();
+    verify_prospective_equivalence(&project, &project.git.root).unwrap()
+}
+
 fn record_all(repo: &Repository, message: &str) -> RecordOutcome {
     repo.record(
         repo.require_working_copy_id().unwrap(),
@@ -137,11 +143,14 @@ fn graph_first_direct_import_matches_native_record_projection() {
 
     let target_temp = TempDir::new().unwrap();
     let target = Repository::init(target_temp.path()).unwrap();
+    let verified = verified_projection(&source);
+
     target
         .write_import_graph_change(
             recorded.change().clone(),
             &[],
             false,
+            &verified,
             InsertOptions::default(),
         )
         .unwrap();

@@ -30,6 +30,7 @@ ulid = { workspace = true }
 walkdir = { workspace = true }
 reflink-copy = "0.1"
 ignore = { workspace = true }
+git2 = { workspace = true }
 syntext = { workspace = true }
 tempfile = { workspace = true }
 log = { workspace = true }

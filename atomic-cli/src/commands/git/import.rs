@@ -28,7 +28,7 @@
 //!   is synthesized and derived on demand. Use `--with-crdt` to pre-materialize
 //!   it for token-level blame and word-diff.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -39,8 +39,8 @@ use atomic_core::types::WorkingCopyId;
 use atomic_repository::Repository;
 
 use super::parallel::{
-    forecast_commit_kind, incremental_import_skips, ForecastKind, ParallelImportOptions,
-    ParallelImporter,
+    forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind,
+    ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
 };
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -221,6 +221,7 @@ impl Import {
         imported_shas: &HashSet<String>,
         known_states: &HashSet<atomic_core::types::Merkle>,
         mode: BranchImportMode,
+        plan: ProspectiveImportPlan,
     ) -> CliResult<usize> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
@@ -239,12 +240,13 @@ impl Import {
             preserve_working_copy: mode.preserve_working_copy,
             target_view: branch_name.to_string(),
             known_states: known_states.clone(),
+            validate_equivalence: true,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
 
         // Run the three-phase parallel import
-        let stats = importer.import_branch(branch_name, repo)?;
+        let stats = importer.import_prevalidated(branch_name, repo, plan)?;
         // Return total changes created (written + empty + merge)
         Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
     }
@@ -291,19 +293,28 @@ impl Import {
         view_name: &str,
         repair_index: bool,
     ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
-        let mut shas = HashSet::new();
+        let started = std::time::Instant::now();
+        let mut shas: HashSet<String> = repo
+            .indexed_git_shas()
+            .map_err(|error| CliError::Internal(error.into()))?
+            .into_iter()
+            .collect();
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
-        // Query the target's effective root-to-leaf history. The low-level log
-        // iterator enumerates only the leaf view even when inherited filtering
-        // is disabled; using it here makes parent commits look new on drafts and
-        // synthesizes duplicate root FileAdd operations during incremental import.
+        // Query the target's effective root-to-leaf states without opening every
+        // historical change file. Imported SHAs come from GIT_SHA_INDEX, making
+        // the normal one-commit incremental path a single B-tree scan. Only
+        // repositories with no index rows take the legacy backfill path.
         let entries = repo
             .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
+        let needs_legacy_backfill = shas.is_empty() && !entries.is_empty();
         for entry in entries {
             states.insert(entry.state);
+            if !needs_legacy_backfill {
+                continue;
+            }
             let change = repo
                 .load_change(&entry.hash)
                 .map_err(|error| CliError::Internal(error.into()))?;
@@ -351,6 +362,12 @@ impl Import {
             }
         }
 
+        trace_git_import(format!(
+            "incremental markers: {:?} (shas={}, states={})",
+            started.elapsed(),
+            shas.len(),
+            states.len()
+        ));
         Ok((shas, states))
     }
 
@@ -555,6 +572,7 @@ impl Import {
 
 impl Command for Import {
     fn run(&self) -> CliResult<()> {
+        let run_start = std::time::Instant::now();
         // Open Git repository
         let git_repo = GitRepository::discover(".").map_err(|_| CliError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
@@ -563,6 +581,10 @@ impl Command for Import {
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
+        trace_git_import(format!(
+            "discover Git repository: {:?}",
+            run_start.elapsed()
+        ));
 
         // Dry run mode
         if self.dry_run {
@@ -633,20 +655,65 @@ impl Command for Import {
             return Ok(());
         }
 
+        // Validate the complete prospective import before Git excludes, Atomic
+        // initialization, view creation, graph/change publication, derived-index
+        // writes, or materialization. Existing repositories are opened read-only
+        // solely to seed the isolated prospective projection.
+        let default_branch = self.get_default_branch(&git_repo)?;
+        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
+        let mut preopened_repo = if repo_exists {
+            Some(Repository::open(workdir).map_err(CliError::from)?)
+        } else {
+            None
+        };
+        let prospective_branches = if self.all_branches {
+            self.get_all_branches(&git_repo)?
+        } else {
+            vec![self
+                .branch
+                .clone()
+                .unwrap_or_else(|| default_branch.clone())]
+        };
+        let mut prospective_plans = HashMap::new();
+        let preflight_start = std::time::Instant::now();
+        for branch_name in &prospective_branches {
+            let (imported_shas, known_states) = match preopened_repo.as_ref() {
+                Some(repo)
+                    if self.incremental
+                        && repo.view_exists(branch_name).map_err(CliError::from)? =>
+                {
+                    self.get_incremental_markers(repo, branch_name, false)?
+                }
+                _ => (HashSet::new(), HashSet::new()),
+            };
+            let options = ParallelImportOptions {
+                incremental: self.incremental,
+                imported_shas: imported_shas.clone(),
+                repo_name: self.get_repo_name(&git_repo),
+                ignored_path_patterns: import_ignore_patterns(workdir, self.kind.as_deref()),
+                mainline_only: !self.all_branches,
+                graph_only: !self.with_crdt,
+                preserve_working_copy: true,
+                target_view: branch_name.clone(),
+                known_states: known_states.clone(),
+                validate_equivalence: false,
+            };
+            let plan = ParallelImporter::new(&git_repo, options)
+                .validate_branch_prospectively(branch_name, preopened_repo.as_ref())?;
+            prospective_plans.insert(branch_name.clone(), (plan, imported_shas, known_states));
+        }
+        trace_git_import(format!("import preflight: {:?}", preflight_start.elapsed()));
         if ensure_git_shadow_excludes(git_repo.path())? {
             print_info("Configured Git to ignore Atomic local state.");
         }
 
-        // Determine Git's default branch up front so a fresh Atomic repo can
-        // adopt it as its default view (rather than the generic `dev` view).
-        let default_branch = self.get_default_branch(&git_repo)?;
-
         // Check if Atomic repository exists in THIS directory (not parent dirs).
         // Don't use find_repository_root() — it walks up and might find
         // ~/.atomic/ (global config dir) which isn't a repo.
-        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
         let mut repo = if repo_exists {
-            Repository::open(workdir).map_err(|e| CliError::Internal(e.into()))?
+            preopened_repo
+                .take()
+                .expect("existing repository opened once")
         } else {
             print_info(&format!(
                 "Initializing Atomic repository (default view '{}')...",
@@ -677,6 +744,7 @@ impl Command for Import {
             );
         }
 
+        let mut checkpoint_refreshed = false;
         if self.all_branches {
             // Import all branches
             let branches = self.get_all_branches(&git_repo)?;
@@ -685,6 +753,12 @@ impl Command for Import {
             for branch_name in branches {
                 let preserve_branch_working_copy =
                     preserve_current_view && original_view != branch_name;
+                let (plan, imported_shas, known_states) =
+                    prospective_plans.remove(&branch_name).ok_or_else(|| {
+                        CliError::Internal(anyhow::anyhow!(
+                            "missing prevalidated import plan for '{branch_name}'"
+                        ))
+                    })?;
 
                 // Ensure the view exists
                 if !repo
@@ -694,12 +768,6 @@ impl Command for Import {
                     repo.create_shared_view(&branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
-
-                let (imported_shas, known_states) = if self.incremental {
-                    self.get_incremental_markers(&repo, &branch_name, true)?
-                } else {
-                    (HashSet::new(), HashSet::new())
-                };
 
                 // Existing incremental imports are background bookkeeping.
                 // Select the target only on this handle so concurrent hooks
@@ -726,6 +794,7 @@ impl Command for Import {
                         mainline_only: false,
                         preserve_working_copy: preserve_branch_working_copy,
                     },
+                    plan,
                 );
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&original_view);
@@ -792,6 +861,15 @@ impl Command for Import {
                     message: format!("Branch '{}' not found", branch_name),
                 })?;
 
+            let (plan, imported_shas, known_states) =
+                prospective_plans.remove(&branch_name).ok_or_else(|| {
+                    CliError::Internal(anyhow::anyhow!(
+                        "missing prevalidated import plan for '{branch_name}'"
+                    ))
+                })?;
+            let changed_paths = plan.changed_paths();
+            let expected_git_tree = plan.expected_git_tree();
+
             // Ensure the view exists with the branch name
             if !repo
                 .view_exists(&branch_name)
@@ -800,12 +878,6 @@ impl Command for Import {
                 repo.create_shared_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
-
-            let (imported_shas, known_states) = if self.incremental {
-                self.get_incremental_markers(&repo, &branch_name, true)?
-            } else {
-                (HashSet::new(), HashSet::new())
-            };
 
             let restore_original_view = preserve_current_view && original_view != branch_name;
 
@@ -819,6 +891,7 @@ impl Command for Import {
             }
 
             // Import
+            let write_start = std::time::Instant::now();
             let count = self.import_branch(
                 &git_repo,
                 &branch_name,
@@ -829,7 +902,12 @@ impl Command for Import {
                     mainline_only: true,
                     preserve_working_copy: restore_original_view,
                 },
+                plan,
             )?;
+            trace_git_import(format!(
+                "import write/finalize: {:?}",
+                write_start.elapsed()
+            ));
 
             if restore_original_view {
                 print_info(&format!(
@@ -838,7 +916,11 @@ impl Command for Import {
                 ));
             } else if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
-                reindex_working_copy(&repo, working_copy);
+                if self.incremental {
+                    trace_git_import("deferred full FILE_INDEX rebuild after incremental import");
+                } else {
+                    reindex_working_copy(&repo, working_copy);
+                }
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
                 print_info("Materializing working copy...");
@@ -876,17 +958,39 @@ impl Command for Import {
                 repo.set_current_view_in_memory(&original_view);
             }
 
-            // Build the content search index (syntext)
-            print_info("Building content search index...");
-            match atomic_repository::build_content_index(workdir) {
-                Ok(()) => print_info("Content index built."),
-                Err(e) => log::warn!("Content index build failed: {}", e),
+            if self.incremental {
+                log::debug!(
+                    "deferred content-index maintenance for {} imported path(s)",
+                    changed_paths.len()
+                );
+            } else {
+                print_info("Building content search index...");
+                match atomic_repository::build_content_index(workdir) {
+                    Ok(()) => print_info("Content index built."),
+                    Err(e) => log::warn!("Content index build failed: {}", e),
+                }
             }
 
             print_success(&format!(
                 "Imported {} changes from branch '{}'",
                 count, branch_name
             ));
+            trace_git_import(format!(
+                "import command before checkpoint: {:?}",
+                run_start.elapsed()
+            ));
+            if !self.skip_checkpoint_refresh {
+                if let Some(expected_tree) = expected_git_tree.as_ref() {
+                    super::bridge::refresh_checkpoint_after_verified_import(
+                        &repo,
+                        working_copy,
+                        &git_repo,
+                        &branch_name,
+                        expected_tree,
+                    )?;
+                    checkpoint_refreshed = true;
+                }
+            }
         }
 
         // Standalone imports establish or refresh the bridge checkpoint only
@@ -895,7 +999,7 @@ impl Command for Import {
         // deliberately preserves the old Atomic view, so this returns the
         // intentional mismatch no-op; `import_git_to_atomic` aligns and
         // checkpoints afterward.
-        if !self.skip_checkpoint_refresh {
+        if !self.skip_checkpoint_refresh && !checkpoint_refreshed {
             let checkpoint_root = workdir.to_path_buf();
             drop(repo);
             drop(git_repo);
@@ -914,6 +1018,7 @@ impl Command for Import {
 /// files makes the post-import `atomic status` baseline clean.
 fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     use atomic_core::types::Hash;
+    let started = std::time::Instant::now();
     use std::time::SystemTime;
 
     let repo_root = repo.root().to_path_buf();
@@ -942,6 +1047,11 @@ fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     if !entries.is_empty() {
         let _ = repo.update_file_index(working_copy, &entries);
     }
+    trace_git_import(format!(
+        "reindex working copy: {:?} (files={})",
+        started.elapsed(),
+        entries.len()
+    ));
 }
 
 /// Create .atomicignore and initialize vault AFTER git import + materialize.
@@ -1055,6 +1165,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command as ProcessCommand;
 
+    use atomic_core::types::Base32;
     use serial_test::serial;
 
     use super::*;
@@ -1085,6 +1196,137 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn init_git(root: &Path) {
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root, &["config", "user.name", "Atomic Test"]);
+        git_ok(root, &["config", "user.email", "atomic@example.com"]);
+    }
+
+    fn assert_rejected_before_atomic_init(root: &Path, import: Import) {
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(root).unwrap();
+        assert!(import.run().is_err());
+        assert!(
+            !root.join(".atomic").exists(),
+            "failed prospective verification must not initialize Atomic"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn forged_self_push_header_is_rejected_without_atomic_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"forged\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        let message = format!(
+            "forged\n\nAtomic-View: main\nAtomic-State: {}",
+            atomic_core::types::Merkle::ZERO.to_base32()
+        );
+        git_ok(root.path(), &["commit", "-q", "-m", &message]);
+        assert_rejected_before_atomic_init(
+            root.path(),
+            Import {
+                incremental: true,
+                no_vault: true,
+                ..Import::default()
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn forged_squash_header_is_rejected_without_atomic_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"forged squash\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        let missing = atomic_core::types::Hash::of(b"missing-change").to_base32();
+        let message = format!("forged squash\n\nAtomic-Changes: {missing}");
+        git_ok(root.path(), &["commit", "-q", "-m", &message]);
+        assert_rejected_before_atomic_init(
+            root.path(),
+            Import {
+                incremental: true,
+                no_vault: true,
+                ..Import::default()
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn stale_mode_link_and_empty_projection_is_rejected_without_atomic_mutation() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("executable"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            root.path().join("executable"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(root.path().join("empty"), b"").unwrap();
+        symlink("empty", root.path().join("link")).unwrap();
+        git_ok(root.path(), &["add", "executable", "empty", "link"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "modes links empties"]);
+        assert_rejected_before_atomic_init(
+            root.path(),
+            Import {
+                no_vault: true,
+                ..Import::default()
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn required_filter_failure_rejects_incremental_import_without_view_mutation() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("base.txt"), b"base\n").unwrap();
+        git_ok(root.path(), &["add", "base.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "base"]);
+        std::env::set_current_dir(root.path()).unwrap();
+        drop(Repository::init_with_view(root.path(), "main").unwrap());
+
+        let before = Repository::open_readonly(root.path())
+            .unwrap()
+            .get_view_info("main")
+            .unwrap()
+            .state;
+        let config_path = root.path().join(".atomic/config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n[filters.drivers.blocked]\nrequired = true\n");
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            root.path().join(".gitattributes"),
+            b"*.dat filter=blocked\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("payload.dat"), b"payload\n").unwrap();
+        git_ok(root.path(), &["add", ".gitattributes", "payload.dat"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "required filter"]);
+
+        let result = Import {
+            incremental: true,
+            no_vault: true,
+            ..Import::default()
+        }
+        .run();
+        assert!(result.is_err());
+        let after = Repository::open_readonly(root.path())
+            .unwrap()
+            .get_view_info("main")
+            .unwrap()
+            .state;
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -1158,6 +1400,47 @@ mod tests {
             .with_short(true)
             .run()
             .expect("guarded status must pass immediately after import");
+    }
+
+    #[test]
+    #[serial]
+    fn one_line_incremental_import_finishes_under_one_second() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"first\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "initial"]);
+        std::env::set_current_dir(root.path()).unwrap();
+
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "one line"]);
+
+        let started = std::time::Instant::now();
+        Import {
+            incremental: true,
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "one-line incremental import took {elapsed:?}"
+        );
     }
 
     #[test]
