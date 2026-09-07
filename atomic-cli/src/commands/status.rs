@@ -106,17 +106,15 @@ use clap::Parser;
 
 use atomic_core::types::Base32;
 use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
-use atomic_repository::{Repository, SnapshotStatus};
+use atomic_repository::{Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode};
 
 use crate::commands::git::bridge::read_checkpoint_observation;
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
     RefTargetObservation,
 };
+use crate::commands::workspace_txn::{enter_workspace, observe_workspace};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -228,11 +226,11 @@ impl Status {
         }
     }
 
-    fn guard_operation(&self) -> GuardOperation {
+    fn workspace_mode(&self) -> WorkspaceTxnMode {
         if self.no_reconcile {
-            GuardOperation::ForensicStatus
+            WorkspaceTxnMode::Observe
         } else {
-            GuardOperation::Status
+            WorkspaceTxnMode::Reconcile
         }
     }
 
@@ -542,45 +540,41 @@ impl Command for Status {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
-        match guard_working_copy(GuardRequest::new(&repo_root, self.guard_operation())).map_err(
-            |error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            },
-        )? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
-            }
+        if self.no_reconcile {
+            let mut repo =
+                Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+                    reason: e.to_string(),
+                })?;
+            return match observe_workspace(&mut repo)? {
+                Ok(workspace) => {
+                    print_forensic_status(&repo_root, &repo, &workspace.view().name, None)
+                }
+                Err(remediation) => {
+                    let working_copy = repo.require_working_copy_id().map_err(|e| {
+                        CliError::InvalidRepository {
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let view = repo
+                        .desired_view_name(working_copy)
+                        .map_err(CliError::from)?;
+                    print_forensic_status(&repo_root, &repo, &view, Some(&remediation))
+                }
+            };
         }
 
-        if self.no_reconcile {
-            return print_forensic_status(&repo_root);
-        }
+        let mut repo = Repository::open_for_workspace_transaction(&repo_root).map_err(|e| {
+            CliError::InvalidRepository {
+                reason: e.to_string(),
+            }
+        })?;
+        let workspace = enter_workspace(&mut repo, self.workspace_mode())?;
+        let working_copy = workspace.working_copy();
 
         // Reindex first if requested (needs read-write access)
         if self.reindex {
-            let rw_repo =
-                Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {
-                    reason: e.to_string(),
-                })?;
-            let working_copy =
-                rw_repo
-                    .require_working_copy_id()
-                    .map_err(|e| CliError::InvalidRepository {
-                        reason: e.to_string(),
-                    })?;
             let start = std::time::Instant::now();
-            match rw_repo.reindex_working_copy(working_copy) {
+            match repo.reindex_working_copy(working_copy) {
                 Ok(count) => {
                     print_info(&format!(
                         "Reindexed {} files in {:.1}s",
@@ -592,19 +586,7 @@ impl Command for Status {
                     print_warning(&format!("Reindex failed: {}", e));
                 }
             }
-            drop(rw_repo);
         }
-
-        // Open the repository
-        let repo =
-            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
-                reason: e.to_string(),
-            })?;
-        let working_copy =
-            repo.require_working_copy_id()
-                .map_err(|e| CliError::InvalidRepository {
-                    reason: e.to_string(),
-                })?;
 
         // Debug ignore patterns if requested
         if self.debug_ignore {
@@ -632,19 +614,19 @@ impl Command for Status {
     }
 }
 
-fn print_forensic_status(repo_root: &Path) -> CliResult<()> {
-    let repo =
-        Repository::open_readonly(repo_root).map_err(|error| CliError::InvalidRepository {
-            reason: error.to_string(),
-        })?;
-    let view = repo.current_view().to_string();
+fn print_forensic_status(
+    repo_root: &Path,
+    repo: &Repository,
+    view: &str,
+    remediation: Option<&WorkspaceRemediation>,
+) -> CliResult<()> {
     let atomic = AtomicAnchorObservation {
         state: repo
-            .get_view_info(&view)
+            .get_view_info(view)
             .map_err(CliError::from)?
             .state
             .to_string(),
-        view,
+        view: view.to_string(),
     };
     let checkpoint = read_checkpoint_observation(repo_root)?;
     let git = observe_git(repo_root).map_err(|error| CliError::GitError {
@@ -661,6 +643,9 @@ fn print_forensic_status(repo_root: &Path) -> CliResult<()> {
         "{}",
         build_forensic_report(repo_root, &atomic, checkpoint.as_ref(), &git, &eligibility)
     );
+    if let Some(remediation) = remediation {
+        println!("Workspace remediation required: {remediation:#?}");
+    }
     Ok(())
 }
 
@@ -1099,12 +1084,12 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_operation_preserves_forensic_bypass() {
+    fn test_workspace_mode_preserves_forensic_observation() {
         let mut status = Status::new();
-        assert_eq!(status.guard_operation(), GuardOperation::Status);
+        assert_eq!(status.workspace_mode(), WorkspaceTxnMode::Reconcile);
 
         status.no_reconcile = true;
-        assert_eq!(status.guard_operation(), GuardOperation::ForensicStatus);
+        assert_eq!(status.workspace_mode(), WorkspaceTxnMode::Observe);
     }
 
     #[test]

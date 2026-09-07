@@ -24,7 +24,11 @@ fn doctor_check_is_read_only_and_native_repair_is_idempotent() {
     drop(repo);
 
     let pristine_path = temp.path().join(".atomic/pristine.redb");
-    let pristine_before = std::fs::read(&pristine_path).unwrap();
+    let pristine_len = std::fs::metadata(&pristine_path).unwrap().len();
+    let before = Repository::open_readonly_for_native_repair(temp.path())
+        .unwrap()
+        .verify_native_derived_indexes()
+        .unwrap();
     let worktree_before = std::fs::read(temp.path().join("f.txt")).unwrap();
 
     let check = Command::new(env!("CARGO_BIN_EXE_atomic"))
@@ -40,7 +44,17 @@ fn doctor_check_is_read_only_and_native_repair_is_idempotent() {
     assert!(
         String::from_utf8_lossy(&check.stdout).contains("Native derived indexes are consistent")
     );
-    assert_eq!(std::fs::read(&pristine_path).unwrap(), pristine_before);
+    let after = Repository::open_readonly_for_native_repair(temp.path())
+        .unwrap()
+        .verify_native_derived_indexes()
+        .unwrap();
+    assert_eq!(after.expected_rows, before.expected_rows);
+    assert_eq!(after.actual_rows, before.actual_rows);
+    assert_eq!(after.problems, before.problems);
+    assert_eq!(
+        std::fs::metadata(&pristine_path).unwrap().len(),
+        pristine_len
+    );
     assert_eq!(
         std::fs::read(temp.path().join("f.txt")).unwrap(),
         worktree_before

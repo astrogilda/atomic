@@ -5,9 +5,11 @@ use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
+use atomic_core::Hash;
 use atomic_objects::content_key;
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -66,6 +68,14 @@ pub fn observe_git_index(
     let index = repository
         .index()
         .map_err(|error| ObservationError::GitIndex(error.to_string()))?;
+    observe_open_git_index(&repository, &index)
+}
+
+fn observe_open_git_index(
+    repository: &git2::Repository,
+    index: &git2::Index,
+) -> Result<GitIndexState, ObservationError> {
+    let observed_algorithm = repository_object_algorithm(repository)?;
     let mut entries = Vec::with_capacity(index.len());
     for entry in index.iter() {
         let path = RepoPath::from_bytes(&entry.path)
@@ -451,6 +461,411 @@ fn detect_platform_capabilities(
             config.get_bool("core.precomposeunicode").unwrap_or(false);
     }
     Ok(capabilities)
+}
+
+/// Complete read-only Git metadata needed at a workspace transaction boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceGitObservation {
+    NoGit { root: PathBuf },
+    Repository(Box<WorkspaceGitRepositoryObservation>),
+}
+
+impl WorkspaceGitObservation {
+    pub fn token(&self) -> GitObservationToken {
+        match self {
+            Self::NoGit { .. } => GitObservationToken {
+                head: GitHeadObservation::Unborn {
+                    symref: "no-git".to_string(),
+                },
+                head_tree: None,
+                index_digest: Hash::ZERO,
+                index_tree: None,
+                index_stages: Vec::new(),
+                index_locked: false,
+                repository_state: "NoGit".to_string(),
+                markers: Vec::new(),
+            },
+            Self::Repository(repository) => GitObservationToken {
+                head: repository.head.clone(),
+                head_tree: repository.head_tree.clone(),
+                index_digest: repository.index_digest,
+                index_tree: repository.index_tree.clone(),
+                index_stages: repository.index_stages.clone(),
+                index_locked: repository.index_lock.is_present(),
+                repository_state: repository.operation.repository_state.clone(),
+                markers: repository.operation.present_markers(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceGitRepositoryObservation {
+    pub worktree_git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub index_path: PathBuf,
+    pub head: GitHeadObservation,
+    pub head_tree: Option<String>,
+    pub index_digest: Hash,
+    pub index_tree: Option<String>,
+    pub index_stages: Vec<u8>,
+    pub index_lock: GitAdminPathObservation,
+    pub operation: GitOperationObservation,
+}
+
+impl WorkspaceGitRepositoryObservation {
+    pub fn conflict_stages(&self) -> Vec<u8> {
+        self.index_stages
+            .iter()
+            .copied()
+            .filter(|stage| *stage != 0)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObservationToken {
+    pub head: GitHeadObservation,
+    pub head_tree: Option<String>,
+    pub index_digest: Hash,
+    pub index_tree: Option<String>,
+    pub index_stages: Vec<u8>,
+    pub index_locked: bool,
+    pub repository_state: String,
+    pub markers: Vec<GitOperationMarker>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitHeadObservation {
+    Attached { symref: String, oid: String },
+    Detached { oid: String },
+    Unborn { symref: String },
+    MissingTarget { symref: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitAdminEntryKind {
+    Missing,
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitAdminPathObservation {
+    pub path: PathBuf,
+    pub kind: GitAdminEntryKind,
+}
+
+impl GitAdminPathObservation {
+    pub fn is_present(&self) -> bool {
+        self.kind != GitAdminEntryKind::Missing
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GitOperationMarker {
+    Sequencer,
+    MergeHead,
+    RebaseHead,
+    RebaseMerge,
+    RebaseApply,
+    CherryPickHead,
+    RevertHead,
+    AutoMerge,
+    BisectStart,
+    BisectLog,
+    BisectNames,
+    BisectExpectedRev,
+}
+
+impl GitOperationMarker {
+    const ALL: [Self; 12] = [
+        Self::Sequencer,
+        Self::MergeHead,
+        Self::RebaseHead,
+        Self::RebaseMerge,
+        Self::RebaseApply,
+        Self::CherryPickHead,
+        Self::RevertHead,
+        Self::AutoMerge,
+        Self::BisectStart,
+        Self::BisectLog,
+        Self::BisectNames,
+        Self::BisectExpectedRev,
+    ];
+
+    fn relative_path(self) -> &'static str {
+        match self {
+            Self::Sequencer => "sequencer",
+            Self::MergeHead => "MERGE_HEAD",
+            Self::RebaseHead => "REBASE_HEAD",
+            Self::RebaseMerge => "rebase-merge",
+            Self::RebaseApply => "rebase-apply",
+            Self::CherryPickHead => "CHERRY_PICK_HEAD",
+            Self::RevertHead => "REVERT_HEAD",
+            Self::AutoMerge => "AUTO_MERGE",
+            Self::BisectStart => "BISECT_START",
+            Self::BisectLog => "BISECT_LOG",
+            Self::BisectNames => "BISECT_NAMES",
+            Self::BisectExpectedRev => "BISECT_EXPECTED_REV",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitOperationMarkerObservation {
+    pub marker: GitOperationMarker,
+    pub path: PathBuf,
+    pub kind: GitAdminEntryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitOperationObservation {
+    pub repository_state: String,
+    pub markers: Vec<GitOperationMarkerObservation>,
+}
+
+impl GitOperationObservation {
+    pub fn is_in_progress(&self) -> bool {
+        self.repository_state != "Clean"
+            || self
+                .markers
+                .iter()
+                .any(|marker| marker.kind != GitAdminEntryKind::Missing)
+    }
+
+    pub fn present_markers(&self) -> Vec<GitOperationMarker> {
+        self.markers
+            .iter()
+            .filter(|marker| marker.kind != GitAdminEntryKind::Missing)
+            .map(|marker| marker.marker)
+            .collect()
+    }
+}
+
+/// Observe HEAD, index identity, locks, and Git-owned sequence state without mutation.
+pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, ObservationError> {
+    let git_marker_exists = fs::symlink_metadata(root.join(".git")).is_ok();
+    let repository = match git2::Repository::open(root) {
+        Ok(repository) => repository,
+        Err(error) if error.code() == git2::ErrorCode::NotFound && !git_marker_exists => {
+            return Ok(WorkspaceGitObservation::NoGit {
+                root: resolve_metadata_path(root, root),
+            });
+        }
+        Err(error) => {
+            return Err(ObservationError::GitOpen {
+                path: root.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+
+    let worktree_git_dir = resolve_metadata_path(repository.path(), root);
+    let common_dir = resolve_metadata_common_dir(&worktree_git_dir)?;
+    let index = repository
+        .index()
+        .map_err(|error| ObservationError::GitIndex(error.to_string()))?;
+    let index_path = index
+        .path()
+        .map(|path| resolve_metadata_path(path, &worktree_git_dir))
+        .unwrap_or_else(|| worktree_git_dir.join("index"));
+    let index_bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(ObservationError::GitIndex(format!(
+                "cannot read '{}': {error}",
+                index_path.display()
+            )));
+        }
+    };
+    let index_state = observe_open_git_index(&repository, &index)?;
+    let mut index_stages: Vec<u8> = index_state
+        .entries
+        .iter()
+        .map(|entry| entry.stage)
+        .collect();
+    index_stages.sort_unstable();
+    index_stages.dedup();
+    let index_tree = index_state.tree.as_ref().map(git_object_id_hex);
+
+    let head = observe_metadata_head(&repository)?;
+    let head_tree = match head_oid(&head) {
+        Some(oid) => {
+            let oid = git2::Oid::from_str(oid).map_err(|error| {
+                ObservationError::GitIndex(format!("cannot parse observed Git HEAD: {error}"))
+            })?;
+            let commit = repository.find_commit(oid).map_err(|error| {
+                ObservationError::GitIndex(format!("cannot read Git HEAD commit: {error}"))
+            })?;
+            Some(commit.tree_id().to_string())
+        }
+        None => None,
+    };
+    let index_lock = observe_metadata_path(append_metadata_suffix(&index_path, ".lock"))?;
+    let markers = GitOperationMarker::ALL
+        .iter()
+        .copied()
+        .map(|marker| {
+            let path = worktree_git_dir.join(marker.relative_path());
+            observe_metadata_path(path).map(|observation| GitOperationMarkerObservation {
+                marker,
+                path: observation.path,
+                kind: observation.kind,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation = GitOperationObservation {
+        repository_state: format!("{:?}", repository.state()),
+        markers,
+    };
+
+    Ok(WorkspaceGitObservation::Repository(Box::new(
+        WorkspaceGitRepositoryObservation {
+            worktree_git_dir,
+            common_dir,
+            index_path,
+            head,
+            head_tree,
+            index_digest: Hash::of(&index_bytes),
+            index_tree,
+            index_stages,
+            index_lock,
+            operation,
+        },
+    )))
+}
+
+fn observe_metadata_head(
+    repository: &git2::Repository,
+) -> Result<GitHeadObservation, ObservationError> {
+    let head = repository
+        .find_reference("HEAD")
+        .map_err(|error| ObservationError::GitIndex(format!("cannot read Git HEAD: {error}")))?;
+    if let Some(symref) = head.symbolic_target() {
+        let symref = symref.to_string();
+        match head.resolve() {
+            Ok(resolved) => resolved
+                .target()
+                .map(|oid| GitHeadObservation::Attached {
+                    symref,
+                    oid: oid.to_string(),
+                })
+                .ok_or_else(|| {
+                    ObservationError::GitIndex(
+                        "Git HEAD target does not resolve directly to an object".to_string(),
+                    )
+                }),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                let mut has_resolved_ref = false;
+                for reference in repository
+                    .references()
+                    .map_err(|error| ObservationError::GitIndex(error.to_string()))?
+                {
+                    has_resolved_ref |= reference
+                        .map_err(|error| ObservationError::GitIndex(error.to_string()))?
+                        .target()
+                        .is_some();
+                }
+                if has_resolved_ref {
+                    Ok(GitHeadObservation::MissingTarget { symref })
+                } else {
+                    Ok(GitHeadObservation::Unborn { symref })
+                }
+            }
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {
+                Ok(GitHeadObservation::Unborn { symref })
+            }
+            Err(error) => Err(ObservationError::GitIndex(format!(
+                "cannot resolve Git HEAD target '{symref}': {error}"
+            ))),
+        }
+    } else if let Some(oid) = head.target() {
+        Ok(GitHeadObservation::Detached {
+            oid: oid.to_string(),
+        })
+    } else {
+        Err(ObservationError::GitIndex(
+            "Git HEAD is neither symbolic nor direct".to_string(),
+        ))
+    }
+}
+
+fn git_object_id_hex(oid: &GitObjectId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(oid.as_bytes().len() * 2);
+    for byte in oid.as_bytes() {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn head_oid(head: &GitHeadObservation) -> Option<&str> {
+    match head {
+        GitHeadObservation::Attached { oid, .. } | GitHeadObservation::Detached { oid } => {
+            Some(oid)
+        }
+        GitHeadObservation::Unborn { .. } | GitHeadObservation::MissingTarget { .. } => None,
+    }
+}
+
+fn observe_metadata_path(path: PathBuf) -> Result<GitAdminPathObservation, ObservationError> {
+    let kind = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => GitAdminEntryKind::Symlink,
+        Ok(metadata) if metadata.is_file() => GitAdminEntryKind::File,
+        Ok(metadata) if metadata.is_dir() => GitAdminEntryKind::Directory,
+        Ok(_) => GitAdminEntryKind::Other,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => GitAdminEntryKind::Missing,
+        Err(error) => {
+            return Err(ObservationError::WorktreeIo {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+    Ok(GitAdminPathObservation { path, kind })
+}
+
+fn resolve_metadata_common_dir(worktree_git_dir: &Path) -> Result<PathBuf, ObservationError> {
+    let pointer = worktree_git_dir.join("commondir");
+    let bytes = match fs::read(&pointer) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(worktree_git_dir.to_path_buf());
+        }
+        Err(error) => {
+            return Err(ObservationError::WorktreeIo {
+                path: pointer.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let value = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    let value = std::str::from_utf8(value).map_err(|error| ObservationError::WorktreeIo {
+        path: pointer.display().to_string(),
+        message: error.to_string(),
+    })?;
+    Ok(resolve_metadata_path(Path::new(value), worktree_git_dir))
+}
+
+fn resolve_metadata_path(path: &Path, base: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    fs::canonicalize(&absolute).unwrap_or(absolute)
+}
+
+fn append_metadata_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 #[cfg(test)]

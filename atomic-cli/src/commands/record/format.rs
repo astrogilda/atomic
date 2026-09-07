@@ -2,11 +2,8 @@ use super::*;
 
 impl Record {
     /// Format the outcome for display.
-    pub(super) fn format_outcome(&self, repo: &Repository, outcome: &RecordOutcome) -> String {
+    pub(super) fn format_outcome(&self, view_name: &str, outcome: &RecordOutcome) -> String {
         let mut output = String::new();
-
-        // Get the actual current view name from the repository
-        let view_name = repo.current_view();
 
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];
@@ -129,10 +126,11 @@ impl Record {
     }
 
     /// Display dry run preview.
-    pub(super) fn display_dry_run(&self, repo: &Repository) -> CliResult<()> {
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+    pub(super) fn display_dry_run(
+        &self,
+        repo: &Repository,
+        working_copy: atomic_core::types::WorkingCopyId,
+    ) -> CliResult<()> {
         let status = repo
             .status(working_copy, StatusOptions::default())
             .map_err(CliError::Repository)?;

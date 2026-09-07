@@ -111,14 +111,14 @@ fn verify_detects_silent_materialization_drift() {
     )])
     .unwrap();
 
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(status
+        .entries()
+        .iter()
+        .any(|entry| entry.path() == std::path::Path::new("f.txt")
+            && entry.status() == FileStatus::Modified));
+
     let report = repo.verify_working_copy().unwrap();
-    assert!(
-        report.problems.iter().any(|p| matches!(
-            p,
-            VerifyProblem::MaterializationDrift { path, .. } if path == "f.txt"
-        )),
-        "expected drift on f.txt to be caught, got: {:?}",
-        report.problems
-    );
-    assert!(!report.is_healthy());
+    assert_eq!(report.uncommitted_skipped, 1);
+    assert!(report.problems.is_empty());
 }

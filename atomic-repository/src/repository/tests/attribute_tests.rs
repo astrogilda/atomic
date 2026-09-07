@@ -170,7 +170,12 @@ fn gitlink_lifecycle_switches_exact_payload_without_filter_corruption() {
     repo.switch_view("feature").unwrap();
     assert!(std::fs::symlink_metadata(&path).unwrap().is_dir());
     assert_eq!(std::fs::read(path.join(".git")).unwrap(), object_id);
-    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(
+        status.is_clean(),
+        "unexpected status: {:?}",
+        status.entries()
+    );
 
     repo.switch_view("dev").unwrap();
     assert!(std::fs::symlink_metadata(&path).unwrap().is_file());

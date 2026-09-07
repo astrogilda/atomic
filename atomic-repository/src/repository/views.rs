@@ -682,7 +682,7 @@ impl Repository {
     /// Create a view with an explicit scope and optional named parent.
     ///
     /// The view's change log starts empty; this only establishes identity.
-    fn create_view_with_identity(
+    pub fn create_view_with_identity(
         &mut self,
         name: &str,
         scope: ViewScope,

@@ -649,7 +649,10 @@ pub(crate) fn classify_guard(
                 old_evidence.atomic.manifest_root.as_ref(),
                 current.atomic.manifest_root.as_ref()
             ),
-            (Some(old), Some(current)) if old != current
+            (Some(old), Some(current))
+                if old.kind == current.kind
+                    && old.provisional == current.provisional
+                    && old.value != current.value
         );
 
     if atomic_root_changed_without_state {

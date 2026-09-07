@@ -1,9 +1,9 @@
 use clap_complete::engine::ArgValueCompleter;
 
+use atomic_repository::WorkspaceTxnMode;
+
 use crate::commands::complete::{complete_change_hashes, complete_view_names};
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::{enter_workspace, observe_workspace, remediation_error};
 
 use super::output::*;
 use super::*;
@@ -219,11 +219,11 @@ impl Diff {
         }
     }
 
-    fn guard_operation(&self) -> GuardOperation {
+    fn workspace_mode(&self) -> WorkspaceTxnMode {
         if self.change.is_some() || self.snapshot {
-            GuardOperation::HistoryOnlyDiff
+            WorkspaceTxnMode::Observe
         } else {
-            GuardOperation::Diff
+            WorkspaceTxnMode::Reconcile
         }
     }
 }
@@ -246,32 +246,25 @@ impl Command for Diff {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
-        match guard_working_copy(GuardRequest::new(&repo_root, self.guard_operation())).map_err(
-            |error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            },
-        )? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
-            }
+        // Open the repository and retain its stable workspace boundary for all diff work.
+        let mode = self.workspace_mode();
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Force => unreachable!("diff never forces workspace entry"),
         }
-
-        // Open the repository
-        let repo =
-            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
-                reason: e.to_string(),
-            })?;
+        .map_err(|e| CliError::InvalidRepository {
+            reason: e.to_string(),
+        })?;
+        let workspace = match mode {
+            WorkspaceTxnMode::Observe => match observe_workspace(&mut repo)? {
+                Ok(workspace) => Some(workspace),
+                Err(_) if self.change.is_some() => None,
+                Err(remediation) => return Err(remediation_error(remediation)),
+            },
+            WorkspaceTxnMode::Reconcile => Some(enter_workspace(&mut repo, mode)?),
+            WorkspaceTxnMode::Force => unreachable!("diff never forces workspace entry"),
+        };
 
         // Parse algorithm
         let algorithm = self.parse_algorithm()?;
@@ -284,11 +277,13 @@ impl Command for Diff {
             return self.show_change_diff(&repo, change_ref, &config);
         }
         if self.snapshot {
-            let working_copy = repo
-                .require_working_copy_id()
-                .map_err(|error| CliError::Internal(error.into()))?;
             let snapshot = repo
-                .snapshot_status(working_copy)
+                .snapshot_status(
+                    workspace
+                        .as_ref()
+                        .expect("snapshot diff requires a ready Observe transaction")
+                        .working_copy(),
+                )
                 .map_err(|error| CliError::Internal(error.into()))?;
             let hash = snapshot.snapshot.or(snapshot.remainder).ok_or_else(|| {
                 CliError::InvalidArgument {
@@ -299,12 +294,15 @@ impl Command for Diff {
         }
 
         // Get status to find modified files
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
         let status_options = StatusOptions::default();
         let status = repo
-            .status(working_copy, status_options)
+            .status(
+                workspace
+                    .as_ref()
+                    .expect("working-copy diff uses Reconcile")
+                    .working_copy(),
+                status_options,
+            )
             .map_err(|e| CliError::Internal(e.into()))?;
 
         // Collect files to diff
@@ -349,6 +347,12 @@ impl Command for Diff {
             return Ok(());
         }
 
+        let workspace_view = &workspace
+            .as_ref()
+            .expect("working-copy diff uses Reconcile")
+            .view()
+            .name;
+
         // Compute diffs for each file
         let mut file_diffs = Vec::new();
         let mut stats = DiffStats::new();
@@ -360,8 +364,7 @@ impl Command for Diff {
             match file_status {
                 FileStatus::Deleted => {
                     // For deleted files, retrieve the old content from the graph
-                    let old_content = match repo.get_file_content_on_view(path, repo.current_view())
-                    {
+                    let old_content = match repo.get_file_content_on_view(path, workspace_view) {
                         Ok(Some(content)) => content,
                         Ok(None) => Vec::new(),
                         Err(_) => Vec::new(),
@@ -461,8 +464,7 @@ impl Command for Diff {
                     };
 
                     // Retrieve the old (recorded) content from the graph.
-                    let old_content = match repo.get_file_content_on_view(path, repo.current_view())
-                    {
+                    let old_content = match repo.get_file_content_on_view(path, workspace_view) {
                         Ok(Some(content)) => content,
                         Ok(None) => Vec::new(), // No recorded content (newly tracked)
                         Err(_) => Vec::new(),   // Error retrieving - treat as new
@@ -513,23 +515,23 @@ impl Command for Diff {
 }
 
 #[cfg(test)]
-mod guard_tests {
+mod workspace_mode_tests {
     use super::*;
 
     #[test]
-    fn change_diff_preserves_history_only_bypass() {
-        assert_eq!(Diff::new().guard_operation(), GuardOperation::Diff);
+    fn change_diff_observes_workspace() {
+        assert_eq!(Diff::new().workspace_mode(), WorkspaceTxnMode::Reconcile);
         assert_eq!(
-            Diff::new().with_change("change").guard_operation(),
-            GuardOperation::HistoryOnlyDiff
+            Diff::new().with_change("change").workspace_mode(),
+            WorkspaceTxnMode::Observe
         );
     }
 
     #[test]
-    fn snapshot_diff_is_history_only() {
+    fn snapshot_diff_observes_workspace() {
         assert_eq!(
-            Diff::new().with_snapshot(true).guard_operation(),
-            GuardOperation::HistoryOnlyDiff
+            Diff::new().with_snapshot(true).workspace_mode(),
+            WorkspaceTxnMode::Observe
         );
     }
 }

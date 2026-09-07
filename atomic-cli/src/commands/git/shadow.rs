@@ -17,14 +17,15 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use git2::Repository as GitRepository;
+use git2::{ObjectType, Repository as GitRepository};
 
 use atomic_config::ContentFilterConfig;
 use atomic_core::operation::GitHashAlgorithm;
 use atomic_objects::content_key;
 use atomic_repository::{
-    compare_project_state, observe_git_index, observe_worktree, ConversionPolicy,
-    EquivalenceClaims, GitAttributesFilter, ManifestRoot, Repository,
+    compare_project_state, compare_project_to_worktree, observe_git_index, observe_worktree,
+    ConversionPolicy, EquivalenceClaims, GitAttributesFilter, GitObjectKind, ManifestRoot,
+    ProjectTree, Repository,
 };
 
 use crate::error::{CliError, CliResult};
@@ -54,6 +55,8 @@ pub(crate) struct VerifiedPublication {
     worktree_root: ManifestRoot,
     git_tree: atomic_core::operation::GitObjectId,
     git_head: Option<git2::Oid>,
+    project: ProjectTree,
+    require_index_equivalence: bool,
 }
 
 impl VerifiedPublication {
@@ -171,7 +174,12 @@ impl VerifiedPublication {
     /// Re-observe every lease represented by this capability. This rejects an
     /// Atomic view/state change, policy change, index edit, or worktree edit.
     pub(crate) fn reobserve(&self, repo: &Repository, repo_root: &Path) -> CliResult<()> {
-        let current = verify_git_publication(repo, repo_root, &self.view)?;
+        let current = verify_git_publication_mode(
+            repo,
+            repo_root,
+            &self.view,
+            self.require_index_equivalence,
+        )?;
         if current.policy != self.policy
             || current.atomic_state != self.atomic_state
             || current.manifest_root != self.manifest_root
@@ -193,10 +201,26 @@ pub(crate) fn verify_git_publication(
     repo_root: &Path,
     view: &str,
 ) -> CliResult<VerifiedPublication> {
+    verify_git_publication_mode(repo, repo_root, view, true)
+}
+
+fn verify_git_publication_mode(
+    repo: &Repository,
+    repo_root: &Path,
+    view: &str,
+    require_index_equivalence: bool,
+) -> CliResult<VerifiedPublication> {
     let git_repo = GitRepository::discover(repo_root)
         .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
     let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
-    verify_git_publication_with_policy(repo, repo_root, view, policy, filters)
+    verify_git_publication_with_policy(
+        repo,
+        repo_root,
+        view,
+        policy,
+        filters,
+        require_index_equivalence,
+    )
 }
 
 /// Whether native publication must run the Git bridge gate.
@@ -220,7 +244,7 @@ pub(crate) fn verify_bridge_publication(
         return Ok(None);
     }
     let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
-    verify_git_publication_with_policy(repo, repo_root, view, policy, filters).map(Some)
+    verify_git_publication_with_policy(repo, repo_root, view, policy, filters, true).map(Some)
 }
 
 fn verify_git_publication_with_policy(
@@ -229,6 +253,7 @@ fn verify_git_publication_with_policy(
     view: &str,
     policy: ConversionPolicy,
     filters: ContentFilterConfig,
+    require_index_equivalence: bool,
 ) -> CliResult<VerifiedPublication> {
     let project = repo.project_tree(view, &policy).map_err(|error| {
         git_error(format!(
@@ -240,14 +265,18 @@ fn verify_git_publication_with_policy(
         .map_err(|error| git_error(format!("cannot observe Git index: {error}")))?;
     let worktree = observe_worktree(repo_root, Some(&index), &filter, &policy)
         .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
-    let claims = EquivalenceClaims {
-        manifest_version: Some(project.manifest.version),
-        object_algorithm: Some(project.git.algorithm),
-        manifest_root: Some(project.manifest.root().content_key.clone()),
-        conversion_policy_root: Some(policy.root().content_key),
-        git_tree_root: Some(project.git.root.clone()),
+    let report = if require_index_equivalence {
+        let claims = EquivalenceClaims {
+            manifest_version: Some(project.manifest.version),
+            object_algorithm: Some(project.git.algorithm),
+            manifest_root: Some(project.manifest.root().content_key.clone()),
+            conversion_policy_root: Some(policy.root().content_key),
+            git_tree_root: Some(project.git.root.clone()),
+        };
+        compare_project_state(&project, &index, &worktree, &policy, &claims)
+    } else {
+        compare_project_to_worktree(&project, &worktree, &policy)
     };
-    let report = compare_project_state(&project, &index, &worktree, &policy, &claims);
     if !report.is_equivalent() {
         let details = report
             .mismatches
@@ -284,8 +313,10 @@ fn verify_git_publication_with_policy(
         manifest_root: project.manifest.root(),
         index_root: index.root(),
         worktree_root: worktree.root(),
-        git_tree: project.git.root,
+        git_tree: project.git.root.clone(),
         git_head,
+        project,
+        require_index_equivalence,
     })
 }
 
@@ -498,9 +529,15 @@ pub(crate) fn sync_git_head_to_view(
     let target_ref = format!("refs/heads/{view}");
     let snapshot = GitSwitchSnapshot::capture(&git_repo, &target_ref)?;
     let sync_result = (|| -> CliResult<()> {
-        let publication = verify_git_publication(repo, repo_root, view)?;
-        // Never bypass V1 for a switch: a conflicted materialization cannot be
-        // checkpointed as clean Git evidence.
+        // V1 must run before even content-addressed object writes.
+        refuse_conflict_markers(repo, repo_root, view)?;
+        let publication = verify_git_publication_mode(repo, repo_root, view, false)?;
+        let written_tree = write_project_tree(&git_repo, &publication.project)?;
+        if written_tree != publication.git_tree_oid()? {
+            return Err(git_error(
+                "written switch projection tree differs from verified Atomic project",
+            ));
+        }
         let tree_oid = stage_and_validate_tree(
             repo,
             &git_repo,
@@ -813,31 +850,7 @@ pub(crate) fn stage_and_validate_tree(
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
     if conflict_markers == ConflictMarkerPolicy::Refuse {
-        if let Some((path, line)) = repo
-            .first_working_copy_conflict_marker(working_copy)
-            .map_err(CliError::Repository)?
-        {
-            if !std::io::stderr().is_terminal() {
-                append_shadow_validate_log(
-                    repo_root,
-                    "V1",
-                    view,
-                    &format!("file={} line={}", path, line),
-                );
-            }
-            print_warning(&format!(
-                "Refusing to commit '{}': unresolved conflict marker at line {}.",
-                path, line
-            ));
-            return Err(CliError::GitError {
-                message: format!(
-                    "'{}' still contains conflict markers at line {} — resolve the \
-                     conflict (remove the >>>>>>> / ======= / <<<<<<< lines), or pass \
-                     --allow-conflict-markers to override. No commit was created.",
-                    path, line
-                ),
-            });
-        }
+        refuse_conflict_markers(repo, repo_root, view)?;
     }
 
     // Prevention: make sure git is configured to exclude Atomic's shadow /
@@ -879,6 +892,72 @@ pub(crate) fn stage_and_validate_tree(
         ))
     })?;
     Ok(tree_oid)
+}
+
+fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> CliResult<()> {
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let Some((path, line)) = repo
+        .first_working_copy_conflict_marker(working_copy)
+        .map_err(CliError::Repository)?
+    else {
+        return Ok(());
+    };
+    if !std::io::stderr().is_terminal() {
+        append_shadow_validate_log(
+            repo_root,
+            "V1",
+            view,
+            &format!("file={} line={}", path, line),
+        );
+    }
+    print_warning(&format!(
+        "Refusing to commit '{}': unresolved conflict marker at line {}.",
+        path, line
+    ));
+    Err(CliError::GitError {
+        message: format!(
+            "'{}' still contains conflict markers at line {} — resolve the conflict \
+             (remove the >>>>>>> / ======= / <<<<<<< lines), or pass \
+             --allow-conflict-markers to override. No commit was created.",
+            path, line
+        ),
+    })
+}
+
+fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<git2::Oid> {
+    if project.git.algorithm != GitHashAlgorithm::Sha1 {
+        return Err(git_error(format!(
+            "libgit2 cannot safely publish {:?} Atomic projections",
+            project.git.algorithm
+        )));
+    }
+    let odb = git
+        .odb()
+        .map_err(|error| git_error(format!("cannot open Git object database: {error}")))?;
+    for (expected, object) in project.git.objects.iter() {
+        let kind = match object.kind {
+            GitObjectKind::Blob => ObjectType::Blob,
+            GitObjectKind::Tree => ObjectType::Tree,
+        };
+        let written = odb.write(kind, &object.bytes).map_err(|error| {
+            git_error(format!(
+                "cannot write projected Git {kind:?} object: {error}"
+            ))
+        })?;
+        if written.as_bytes() != expected.as_bytes() {
+            return Err(git_error(format!(
+                "Git object database returned {written} for projected object {expected:?}"
+            )));
+        }
+    }
+    git2::Oid::from_bytes(project.git.root.as_bytes()).map_err(|error| {
+        git_error(format!(
+            "projected Git tree identity {:?} is unsupported: {error}",
+            project.git.root
+        ))
+    })
 }
 
 /// Append a `shadow-validate:<rule>` entry to `.atomic/hook-errors.log` (SPEC

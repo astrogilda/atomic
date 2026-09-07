@@ -100,6 +100,7 @@ mod split;
 mod switch;
 mod views;
 mod working_copy;
+mod workspace_txn;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
@@ -114,7 +115,12 @@ pub use filter::{
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
     view_membership_at_sequence,
 };
-pub use git_observation::{observe_git_index, observe_worktree, ObservationError};
+pub use git_observation::{
+    observe_git_index, observe_git_metadata, observe_worktree, GitAdminEntryKind,
+    GitAdminPathObservation, GitHeadObservation, GitObservationToken, GitOperationMarker,
+    GitOperationMarkerObservation, GitOperationObservation, ObservationError,
+    WorkspaceGitObservation, WorkspaceGitRepositoryObservation,
+};
 pub use locks::RepositoryCommonLockGuard;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
@@ -140,6 +146,12 @@ pub use snapshot_split::{
 };
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
+pub use workspace_txn::{
+    GitOperationDisposition, UnanchoredWorkspace, WorkspaceCheckpoint, WorkspaceEntryPlan,
+    WorkspaceFilesystemPlan, WorkspaceHeadPlan, WorkspaceRefPlan, WorkspaceRemediation,
+    WorkspaceTxn, WorkspaceTxnMode, WorkspaceTxnStart, MAX_WORKSPACE_ENTRY_PLAN_ITEMS,
+    MAX_WORKSPACE_TXN_ATTEMPTS,
+};
 
 // Re-import workspace helpers from `switch` so they are available to
 // `mod.rs` (used in `init`) and to sibling sub-modules via `use super::*;`.
@@ -519,6 +531,41 @@ default = "{}"
             working_copy::load_registered_identity(&repository.pristine, &layout)?;
         repository.current_view = authoritative_view;
         Ok(repository)
+    }
+
+    /// Open an existing repository for a workspace transaction preflight.
+    ///
+    /// This constructor supports later writes but performs no migration, operation
+    /// recovery, head consolidation, compatibility-file rewrite, or table
+    /// initialization. Callers must immediately enter [`Self::begin_workspace_txn`],
+    /// which observes and classifies Git state before any recovery mutation.
+    pub fn open_for_workspace_transaction<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+            return Self::open_sandbox(working_root, canonical, &view);
+        }
+        let layout = working_copy::discover_layout(path.as_ref())?;
+        let root = layout.working_root.clone();
+        let dot_dir = layout.common_dot_dir.clone();
+        let pristine = Arc::new(
+            Pristine::open_existing(dot_dir.join("pristine.redb"))
+                .map_err(RepositoryError::from)?,
+        );
+        let (_working_copy_id, current_view) =
+            working_copy::load_registered_identity(&pristine, &layout)?;
+        let change_store =
+            ChangeStore::open_existing(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+
+        Ok(Self {
+            root,
+            dot_dir,
+            current_view,
+            pristine,
+            change_store,
+            is_sandbox: false,
+        })
     }
 
     /// Open an existing repository in read-only mode.

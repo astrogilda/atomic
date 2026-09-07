@@ -58,12 +58,12 @@
 use std::path::{Path, PathBuf};
 
 use atomic_repository::tracking::TrackingOptions;
-use atomic_repository::{FileStatus, Repository, RepositoryStatus, StatusOptions};
+use atomic_repository::{
+    FileStatus, Repository, RepositoryStatus, StatusOptions, WorkspaceTxnMode,
+};
 use clap::Parser;
 
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
@@ -220,11 +220,13 @@ impl Restore {
     }
 
     /// Execute dry-run for a single file - output pristine content to stdout.
-    fn dry_run_single_file(&self, repo: &Repository, path: &str) -> CliResult<()> {
+    fn dry_run_single_file(&self, repo: &Repository, view: &str, path: &str) -> CliResult<()> {
         // Get file content from pristine
-        let content = repo.get_file_content(Path::new(path)).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
-        })?;
+        let content = repo
+            .get_file_content_on_view(Path::new(path), view)
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
+            })?;
 
         match content {
             Some(bytes) => {
@@ -254,14 +256,12 @@ impl Restore {
     fn restore_file(
         &self,
         repo: &Repository,
+        working_copy: atomic_core::WorkingCopyId,
+        view: &str,
         repo_root: &Path,
         path: &Path,
         status: FileStatus,
     ) -> CliResult<RestoreOutcome> {
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
-
         if status == FileStatus::Added {
             // Undo the `add`: stop tracking, but keep the file on disk.
             repo.remove(
@@ -274,7 +274,7 @@ impl Restore {
         }
 
         // Restore content from pristine.
-        let content = repo.get_file_content(path).map_err(|e| {
+        let content = repo.get_file_content_on_view(path, view).map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
         })?;
 
@@ -342,31 +342,20 @@ impl Command for Restore {
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
-
-        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
-            .map_err(|error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            })? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
-            }
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Force => unreachable!("restore never forces workspace entry"),
         }
-
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = workspace.view().name.clone();
 
         // Compute status once. Restore only touches tracked files, so we skip
         // the untracked scan, and we reuse this single status for both the
@@ -403,7 +392,7 @@ impl Command for Restore {
             && !self.files[0].ends_with('/')
             && !repo_root.join(&self.files[0]).is_dir();
         if self.dry_run && single_file_arg && !single_added {
-            return self.dry_run_single_file(&repo, &self.files[0]);
+            return self.dry_run_single_file(&repo, &workspace_view, &self.files[0]);
         }
 
         // Dry run mode - just show what would happen
@@ -442,7 +431,14 @@ impl Command for Restore {
         for (path, file_status) in &files_to_restore {
             let path_display = path.display();
 
-            match self.restore_file(&repo, &repo_root, path, *file_status) {
+            match self.restore_file(
+                &repo,
+                working_copy,
+                &workspace_view,
+                &repo_root,
+                path,
+                *file_status,
+            ) {
                 Ok(RestoreOutcome::Restored) => {
                     println!("  Restored: {}", path_display);
                     restored_count += 1;
@@ -698,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_restore_modified_restores_pristine_content() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
         let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
@@ -710,8 +706,16 @@ mod tests {
         fs::write(root.join(path), b"local edit\n").unwrap();
 
         let cmd = Restore::new();
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Modified)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Modified,
+            )
             .unwrap();
 
         assert_eq!(outcome, RestoreOutcome::Restored);
@@ -720,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_restore_deleted_restores_file_from_pristine() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
         let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
@@ -733,8 +737,16 @@ mod tests {
         assert!(!root.join(path).exists());
 
         let cmd = Restore::new();
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Deleted)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Deleted,
+            )
             .unwrap();
 
         assert_eq!(outcome, RestoreOutcome::Restored);
@@ -744,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_restore_added_untracks_but_keeps_file_on_disk() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
         let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("new.txt");
         fs::write(root.join(path), b"brand new\n").unwrap();
@@ -763,8 +775,16 @@ mod tests {
             .iter()
             .any(|(p, s)| p.as_path() == path && *s == FileStatus::Added));
 
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Added)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Added,
+            )
             .unwrap();
         assert_eq!(outcome, RestoreOutcome::Untracked);
 

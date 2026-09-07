@@ -108,7 +108,7 @@ fn operation_lock_child_holds_file() {
 }
 
 #[test]
-fn common_operation_lock_is_cross_process_exclusive_and_reacquirable() {
+fn common_operation_lock_is_cross_process_and_independent_same_thread_exclusive() {
     let (_temp_dir, repo) = create_temp_repo();
     let common_path = repo.common_operation_lock_path();
     assert_eq!(common_path, repo.dot_dir().join("bridge.lock"));
@@ -131,23 +131,16 @@ fn common_operation_lock_is_cross_process_exclusive_and_reacquirable() {
     let first = repo
         .try_lock_common_operation()
         .expect("common lock should be available after child exits");
-    let error = match repo.try_lock_common_operation() {
-        Ok(_) => panic!("second common lock unexpectedly acquired"),
-        Err(error) => error,
-    };
     assert!(matches!(
-        error,
-        RepositoryError::LockContended {
-            lock: RepositoryLockKind::Common,
-            ..
-        }
+        repo.try_lock_common_operation(),
+        Err(RepositoryError::LockContended { .. })
     ));
     drop(first);
     assert!(repo.try_lock_common_operation().is_ok());
 }
 
 #[test]
-fn working_copy_operation_lock_is_cross_process_exclusive_and_reacquirable() {
+fn working_copy_operation_lock_is_cross_process_and_independent_same_thread_exclusive() {
     let (_temp_dir, repo) = create_temp_repo();
     let working_copy = repo.working_copy();
     let path = repo.working_copy_operation_lock_path(working_copy);
@@ -183,6 +176,10 @@ fn working_copy_operation_lock_is_cross_process_exclusive_and_reacquirable() {
         .try_lock_operation(working_copy)
         .expect("ordered operation locks should be available");
     assert_eq!(first.working_copy(), working_copy);
+    assert!(matches!(
+        repo.try_lock_operation(working_copy),
+        Err(RepositoryError::LockContended { .. })
+    ));
     drop(first);
     assert!(repo.try_lock_operation(working_copy).is_ok());
 }
@@ -319,7 +316,7 @@ fn switch_contention_returns_before_record_or_filesystem_mutation() {
     let current_view = repo.current_view().to_string();
     let record_before = repo.working_copy_record(working_copy).unwrap();
     let pointer_before = fs::read(temp.path().join(".atomic/current_view")).unwrap();
-    let common = repo.try_lock_common_operation().unwrap();
+    let holder = ChildLockHolder::spawn(&repo.common_operation_lock_path());
 
     let error = repo.switch_view(&current_view).unwrap_err();
     assert!(matches!(
@@ -345,7 +342,7 @@ fn switch_contention_returns_before_record_or_filesystem_mutation() {
         .unwrap()
         .is_empty());
     drop(txn);
-    drop(common);
+    drop(holder);
 }
 
 #[test]

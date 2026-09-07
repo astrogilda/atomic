@@ -1,8 +1,8 @@
 use super::*;
 
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use atomic_repository::WorkspaceTxnMode;
+
+use crate::commands::workspace_txn::enter_workspace;
 
 impl Command for Record {
     /// Execute the record command.
@@ -21,32 +21,24 @@ impl Command for Record {
         // Find repository
         let repo_root = find_repository_root()?;
 
-        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Record)).map_err(
-            |error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            },
-        )? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
-            }
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
         }
-
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let view_name = workspace.view().name.clone();
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&repo);
+            return self.display_dry_run(&repo, working_copy);
         }
 
         // Get commit message
@@ -66,9 +58,6 @@ impl Command for Record {
 
         // Build record options
         let options = self.build_options()?;
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
 
         // Repository::record owns --all inclusion so rename classification runs
         // before any untracked destination could be staged as a fresh inode.
@@ -124,7 +113,7 @@ impl Command for Record {
         })?;
 
         // Display result
-        let output = self.format_outcome(&repo, &outcome);
+        let output = self.format_outcome(&view_name, &outcome);
         print!("{}", output);
 
         // Show any errors that occurred during recording

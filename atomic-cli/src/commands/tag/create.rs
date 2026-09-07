@@ -36,8 +36,9 @@
 
 use clap::Parser;
 
-use atomic_repository::{Repository, TagKind};
+use atomic_repository::{Repository, TagKind, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{emphasis, print_success};
@@ -176,16 +177,28 @@ impl Command for Create {
 
         // Find the repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
-                searched_path: path.into(),
-            },
-            other => CliError::Repository(other),
-        })?;
+        let mut repo =
+            Repository::open_for_workspace_transaction(&repo_root).map_err(|e| match e {
+                atomic_repository::RepositoryError::NotFound { path } => {
+                    CliError::RepositoryNotFound {
+                        searched_path: path.into(),
+                    }
+                }
+                other => CliError::Repository(other),
+            })?;
+
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
+        let workspace_view = &workspace.view().name;
+        let target_view = self.view.as_deref().unwrap_or(workspace_view);
 
         // Check for an existing tag. Forced replacement is performed by one
         // leased repository transition rather than a delete/create pair.
-        if !self.force && repo.get_tag(name).map_err(CliError::Repository)?.is_some() {
+        if !self.force
+            && repo
+                .get_tag_from_view(name, target_view)
+                .map_err(CliError::Repository)?
+                .is_some()
+        {
             return Err(CliError::InvalidArgument {
                 message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
             });
@@ -193,7 +206,7 @@ impl Command for Create {
 
         // Create the tag
         let tag = repo
-            .create_tag(name, self.message.as_deref(), TagKind::Release)
+            .create_tag_on_view(target_view, name, self.message.as_deref(), TagKind::Release)
             .map_err(|e| match e {
                 atomic_repository::RepositoryError::TagAlreadyExists { name } => {
                     CliError::InvalidArgument {

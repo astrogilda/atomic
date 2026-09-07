@@ -40,11 +40,11 @@ use clap::Parser;
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::complete::complete_view_names;
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::{enter_workspace, remediation_error};
 
-use atomic_repository::Repository;
+use atomic_repository::{
+    Repository, UnanchoredWorkspace, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
+};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -152,44 +152,37 @@ impl Command for Switch {
         // Find the repository
         let repo_root = find_repository_root()?;
 
-        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::ViewSwitch))
-            .map_err(|error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            })? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
+        let mut repo =
+            Repository::open_for_workspace_transaction(&repo_root).map_err(|e| match e {
+                atomic_repository::RepositoryError::NotFound { path } => {
+                    CliError::RepositoryNotFound {
+                        searched_path: path.into(),
+                    }
+                }
+                other => CliError::Repository(other),
+            })?;
+        let workspace = match repo
+            .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+            .map_err(CliError::Repository)?
+        {
+            WorkspaceTxnStart::Ready(workspace) => workspace,
+            WorkspaceTxnStart::Remediation(WorkspaceRemediation::Unanchored {
+                state: UnanchoredWorkspace::AtomicCheckpointDrift { desired_view, .. },
+                ..
+            }) if desired_view == *name => enter_workspace(&mut repo, WorkspaceTxnMode::Force)?,
+            WorkspaceTxnStart::Remediation(remediation) => {
+                return Err(remediation_error(remediation));
             }
-        }
-
-        let mut repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
-                searched_path: path.into(),
-            },
-            other => CliError::Repository(other),
-        })?;
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
-        let desired_view = repo
-            .desired_view_name(working_copy)
-            .map_err(CliError::Repository)?;
+        };
+        let working_copy = workspace.working_copy();
+        let desired_view = workspace.view().name.clone();
 
         // A prior coordinated switch may have materialized this view but failed
         // before Git/checkpoint alignment. In an active shadow repo, retry the
         // projection even when Atomic already points at the requested view; do
         // not print a false success while Git evidence is still stale.
         if desired_view == name.as_str() {
+            drop(workspace);
             let shadow_sync =
                 crate::commands::git::shadow::sync_git_head_to_view(&repo, &repo_root, name)?;
             if !shadow_sync.is_synchronized() {
@@ -248,6 +241,10 @@ impl Command for Switch {
             }
             other => CliError::Repository(other),
         })?;
+
+        // The native CB-5B operation is complete. Git shadow writes remain a
+        // separate legacy boundary until CB-5C journals and routes them.
+        drop(workspace);
 
         // Git shadows Atomic: validate the just-materialized target through the
         // single shadow staging path, advance/create its mirror projection, and

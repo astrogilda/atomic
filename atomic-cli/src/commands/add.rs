@@ -90,13 +90,12 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use atomic_core::WorkingCopyId;
 use atomic_repository::status::StatusOptions;
 use atomic_repository::tracking::{TrackingOptions, TrackingStats};
-use atomic_repository::Repository;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -260,10 +259,11 @@ impl Add {
     }
 
     /// Collect all untracked files in the repository.
-    fn collect_untracked_files(&self, repo: &Repository) -> CliResult<Vec<PathBuf>> {
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
+    fn collect_untracked_files(
+        &self,
+        repo: &Repository,
+        working_copy: WorkingCopyId,
+    ) -> CliResult<Vec<PathBuf>> {
         let status = repo
             .status(working_copy, StatusOptions::default())
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -275,13 +275,10 @@ impl Add {
     fn add_path(
         &self,
         repo: &Repository,
+        working_copy: WorkingCopyId,
         path: &str,
         options: &TrackingOptions,
     ) -> CliResult<TrackingStats> {
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
-
         // Convert to PathBuf for the repository API
         let path_buf = PathBuf::from(path);
 
@@ -420,31 +417,22 @@ impl Command for Add {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
-        match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Add)).map_err(
-            |error| match error {
-                GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                    reason: error.to_string(),
-                },
-                GuardError::Observation(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-                GuardError::Wip(error) => CliError::GitError {
-                    message: error.to_string(),
-                },
-            },
-        )? {
-            GuardOutcome::Pass(_) => {}
-            GuardOutcome::Refuse(refusal) => {
-                return Err(CliError::StaleBaseline {
-                    report: refusal.to_string(),
-                });
-            }
+        // Open the repository and retain its stable workspace boundary for all add work.
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
         }
-
-        // Open the repository
-        let repo = Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {
+        .map_err(|e| CliError::InvalidRepository {
             reason: e.to_string(),
         })?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
 
         // Get tracking options
         let mut options = self.get_tracking_options();
@@ -454,7 +442,7 @@ impl Command for Add {
 
         // Collect files to add
         let files_to_add: Vec<PathBuf> = if self.all {
-            self.collect_untracked_files(&repo)?
+            self.collect_untracked_files(&repo, working_copy)?
         } else {
             self.files.iter().map(PathBuf::from).collect()
         };
@@ -478,7 +466,7 @@ impl Command for Add {
         for path in &files_to_add {
             let path_str = path.to_string_lossy();
 
-            match self.add_path(&repo, &path_str, &options) {
+            match self.add_path(&repo, working_copy, &path_str, &options) {
                 Ok(stats) => {
                     // Print progress for each file
                     if self.dry_run {

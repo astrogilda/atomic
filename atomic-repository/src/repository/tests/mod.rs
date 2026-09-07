@@ -43,6 +43,7 @@ mod tree_projection_tests;
 mod verify_tests;
 mod view_tests;
 mod working_copy_identity_tests;
+mod workspace_txn_tests;
 
 // ── Shared Helpers ──────────────────────────────────────────────────────
 

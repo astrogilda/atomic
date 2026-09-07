@@ -30,9 +30,9 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-5A: Shared workspace transaction core and remediation objects**
-  Intent: pending · Priority: high · Prerequisites: CB-1C, CB-4B, CB-4C, and CB-0C (done)
-  Add the ordered, mode-aware workspace transaction boundary with bounded plans, TOCTOU retries, and typed remediation.
+- [ ] **READY — CB-5C: Route Git/network/agent boundaries and journal bridge writes**
+  Intent: pending · Priority: high · Prerequisites: CB-5A, CB-5B, CB-2A (done)
+  Extend the shared transaction boundary to Git, network, and managed-agent entrypoints and journal bridge-owned Git mutations.
 
 ### Recently completed critical path
 
@@ -44,6 +44,8 @@ next.
 - [x] **DONE — CB-4A:** `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B`
 - [x] **DONE — CB-4B:** `ATOM::continuouslee::88` / `01M1WFS2NX3Z0X81ZC7AKY5ZFV`
 - [x] **DONE — CB-4C:** `ATOM::continuouslee::90` / `01M1WRRF45S40EHSVDSAMK4Z5H`
+- [x] **DONE — CB-5A:** `ATOM::continuouslee::93` / `01M1XT5HH77A2HWPT01DXWBBTK`
+- [x] **DONE — CB-5B:** `ATOM::continuouslee::94` / `01M1XVS0M0QG2SR8PPHQNXRZDB`
 
 Phase 1, the shared CB-FMT1 format foundation, and the Phase 2/3 prerequisites for CB-2B are complete.
 
@@ -297,8 +299,8 @@ sources reverify to identical roots; errors/overflow/unknown tokens degrade to s
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] READY | CB-5A | Shared workspace transaction core and remediation objects | 1C, 4B, 4C, 0C | pending |
-| [ ] BLOCKED | CB-5B | Route local repository commands and retire direct view reads | 5A | pending |
+| [x] DONE | CB-5A | Shared workspace transaction core and remediation objects | 1C, 4B, 4C, 0C | `ATOM::continuouslee::93` |
+| [x] DONE | CB-5B | Route local repository commands and retire direct view reads | 5A | `ATOM::continuouslee::94` / `01M1XVS0M0QG2SR8PPHQNXRZDB` |
 | [ ] BLOCKED | CB-5C | Route Git/network/agent boundaries and journal bridge writes | 5A, 5B, 2A | pending |
 
 ### CB-5A definition of done

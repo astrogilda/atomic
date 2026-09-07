@@ -863,10 +863,16 @@ impl Repository {
             };
             let observed = self.observe_filesystem_effect(working_copy, &target)?;
             let mut expected_new = entry.expected_new;
-            if let EffectValue::File(new) = &mut expected_new {
-                if matches!(observed, EffectValue::Absent) {
+            match (&observed, &mut expected_new) {
+                (EffectValue::Absent, EffectValue::File(new)) => {
                     new.mode = self.materialized_creation_mode(new.mode)?;
                 }
+                (EffectValue::File(old), EffectValue::File(new))
+                    if full_materialization && old.kind == new.kind =>
+                {
+                    new.mode = old.mode;
+                }
+                _ => {}
             }
             if observed == expected_new {
                 continue;

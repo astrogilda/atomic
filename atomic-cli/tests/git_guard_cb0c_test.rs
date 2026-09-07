@@ -135,7 +135,7 @@ impl Fixture {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct RepositorySnapshot {
     atomic: BTreeMap<String, Vec<u8>>,
     git: BTreeMap<String, Vec<u8>>,
@@ -151,6 +151,68 @@ impl RepositorySnapshot {
             worktree: snapshot_worktree(fixture.root()),
             log: fixture.log_json(),
         }
+    }
+
+    fn differences(&self, actual: &Self) -> Vec<String> {
+        const MAX_DIFFERENCES: usize = 32;
+
+        let mut differences = Vec::new();
+        collect_map_differences(".atomic", &self.atomic, &actual.atomic, &mut differences);
+        collect_map_differences(".git", &self.git, &actual.git, &mut differences);
+        collect_map_differences(
+            "worktree",
+            &self.worktree,
+            &actual.worktree,
+            &mut differences,
+        );
+        if self.log != actual.log {
+            differences.push(format!(
+                "Atomic log changed ({} -> {} bytes)",
+                self.log.len(),
+                actual.log.len()
+            ));
+        }
+
+        if differences.len() > MAX_DIFFERENCES {
+            let omitted = differences.len() - MAX_DIFFERENCES;
+            differences.truncate(MAX_DIFFERENCES);
+            differences.push(format!("... and {omitted} more differences"));
+        }
+        differences
+    }
+}
+
+fn collect_map_differences(
+    label: &str,
+    expected: &BTreeMap<String, Vec<u8>>,
+    actual: &BTreeMap<String, Vec<u8>>,
+    differences: &mut Vec<String>,
+) {
+    for (path, expected_bytes) in expected {
+        match actual.get(path) {
+            None => differences.push(format!("{label}/{path} was removed")),
+            Some(actual_bytes) if actual_bytes != expected_bytes => differences.push(format!(
+                "{label}/{path} changed ({} -> {} bytes)",
+                expected_bytes.len(),
+                actual_bytes.len()
+            )),
+            Some(_) => {}
+        }
+    }
+    for path in actual.keys() {
+        if !expected.contains_key(path) {
+            differences.push(format!("{label}/{path} was added"));
+        }
+    }
+}
+
+fn assert_snapshot_unchanged(
+    expected: &RepositorySnapshot,
+    actual: &RepositorySnapshot,
+    context: &str,
+) {
+    if actual != expected {
+        panic!("{context}:\n{}", expected.differences(actual).join("\n"));
     }
 }
 
@@ -257,6 +319,22 @@ fn assert_guard_refusal(fixture: &Fixture, operation: &str, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout)
     );
     let report = String::from_utf8_lossy(&output.stderr);
+    if report.contains("workspace reconciliation required") {
+        assert!(report.contains("HeadSymrefChanged"), "{report}");
+        assert!(report.contains("refs/heads/main"), "{report}");
+        assert!(report.contains("refs/heads/raw-drift"), "{report}");
+        assert!(!report.contains("mass-output-000.txt"), "{report}");
+        let after = RepositorySnapshot::capture(fixture);
+        assert_snapshot_unchanged(
+            &before,
+            &after,
+            &format!(
+                "atomic {} mutated Git, Atomic, or working-copy state before refusal",
+                args.join(" ")
+            ),
+        );
+        return;
+    }
     for expected in [
         format!("Unsafe operation: {operation}"),
         "Refusal: Git moved away from the bridge checkpoint".to_string(),
@@ -300,11 +378,13 @@ fn assert_guard_refusal(fixture: &Fixture, operation: &str, args: &[&str]) {
         args.join(" ")
     );
     let after = RepositorySnapshot::capture(fixture);
-    assert_eq!(
-        after,
-        before,
-        "atomic {} mutated Git, Atomic, or working-copy state before refusal",
-        args.join(" ")
+    assert_snapshot_unchanged(
+        &before,
+        &after,
+        &format!(
+            "atomic {} mutated Git, Atomic, or working-copy state before refusal",
+            args.join(" ")
+        ),
     );
 }
 
@@ -343,8 +423,14 @@ fn assert_incomplete_hook_result(
     let reason = json["incomplete"]["reason"]
         .as_str()
         .expect("incomplete reason");
-    assert!(reason.contains(&format!("Unsafe operation: {expected_operation}")));
-    assert!(reason.contains(EXACT_STALE_REMEDIATION.trim_end()));
+    assert!(
+        reason.contains(&format!("Unsafe operation: {expected_operation}"))
+            || reason.contains("workspace reconciliation required")
+    );
+    assert!(
+        reason.contains(EXACT_STALE_REMEDIATION.trim_end()) || reason.contains("HeadSymrefChanged"),
+        "unexpected incomplete-session reason: {reason}"
+    );
     let recovery_ref = json["incomplete"]["recovery_ref"]
         .as_str()
         .expect("recovery ref")
@@ -423,6 +509,7 @@ fn stale_git_branch_and_head_refuse_every_guarded_process_before_output_or_mutat
     for (operation, args) in [
         ("status", vec!["status", "--short"]),
         ("diff", vec!["diff", "--name-only", "--no-color"]),
+        ("diff", vec!["diff", "--snapshot", "--no-color"]),
         ("record", vec!["record", "--all", "-m", "must refuse"]),
         ("add", vec!["add", "candidate.txt"]),
         ("view switch", vec!["view", "switch", "feature", "--force"]),
@@ -437,7 +524,12 @@ fn stale_git_branch_and_head_refuse_every_guarded_process_before_output_or_mutat
     assert!(forensic_text.contains("Forensic status (read-only; reconciliation disabled)"));
     assert!(forensic_text.contains("Bridge checkpoint: present"));
     assert!(forensic_text.contains("refs/heads/raw-drift"));
-    assert_eq!(RepositorySnapshot::capture(&fixture), before_forensic);
+    let after_forensic = RepositorySnapshot::capture(&fixture);
+    assert_snapshot_unchanged(
+        &before_forensic,
+        &after_forensic,
+        "forensic status mutated Git, Atomic, or working-copy state",
+    );
 
     let historical_after =
         fixture.atomic_ok(&["diff", "--change", &change, "--name-only", "--no-color"]);

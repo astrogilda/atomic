@@ -585,7 +585,12 @@ fn read_canonical_content(
     let bytes = match file.kind {
         ObservedKind::Regular => fs::read(&file.native_path),
         ObservedKind::Symlink => read_link_bytes(&file.native_path),
-        ObservedKind::Directory | ObservedKind::Other => Ok(Vec::new()),
+        ObservedKind::Directory => match fs::read(file.native_path.join(".git")) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        },
+        ObservedKind::Other => Ok(Vec::new()),
     }
     .map_err(|error| ChangeSourceError::Io {
         path: path.escaped(),

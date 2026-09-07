@@ -1,7 +1,9 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use atomic_core::pristine::{MutTxnT, Pristine, WriteTxn};
 use atomic_core::WorkingCopyId;
@@ -25,6 +27,7 @@ pub struct RepositoryCommonLockGuard {
     _common_lock: AdvisoryFileLock,
     dot_dir: PathBuf,
     pristine: Arc<Pristine>,
+    reentrant: bool,
 }
 
 /// A repository operation lock scoped to one persistent working copy.
@@ -61,13 +64,38 @@ pub(super) struct FinalResourceWriteTxn<'a> {
     write: OrderedPristineWriteTxn<'a>,
 }
 
+thread_local! {
+    static HELD_LOCKS: RefCell<HashMap<PathBuf, (usize, Weak<File>, bool)>> = RefCell::new(HashMap::new());
+}
+
+/// One thread-owned advisory lock acquisition.
+///
+/// Nested repository operations on the same thread reuse the outer workspace
+/// transaction's OS lock. Other threads and processes still contend on the file.
 struct AdvisoryFileLock {
-    file: File,
+    file: Arc<File>,
+    path: PathBuf,
 }
 
 impl Drop for AdvisoryFileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let release = HELD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            match held.get_mut(&self.path) {
+                Some((count, _, _)) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    held.remove(&self.path);
+                    true
+                }
+                None => false,
+            }
+        });
+        if release {
+            let _ = FileExt::unlock(&*self.file);
+        }
     }
 }
 
@@ -105,12 +133,20 @@ impl Repository {
     pub(super) fn try_lock_common_operation(
         &self,
     ) -> Result<RepositoryCommonLockGuard, RepositoryError> {
+        self.try_lock_common_operation_with_reentrancy(false)
+    }
+
+    fn try_lock_common_operation_with_reentrancy(
+        &self,
+        reentrant: bool,
+    ) -> Result<RepositoryCommonLockGuard, RepositoryError> {
         let path = self.common_operation_lock_path();
-        let common_lock = try_lock_file(&path, RepositoryLockKind::Common)?;
+        let common_lock = try_lock_file(&path, RepositoryLockKind::Common, reentrant)?;
         Ok(RepositoryCommonLockGuard {
             _common_lock: common_lock,
             dot_dir: self.dot_dir.clone(),
             pristine: Arc::clone(&self.pristine),
+            reentrant,
         })
     }
 
@@ -121,6 +157,19 @@ impl Repository {
     ) -> Result<WorkingCopyOperationLockGuard, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         self.try_lock_common_operation()?
+            .try_lock_working_copy(working_copy)
+    }
+
+    /// Enter the operation hierarchy as a workspace transaction owner.
+    ///
+    /// Only this outer boundary permits same-thread nested repository operations
+    /// to reuse its locks. Ordinary independent acquisitions still contend.
+    pub(super) fn try_lock_workspace_operation(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<WorkingCopyOperationLockGuard, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        self.try_lock_common_operation_with_reentrancy(true)?
             .try_lock_working_copy(working_copy)
     }
 }
@@ -146,8 +195,11 @@ impl RepositoryCommonLockGuard {
         working_copy: WorkingCopyId,
     ) -> Result<WorkingCopyOperationLockGuard, RepositoryError> {
         let path = working_copy_operation_lock_path(&self.dot_dir, working_copy);
-        let working_copy_lock =
-            try_lock_file(&path, RepositoryLockKind::WorkingCopy { id: working_copy })?;
+        let working_copy_lock = try_lock_file(
+            &path,
+            RepositoryLockKind::WorkingCopy { id: working_copy },
+            self.reentrant,
+        )?;
         Ok(WorkingCopyOperationLockGuard {
             _working_copy_lock: working_copy_lock,
             common: self,
@@ -234,7 +286,7 @@ impl<'a> OrderedPristineWriteTxn<'a> {
                 RepositoryLockKind::DeferredTree,
             ),
         };
-        let final_lock = try_lock_file(&path, kind)?;
+        let final_lock = try_lock_file(&path, kind, self.operation.common.reentrant)?;
         Ok(FinalResourceWriteTxn {
             _final_lock: final_lock,
             write: self,
@@ -324,7 +376,24 @@ fn deferred_tree_operation_lock_path(dot_dir: &Path) -> PathBuf {
 fn try_lock_file(
     path: &Path,
     kind: RepositoryLockKind,
+    reentrant_owner: bool,
 ) -> Result<AdvisoryFileLock, RepositoryError> {
+    let path = path.to_path_buf();
+    let reentrant = HELD_LOCKS.with(|held| {
+        let mut held = held.borrow_mut();
+        let Some((count, file, reentrant)) = held.get_mut(&path) else {
+            return None;
+        };
+        if !*reentrant {
+            return None;
+        }
+        let file = file.upgrade()?;
+        *count += 1;
+        Some(file)
+    });
+    if let Some(file) = reentrant {
+        return Ok(AdvisoryFileLock { file, path });
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -333,13 +402,19 @@ fn try_lock_file(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(&path)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(AdvisoryFileLock { file }),
-        Err(error) if is_lock_contended(&error) => Err(RepositoryError::LockContended {
-            lock: kind,
-            path: path.to_path_buf(),
-        }),
+        Ok(()) => {
+            let file = Arc::new(file);
+            HELD_LOCKS.with(|held| {
+                held.borrow_mut()
+                    .insert(path.clone(), (1, Arc::downgrade(&file), reentrant_owner));
+            });
+            Ok(AdvisoryFileLock { file, path })
+        }
+        Err(error) if is_lock_contended(&error) => {
+            Err(RepositoryError::LockContended { lock: kind, path })
+        }
         Err(error) => Err(RepositoryError::Io(error)),
     }
 }

@@ -7,6 +7,11 @@ use atomic_core::operation::{
 };
 
 impl Repository {
+    fn authoritative_working_copy_view_name(&self) -> Result<String, RepositoryError> {
+        let working_copy = self.require_working_copy_id()?;
+        self.desired_view_name(working_copy)
+    }
+
     // History Methods
 
     /// Get a forward history log for the current view.
@@ -286,11 +291,10 @@ impl Repository {
         hash: &Hash,
         options: UnrecordOptions,
     ) -> Result<UnrecordOutcome, RepositoryError> {
-        let view_name = options
-            .view
-            .as_deref()
-            .unwrap_or(&self.current_view)
-            .to_string();
+        let view_name = match options.view.as_deref() {
+            Some(view) => view.to_string(),
+            None => self.authoritative_working_copy_view_name()?,
+        };
         if options.dry_run {
             let txn = self
                 .pristine
@@ -505,12 +509,15 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let view_name = match options.view.as_deref() {
+            Some(view) => view.to_string(),
+            None => self.authoritative_working_copy_view_name()?,
+        };
         let view = txn
-            .get_view(view_name)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: view_name.to_string(),
+                name: view_name.clone(),
             })?;
 
         let last_hash = crate::unrecord::get_last_change(&txn, &view)
@@ -549,6 +556,17 @@ impl Repository {
         hash: &Hash,
         at_sequence: Option<u64>,
     ) -> Result<(Merkle, u64), RepositoryError> {
+        let view = self.authoritative_working_copy_view_name()?;
+        self.reinsert_change_on_view(&view, hash, at_sequence)
+    }
+
+    /// Reinsert a change into an explicit view at its original or requested sequence.
+    pub fn reinsert_change_on_view(
+        &self,
+        view_name: &str,
+        hash: &Hash,
+        at_sequence: Option<u64>,
+    ) -> Result<(Merkle, u64), RepositoryError> {
         let change = self.load_change(hash)?;
 
         // Get write transaction
@@ -559,9 +577,9 @@ impl Repository {
 
         // Get the view
         let mut view = txn
-            .open_or_create_view(&self.current_view)
+            .open_or_create_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        self.ensure_change_allowed_in_view(&txn, &self.current_view, &change)?;
+        self.ensure_change_allowed_in_view(&txn, view_name, &change)?;
 
         // Get internal ID (must already be registered)
         let change_id = txn
@@ -583,8 +601,7 @@ impl Repository {
         // its pre-reinsert source path.
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let affected_tree_paths =
-            self.realign_tree_projection_in_txn(&mut txn, &self.current_view)?;
+        let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, view_name)?;
 
         // Commit the transaction
         txn.commit()
@@ -736,11 +753,12 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        let view_name = self.authoritative_working_copy_view_name()?;
         let view = txn
-            .get_view(&self.current_view)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
+                name: view_name.clone(),
             })?;
 
         crate::unrecord::check_can_unrecord(&txn, &view, hash, &UnrecordOptions::default())

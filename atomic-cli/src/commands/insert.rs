@@ -11,15 +11,13 @@ use clap_complete::engine::ArgValueCompleter;
 
 use atomic_core::types::{Base32, Hash, WorkingCopyId};
 use atomic_repository::{
-    CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions, Repository,
+    CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions, Repository, WorkspaceTxnMode,
 };
 
 use crate::commands::complete::{complete_change_hashes, complete_view_names};
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{
-    find_repository_root, find_repository_root_from, format_hash, require_repository,
+    find_repository_root, find_repository_root_from, format_hash, require_repository_readonly,
 };
 use crate::error::{CliError, CliResult};
 use crate::output;
@@ -194,13 +192,13 @@ pub struct PreviewArgs {
 // Command Implementation
 
 impl Insert {
-    fn may_materialize_working_copy(&self) -> bool {
+    fn workspace_mode(&self) -> WorkspaceTxnMode {
         match &self.command {
-            Some(InsertSubcommand::View(args)) => !args.dry_run,
-            Some(InsertSubcommand::Tag(args)) => !args.dry_run,
-            Some(InsertSubcommand::Change(_)) => true,
-            Some(InsertSubcommand::Preview(_)) => false,
-            None => self.change.is_some(),
+            Some(InsertSubcommand::View(args)) if args.dry_run => WorkspaceTxnMode::Observe,
+            Some(InsertSubcommand::Tag(args)) if args.dry_run => WorkspaceTxnMode::Observe,
+            Some(InsertSubcommand::Preview(_)) => WorkspaceTxnMode::Observe,
+            None if self.dry_run => WorkspaceTxnMode::Observe,
+            _ => WorkspaceTxnMode::Reconcile,
         }
     }
 }
@@ -213,43 +211,35 @@ impl crate::commands::Command for Insert {
             None => find_repository_root()?,
         };
 
-        if self.may_materialize_working_copy() {
-            match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
-                .map_err(|error| match error {
-                    GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                        reason: error.to_string(),
-                    },
-                    GuardError::Observation(error) => CliError::GitError {
-                        message: error.to_string(),
-                    },
-                    GuardError::Wip(error) => CliError::GitError {
-                        message: error.to_string(),
-                    },
-                })? {
-                GuardOutcome::Pass(_) => {}
-                GuardOutcome::Refuse(refusal) => {
-                    return Err(CliError::StaleBaseline {
-                        report: refusal.to_string(),
-                    });
-                }
+        let mode = self.workspace_mode();
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => require_repository_readonly(Some(&repo_root)),
+            WorkspaceTxnMode::Reconcile => {
+                Repository::open_for_workspace_transaction(&repo_root).map_err(CliError::from)
             }
-        }
-
-        let repo = require_repository(Some(&repo_root))?;
+            WorkspaceTxnMode::Force => unreachable!("insert never forces workspace entry"),
+        }?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = &workspace.view().name;
 
         match &self.command {
-            Some(InsertSubcommand::View(args)) => run_view_insert(&repo, args),
-            Some(InsertSubcommand::Tag(args)) => run_tag(&repo, args),
-            Some(InsertSubcommand::Change(args)) => run_change_insert(&repo, args),
-            Some(InsertSubcommand::Preview(args)) => run_preview(&repo, args),
+            Some(InsertSubcommand::View(args)) => {
+                run_view_insert(&repo, working_copy, workspace_view, args)
+            }
+            Some(InsertSubcommand::Tag(args)) => run_tag(&repo, working_copy, workspace_view, args),
+            Some(InsertSubcommand::Change(args)) => {
+                run_change_insert(&repo, working_copy, workspace_view, args)
+            }
+            Some(InsertSubcommand::Preview(args)) => run_preview(&repo, workspace_view, args),
             None => {
                 if let Some(ref change_str) = self.change {
                     // Insert a single change into the current (or --view) view.
-                    run_single_insert(&repo, change_str, self)
+                    run_single_insert(&repo, working_copy, workspace_view, change_str, self)
                 } else {
                     // No change and no subcommand: promote the current view's
                     // changes into its parent view.
-                    run_promote_to_parent(&repo, self)
+                    run_promote_to_parent(&repo, workspace_view, self)
                 }
             }
         }
@@ -259,21 +249,33 @@ impl crate::commands::Command for Insert {
 // Subcommand Implementations
 
 /// Insert a single change by hash.
-fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliResult<()> {
+fn run_single_insert(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    workspace_view: &str,
+    change_str: &str,
+    args: &Insert,
+) -> CliResult<()> {
     let hash = parse_change_hash(repo, change_str)?;
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let desired_view = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
-    let target_view = args.view.clone().unwrap_or_else(|| desired_view.clone());
-    let is_current_view = target_view == desired_view;
+    let target_view = args
+        .view
+        .clone()
+        .unwrap_or_else(|| workspace_view.to_string());
+    let is_current_view = target_view == workspace_view;
 
     let options = InsertOptions::default()
         .apply_deps(args.deps)
         .allow_conflict(args.allow_conflicts)
         .view(&target_view);
+
+    if args.dry_run {
+        output::print_info(&format!(
+            "Dry run: would insert change {} into '{}'.",
+            format_hash(&hash, true),
+            target_view
+        ));
+        return Ok(());
+    }
 
     output::print_info(&format!("Inserting change {}...", format_hash(&hash, true)));
 
@@ -315,13 +317,8 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
 ///
 /// The working copy is intentionally NOT rematerialized: the target view is
 /// not checked out, so the current view's on-disk state is unchanged.
-fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let source = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
+fn run_promote_to_parent(repo: &Repository, workspace_view: &str, args: &Insert) -> CliResult<()> {
+    let source = workspace_view.to_string();
     let source_info = repo
         .get_view_info(&source)
         .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
@@ -433,15 +430,17 @@ fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
 }
 
 /// Insert all changes from another view (the `insert view` subcommand).
-fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let desired_view = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
-    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
-    let is_current_view = to_view == desired_view;
+fn run_view_insert(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    workspace_view: &str,
+    args: &ViewArgs,
+) -> CliResult<()> {
+    let to_view = args
+        .to_view
+        .clone()
+        .unwrap_or_else(|| workspace_view.to_string());
+    let is_current_view = to_view == workspace_view;
 
     output::print_info(&format!(
         "Inserting changes from '{}' to '{}'...",
@@ -506,19 +505,21 @@ fn run_view_insert(repo: &Repository, args: &ViewArgs) -> CliResult<()> {
 }
 
 /// Insert changes up to a specific tag.
-fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let desired_view = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
+fn run_tag(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    workspace_view: &str,
+    args: &TagArgs,
+) -> CliResult<()> {
     let from_view = args
         .from_view
         .clone()
-        .unwrap_or_else(|| desired_view.clone());
-    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
-    let is_current_view = to_view == desired_view;
+        .unwrap_or_else(|| workspace_view.to_string());
+    let to_view = args
+        .to_view
+        .clone()
+        .unwrap_or_else(|| workspace_view.to_string());
+    let is_current_view = to_view == workspace_view;
 
     output::print_info(&format!(
         "Inserting changes up to tag '{}' from '{}' to '{}'...",
@@ -579,15 +580,17 @@ fn run_tag(repo: &Repository, args: &TagArgs) -> CliResult<()> {
 }
 
 /// Insert specific change(s) by hash (the `insert change` subcommand).
-fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let desired_view = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
-    let to_view = args.to_view.clone().unwrap_or_else(|| desired_view.clone());
-    let is_current_view = to_view == desired_view;
+fn run_change_insert(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    workspace_view: &str,
+    args: &ChangeArgs,
+) -> CliResult<()> {
+    let to_view = args
+        .to_view
+        .clone()
+        .unwrap_or_else(|| workspace_view.to_string());
+    let is_current_view = to_view == workspace_view;
 
     // Parse all change hashes
     let mut hashes = Vec::new();
@@ -626,14 +629,11 @@ fn run_change_insert(repo: &Repository, args: &ChangeArgs) -> CliResult<()> {
 }
 
 /// Preview what would be inserted.
-fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(CliError::Repository)?;
-    let desired_view = repo
-        .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
-    let to_view = args.to_view.clone().unwrap_or(desired_view);
+fn run_preview(repo: &Repository, workspace_view: &str, args: &PreviewArgs) -> CliResult<()> {
+    let to_view = args
+        .to_view
+        .clone()
+        .unwrap_or_else(|| workspace_view.to_string());
 
     output::print_section("Insert Preview");
     println!();
@@ -827,7 +827,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_materialization_guard_selector() {
+    fn test_workspace_mode_selector() {
         let bare_promotion = Insert {
             command: None,
             change: None,
@@ -838,7 +838,7 @@ mod tests {
             confirm: false,
             repository: None,
         };
-        assert!(!bare_promotion.may_materialize_working_copy());
+        assert_eq!(bare_promotion.workspace_mode(), WorkspaceTxnMode::Reconcile);
 
         let preview = Insert {
             command: Some(InsertSubcommand::Preview(PreviewArgs {
@@ -848,7 +848,7 @@ mod tests {
             })),
             ..bare_promotion
         };
-        assert!(!preview.may_materialize_working_copy());
+        assert_eq!(preview.workspace_mode(), WorkspaceTxnMode::Observe);
 
         let change = Insert {
             command: None,
@@ -860,7 +860,13 @@ mod tests {
             confirm: false,
             repository: None,
         };
-        assert!(change.may_materialize_working_copy());
+        assert_eq!(change.workspace_mode(), WorkspaceTxnMode::Reconcile);
+
+        let change_dry_run = Insert {
+            dry_run: true,
+            ..change
+        };
+        assert_eq!(change_dry_run.workspace_mode(), WorkspaceTxnMode::Observe);
     }
 
     #[test]

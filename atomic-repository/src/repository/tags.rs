@@ -34,6 +34,17 @@ impl Repository {
         self.create_tag_with_metadata(name, message, kind, None)
     }
 
+    /// Create a named tag on an explicit view.
+    pub fn create_tag_on_view(
+        &self,
+        view: &str,
+        name: &str,
+        message: Option<&str>,
+        kind: TagKind,
+    ) -> Result<TagRecord, RepositoryError> {
+        self.create_tag_with_metadata_on_view(view, name, message, kind, None)
+    }
+
     /// Create a named tag with optional metadata on the current view.
     ///
     /// This is the full-featured variant of [`create_tag`](Self::create_tag)
@@ -46,9 +57,22 @@ impl Repository {
         kind: TagKind,
         metadata: Option<serde_json::Value>,
     ) -> Result<TagRecord, RepositoryError> {
+        let view = self.current_view.clone();
+        self.create_tag_with_metadata_on_view(&view, name, message, kind, metadata)
+    }
+
+    /// Create a named tag with optional metadata on an explicit view.
+    pub fn create_tag_with_metadata_on_view(
+        &self,
+        view: &str,
+        name: &str,
+        message: Option<&str>,
+        kind: TagKind,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<TagRecord, RepositoryError> {
         let tag = TagRecord {
             name: name.to_string(),
-            view: self.current_view.clone(),
+            view: view.to_string(),
             sequence: 0,
             state: Merkle::ZERO,
             change_hash: Merkle::ZERO,

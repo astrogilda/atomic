@@ -56,8 +56,10 @@ use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::complete::complete_view_names;
 
-use atomic_repository::Repository;
+use atomic_core::pristine::ViewScope;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, view as style_view};
@@ -249,48 +251,23 @@ impl New {
         self
     }
 
-    /// Two-tier view creation: --draft and/or --parent
-    fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
-        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
-
+    /// Two-tier view creation: --draft and/or --parent.
+    fn run_two_tier(
+        &self,
+        name: &str,
+        repo: &mut Repository,
+        working_copy: atomic_core::WorkingCopyId,
+        workspace_view: &str,
+    ) -> CliResult<()> {
         let kind = if self.draft {
             ViewScope::Draft
         } else {
             ViewScope::Shared
         };
+        let parent_name = self.parent.as_deref().unwrap_or(workspace_view);
 
-        // Resolve the parent view name → ID
-        let parent_name = match &self.parent {
-            Some(parent) => parent.clone(),
-            None => {
-                let working_copy = repo
-                    .require_working_copy_id()
-                    .map_err(CliError::Repository)?;
-                repo.desired_view_name(working_copy)
-                    .map_err(CliError::Repository)?
-            }
-        };
-
-        let mut txn = repo
-            .pristine()
-            .write_txn()
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        let parent_view = txn
-            .get_view(&parent_name)
-            .map_err(|e| CliError::Internal(e.into()))?
-            .ok_or_else(|| CliError::ViewNotFound {
-                name: parent_name.clone(),
-            })?;
-
-        let parent_id = parent_view.id;
-
-        // Create the view with explicit kind and parent
-        let _view = txn
-            .create_view(name, kind, Some(parent_id))
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        txn.commit().map_err(|e| CliError::Internal(e.into()))?;
+        repo.create_view_with_identity(name, kind, Some(parent_name))
+            .map_err(CliError::Repository)?;
 
         let kind_label = if kind.is_draft() { "draft" } else { "shared" };
 
@@ -298,18 +275,20 @@ impl New {
             "Created {} view: {} (parent: {})",
             kind_label,
             style_view(name),
-            style_view(&parent_name),
+            style_view(parent_name),
         ));
 
-        self.maybe_switch(name, repo)
+        self.maybe_switch(name, repo, working_copy)
     }
 
     /// Optionally switch to the new view and print hint.
-    fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
+    fn maybe_switch(
+        &self,
+        name: &str,
+        repo: &mut Repository,
+        working_copy: atomic_core::WorkingCopyId,
+    ) -> CliResult<()> {
         if self.switch {
-            let working_copy = repo
-                .require_working_copy_id()
-                .map_err(CliError::Repository)?;
             let result = repo
                 .switch_view(working_copy, name)
                 .map_err(CliError::Repository)?;
@@ -343,12 +322,19 @@ impl Command for New {
 
         // Find the repository
         let repo_root = find_repository_root()?;
-        let mut repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
-                searched_path: path.into(),
-            },
-            other => CliError::Repository(other),
-        })?;
+        let mut repo =
+            Repository::open_for_workspace_transaction(&repo_root).map_err(|e| match e {
+                atomic_repository::RepositoryError::NotFound { path } => {
+                    CliError::RepositoryNotFound {
+                        searched_path: path.into(),
+                    }
+                }
+                other => CliError::Repository(other),
+            })?;
+
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = workspace.view().name.clone();
 
         // Check if the view already exists
         if repo.view_exists(name).map_err(CliError::Repository)? {
@@ -359,7 +345,7 @@ impl Command for New {
 
         // If --draft or --parent is specified, use the two-tier create path
         if self.draft || self.parent.is_some() {
-            return self.run_two_tier(name, &mut repo);
+            return self.run_two_tier(name, &mut repo, working_copy, &workspace_view);
         }
 
         // Determine how to create the new view:
@@ -417,26 +403,20 @@ impl Command for New {
             // No --from: create an empty Draft workspace parented on the
             // nearest Shared ancestor.  No changes are inherited — the
             // user inserts them explicitly.
-            let working_copy = repo
-                .require_working_copy_id()
+            let parent_name = repo
+                .nearest_shared_ancestor(&workspace_view)
                 .map_err(CliError::Repository)?;
-            let desired_view = repo
-                .desired_view_name(working_copy)
+            repo.create_view_with_identity(name, ViewScope::Draft, Some(&parent_name))
                 .map_err(CliError::Repository)?;
-            repo.create_view(name).map_err(CliError::Repository)?;
 
             print_success(&format!(
                 "Created view: {} (forked from {} - empty)",
                 style_view(name),
-                style_view(
-                    &repo
-                        .nearest_shared_ancestor(&desired_view)
-                        .unwrap_or(desired_view)
-                ),
+                style_view(&parent_name),
             ));
         }
 
-        self.maybe_switch(name, &mut repo)
+        self.maybe_switch(name, &mut repo, working_copy)
     }
 }
 

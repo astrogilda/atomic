@@ -124,6 +124,7 @@ pub mod client;
 pub mod project;
 pub mod token;
 pub mod workspace;
+pub(crate) mod workspace_txn;
 
 // Team collaboration commands (feature-gated)
 #[cfg(feature = "teams")]
