@@ -367,9 +367,36 @@ pub struct RepoConfig {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
+    /// Git interoperability configuration.
+    #[serde(default)]
+    pub git: GitConfig,
+
     /// Repository-byte content-filter policy.
     #[serde(default)]
     pub filters: ContentFilterConfig,
+}
+
+/// Git interoperability settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GitConfig {
+    /// Candidate-path source used for Git-backed working copies.
+    #[serde(default)]
+    pub watch: GitWatch,
+}
+
+/// Candidate-path source preference for Git-backed working copies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitWatch {
+    /// Do not use an external change notification source.
+    Off,
+    /// Prefer builtin Git fsmonitor, then Watchman, then a full scan.
+    #[default]
+    Auto,
+    /// Prefer Git's builtin fsmonitor daemon.
+    Fsmonitor,
+    /// Prefer Watchman.
+    Watchman,
 }
 
 /// Bounds and external drivers used by repository-byte content filters.
@@ -556,6 +583,27 @@ impl RepoConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_git_watch_defaults_to_auto() {
+        assert_eq!(RepoConfig::default().git.watch, GitWatch::Auto);
+        let parsed: RepoConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.git.watch, GitWatch::Auto);
+    }
+
+    #[test]
+    fn repo_git_watch_parses_all_modes() {
+        for (value, expected) in [
+            ("off", GitWatch::Off),
+            ("auto", GitWatch::Auto),
+            ("fsmonitor", GitWatch::Fsmonitor),
+            ("watchman", GitWatch::Watchman),
+        ] {
+            let config: RepoConfig =
+                toml::from_str(&format!("[git]\nwatch = \"{value}\"\n")).unwrap();
+            assert_eq!(config.git.watch, expected);
+        }
+    }
 
     #[test]
     fn test_author_serialization() {

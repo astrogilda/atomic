@@ -30,9 +30,9 @@ next.
 
 ### Primary next
 
-- [ ] **READY — CB-4C: `FILE_INDEX_V2`, change-source tiers, and performance gates**
-  Intent: pending · Priority: high · Prerequisites: CB-4A and CB-4B (done)
-  Add racy-stat-safe file indexing, verified scan/fsmonitor/Watchman candidate tiers, and 100k-file warm performance gates.
+- [ ] **READY — CB-5A: Shared workspace transaction core and remediation objects**
+  Intent: pending · Priority: high · Prerequisites: CB-1C, CB-4B, CB-4C, and CB-0C (done)
+  Add the ordered, mode-aware workspace transaction boundary with bounded plans, TOCTOU retries, and typed remediation.
 
 ### Recently completed critical path
 
@@ -43,6 +43,7 @@ next.
 - [x] **DONE — CB-3C:** `ATOM::continuouslee::85` / `01M1W7NBQA8CJRMQAC84T58X6G`
 - [x] **DONE — CB-4A:** `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B`
 - [x] **DONE — CB-4B:** `ATOM::continuouslee::88` / `01M1WFS2NX3Z0X81ZC7AKY5ZFV`
+- [x] **DONE — CB-4C:** `ATOM::continuouslee::90` / `01M1WRRF45S40EHSVDSAMK4Z5H`
 
 Phase 1, the shared CB-FMT1 format foundation, and the Phase 2/3 prerequisites for CB-2B are complete.
 
@@ -268,7 +269,7 @@ away with explicit `LossNote::EmptyDirectory`.
 |---|---|---|---|---|
 | [x] DONE | CB-4A | Canonical manifest model and Atomic/Git tree builders | 2B, 3B, 3C, N9 | `ATOM::continuouslee::87` / `01M1WEPQY3EG6PQK7DYNW2E62B` |
 | [x] DONE | CB-4B | Stage/worktree observation and complete equivalence integration | 4A | `ATOM::continuouslee::88` / `01M1WFS2NX3Z0X81ZC7AKY5ZFV` |
-| [ ] READY | CB-4C | `FILE_INDEX_V2`, change-source tiers, and performance gates | 4A, 4B | pending |
+| [x] DONE | CB-4C | `FILE_INDEX_V2`, change-source tiers, and performance gates | 4A, 4B | `ATOM::continuouslee::90` / `01M1WRRF45S40EHSVDSAMK4Z5H` |
 
 ### CB-4A definition of done
 
@@ -296,7 +297,7 @@ sources reverify to identical roots; errors/overflow/unknown tokens degrade to s
 
 | Status | ID | Work unit | Prerequisites | Intent |
 |---|---|---|---|---|
-| [ ] BLOCKED | CB-5A | Shared workspace transaction core and remediation objects | 1C, 4B, 4C, 0C | pending |
+| [ ] READY | CB-5A | Shared workspace transaction core and remediation objects | 1C, 4B, 4C, 0C | pending |
 | [ ] BLOCKED | CB-5B | Route local repository commands and retire direct view reads | 5A | pending |
 | [ ] BLOCKED | CB-5C | Route Git/network/agent boundaries and journal bridge writes | 5A, 5B, 2A | pending |
 
@@ -525,7 +526,7 @@ without changing the next command outcome.
 
 ## Dependency waves
 
-1. **Now:** CB-4C; CB-2A/2B, CB-3A/3B/3C, and CB-4A/4B are complete.
+1. **Now:** CB-5A; CB-2A/2B, CB-3A/3B/3C, and CB-4A/4B/4C are complete.
 2. **Native integrity:** Phase N is complete through CB-N9.
 3. **Phase 0 completion:** CB-0A, CB-0B, CB-0C, and CB-0D are done.
 4. **Operation and format substrate:** CB-1A → CB-1B → CB-1C → CB-FMT1 are done.
@@ -541,4 +542,4 @@ without changing the next command outcome.
 ## Administrative follow-up
 
 - Refresh the stale attestation for `ATOM::continuouslee::56` after confirming its current directives still match the MVP evidence.
-- Allocate the CB-4C intent next with CB-4A and CB-4B encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.
+- Allocate the CB-5A intent next with CB-1C, CB-4B, CB-4C, and CB-0C encoded in `blocked_by` frontmatter; replace `pending` with its human key and UID.

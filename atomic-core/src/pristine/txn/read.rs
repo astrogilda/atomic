@@ -15,7 +15,8 @@ use crate::pristine::traits::tag::TagRecord;
 use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{
-    decode_set_id_index_entry, SetIdIndexTxnT, VaultEntry, VaultEntryType, VaultManifest,
+    decode_file_index_v2, decode_set_id_index_entry, FileIndexV2Entry, FileIndexV2Key,
+    SetIdIndexTxnT, VaultEntry, VaultEntryType, VaultManifest,
 };
 use crate::types::{
     ChangePosition, EdgeFlags, EffectReceiptId, GraphNode, Hash, Inode, Merkle, NodeId,
@@ -29,7 +30,7 @@ use crate::pristine::path_claim::{
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    decode_working_copy_record, FileIndexEntry, FileIndexMetadata, GraphTxnT,
+    decode_working_copy_record, FileIndexEntry, FileIndexMetadata, FileIndexV2TxnT, GraphTxnT,
     GraphVisibilityClosure, OperationTxnT, PathClaimTxnT, StoredConflict, TreeTxnT, ViewState,
     ViewTxnT, WorkingCopyRecord, WorkingCopyTxnT,
 };
@@ -936,6 +937,49 @@ impl TreeTxnT for ReadTxn {
             entries.push((path, secs, nanos, size, hash));
         }
         Ok(entries)
+    }
+}
+
+impl FileIndexV2TxnT for ReadTxn {
+    fn get_file_index_v2_batch(
+        &self,
+        keys: &[FileIndexV2Key],
+    ) -> PristineResult<Vec<Option<FileIndexV2Entry>>> {
+        let table = match self.txn.open_table(FILE_INDEX_V2) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![None; keys.len()]),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let encoded = key.encode();
+            rows.push(match table.get(encoded.as_slice())? {
+                Some(value) => Some(decode_file_index_v2(value.value())?),
+                None => None,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn iter_file_index_v2(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> PristineResult<Vec<(Vec<u8>, FileIndexV2Entry)>> {
+        let table = match self.txn.open_table(FILE_INDEX_V2) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let key = FileIndexV2Key::decode(key.value())?;
+            let entry = decode_file_index_v2(value.value())?;
+            if key.working_copy == working_copy {
+                rows.push((key.path, entry));
+            }
+        }
+        Ok(rows)
     }
 }
 

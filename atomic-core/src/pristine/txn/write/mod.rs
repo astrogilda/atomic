@@ -16,15 +16,18 @@ use crate::crdt::tables::{
 
 use crate::types::{
     ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
-    SerializedGraphEdge,
+    SerializedGraphEdge, WorkingCopyId,
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::path_claim::tree_bijection_error;
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, StoredConflict, TreeTxnT,
-    ViewScope, ViewState, ViewTxnT, WorkingCopyTxnT,
+    FileIndexEntry, FileIndexMetadata, FileIndexV2MutTxnT, FileIndexV2TxnT, GraphTxnT, KgMutTxnT,
+    MutTxnT, StoredConflict, TreeTxnT, ViewScope, ViewState, ViewTxnT, WorkingCopyTxnT,
+};
+use crate::pristine::{
+    decode_file_index_v2, encode_file_index_v2, FileIndexV2Entry, FileIndexV2Key,
 };
 
 use super::helpers::{

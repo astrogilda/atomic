@@ -172,6 +172,14 @@ pub use capability::{
     CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};
+mod file_index_v2;
+
+pub use file_index_v2::{
+    decode_file_index_v2, encode_file_index_v2, FileIndexTimestamp, FileIndexV2Entry,
+    FileIndexV2Fields, FileIndexV2Key, FILE_INDEX_V2_KEY_VERSION, FILE_INDEX_V2_VALUE_SIZE,
+    FILE_INDEX_V2_VERSION,
+};
+
 pub use inode_graph::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
 };
@@ -188,13 +196,14 @@ pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
     decode_working_copy_record, encode_working_copy_record, CrdtTxnT, EffectiveProjectionClosure,
-    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, GitShaIndexMutTxnT,
-    GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT,
-    NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, OperationMutTxnT, OperationTxnT,
-    PathClaimMutTxnT, PathClaimTxnT, StoredConflict, StoredConflictKind, TagKind, TagMutTxnT,
-    TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
-    ViewMembershipSet, ViewScope, ViewState, ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord,
-    WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE, WORKING_COPY_RECORD_VERSION,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, FileIndexV2MutTxnT,
+    FileIndexV2TxnT, GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure,
+    KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT,
+    OperationMutTxnT, OperationTxnT, PathClaimMutTxnT, PathClaimTxnT, StoredConflict,
+    StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
+    VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
+    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
+    WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

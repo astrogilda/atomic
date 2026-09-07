@@ -88,6 +88,7 @@
 
 // Core modules
 pub mod apply;
+pub mod change_source;
 pub mod changestore;
 pub mod content_filter;
 pub mod error;

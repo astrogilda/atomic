@@ -407,6 +407,15 @@ pub struct RepositoryStatus {
     /// hashing.  A non-zero value means `atomic status --reindex`
     /// would likely resolve the false positives.
     stale_index_count: usize,
+
+    /// Canonical root of the FILE_INDEX_V2 re-verification performed by status.
+    verified_candidate_root: Option<crate::change_source::VerifiedCandidateRoot>,
+
+    /// Transaction-local reason the selected adapter degraded to a full scan.
+    change_source_fallback: Option<crate::change_source::ChangeSourceFallbackReason>,
+
+    /// Deterministic counters for the canonical candidate transaction.
+    change_source_metrics: Option<crate::change_source::ChangeSourceMetrics>,
 }
 
 impl RepositoryStatus {
@@ -423,6 +432,9 @@ impl RepositoryStatus {
             entries: Vec::new(),
             path_index: HashMap::new(),
             stale_index_count: 0,
+            verified_candidate_root: None,
+            change_source_fallback: None,
+            change_source_metrics: None,
         }
     }
 
@@ -440,6 +452,9 @@ impl RepositoryStatus {
             entries: Vec::with_capacity(capacity),
             path_index: HashMap::with_capacity(capacity),
             stale_index_count: 0,
+            verified_candidate_root: None,
+            change_source_fallback: None,
+            change_source_metrics: None,
         }
     }
 
@@ -456,6 +471,33 @@ impl RepositoryStatus {
     /// Get the Merkle state of the current view.
     pub fn state(&self) -> Option<&Merkle> {
         self.state.as_ref()
+    }
+
+    /// Canonical FILE_INDEX_V2 verification root for this status transaction.
+    pub fn verified_candidate_root(&self) -> Option<crate::change_source::VerifiedCandidateRoot> {
+        self.verified_candidate_root
+    }
+
+    /// Deterministic candidate verification counters for this transaction.
+    pub fn change_source_metrics(&self) -> Option<&crate::change_source::ChangeSourceMetrics> {
+        self.change_source_metrics.as_ref()
+    }
+
+    /// Why candidate discovery degraded to a complete scan, when applicable.
+    pub fn change_source_fallback(
+        &self,
+    ) -> Option<&crate::change_source::ChangeSourceFallbackReason> {
+        self.change_source_fallback.as_ref()
+    }
+
+    pub(crate) fn set_change_source_verification(
+        &mut self,
+        root: crate::change_source::VerifiedCandidateRoot,
+        metrics: crate::change_source::ChangeSourceMetrics,
+    ) {
+        self.verified_candidate_root = Some(root);
+        self.change_source_fallback = metrics.fallback_reason.clone();
+        self.change_source_metrics = Some(metrics);
     }
 
     /// Number of tracked files that were reported as Modified only because

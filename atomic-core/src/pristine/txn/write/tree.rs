@@ -203,10 +203,70 @@ impl<'a> TreeTxnT for WriteTxn<'a> {
     }
 }
 
+impl FileIndexV2TxnT for WriteTxn<'_> {
+    fn get_file_index_v2_batch(
+        &self,
+        keys: &[FileIndexV2Key],
+    ) -> PristineResult<Vec<Option<FileIndexV2Entry>>> {
+        let table = self.txn.open_table(FILE_INDEX_V2)?;
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let encoded = key.encode();
+            rows.push(match table.get(encoded.as_slice())? {
+                Some(value) => Some(decode_file_index_v2(value.value())?),
+                None => None,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn iter_file_index_v2(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> PristineResult<Vec<(Vec<u8>, FileIndexV2Entry)>> {
+        let table = self.txn.open_table(FILE_INDEX_V2)?;
+        let mut rows = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let key = FileIndexV2Key::decode(key.value())?;
+            let entry = decode_file_index_v2(value.value())?;
+            if key.working_copy == working_copy {
+                rows.push((key.path, entry));
+            }
+        }
+        Ok(rows)
+    }
+}
+
+impl FileIndexV2MutTxnT for WriteTxn<'_> {
+    fn put_file_index_v2_batch(
+        &mut self,
+        entries: &[(FileIndexV2Key, FileIndexV2Entry)],
+    ) -> PristineResult<()> {
+        let mut table = self.txn.open_table(FILE_INDEX_V2)?;
+        for (key, entry) in entries {
+            let key = key.encode();
+            let value = encode_file_index_v2(entry)?;
+            table.insert(key.as_slice(), value.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn del_file_index_v2_batch(&mut self, keys: &[FileIndexV2Key]) -> PristineResult<()> {
+        let mut table = self.txn.open_table(FILE_INDEX_V2)?;
+        for key in keys {
+            let key = key.encode();
+            table.remove(key.as_slice())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::{MutTxnT, PathClaimTxnT, Pristine};
+    use crate::change::InodeKind;
+    use crate::pristine::{FileIndexTimestamp, MutTxnT, PathClaimTxnT, Pristine};
     use tempfile::tempdir;
 
     #[test]
@@ -272,6 +332,116 @@ mod tests {
         assert_eq!(txn.get_path(first).unwrap().as_deref(), Some("same.txt"));
         assert_eq!(txn.get_path(second).unwrap(), None);
         txn.validate_tree_bijection().unwrap();
+    }
+
+    #[test]
+    fn file_index_v2_reopens_and_coexists_with_unchanged_legacy_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pristine");
+        let working_copy = WorkingCopyId::from_bytes([8; 16]);
+        let key = FileIndexV2Key::new(working_copy, b"src/lib.rs".to_vec()).unwrap();
+        let timestamp = FileIndexTimestamp::new(123, 456_789_012).unwrap();
+        let entry = FileIndexV2Entry::complete(
+            1,
+            2,
+            timestamp,
+            FileIndexTimestamp::new(124, 7).unwrap(),
+            9,
+            Hash::of(b"content"),
+            0o755,
+            InodeKind::Regular,
+            timestamp,
+            Hash::of(b"policy"),
+        )
+        .unwrap();
+        let legacy_hash = Hash::of(b"legacy");
+
+        {
+            let pristine = Pristine::open(&path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            txn.put_file_index("src/lib.rs", 10, 20, 30, &legacy_hash)
+                .unwrap();
+            txn.put_file_index_v2(&key, &entry).unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let pristine = Pristine::open(&path).unwrap();
+            let txn = pristine.read_txn().unwrap();
+            assert_eq!(
+                txn.get_file_index("src/lib.rs").unwrap(),
+                Some((10, 20, 30, legacy_hash))
+            );
+            assert_eq!(
+                txn.get_file_index_v2(working_copy, b"src/lib.rs").unwrap(),
+                Some(entry)
+            );
+        }
+    }
+
+    #[test]
+    fn file_index_v2_batch_get_iterate_and_delete_are_working_copy_scoped() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let first_copy = WorkingCopyId::from_bytes([1; 16]);
+        let second_copy = WorkingCopyId::from_bytes([2; 16]);
+        let timestamp = FileIndexTimestamp::new(1, 2).unwrap();
+        let entry = FileIndexV2Entry::complete(
+            3,
+            4,
+            timestamp,
+            timestamp,
+            5,
+            Hash::of(b"content"),
+            0o644,
+            InodeKind::Regular,
+            FileIndexTimestamp::new(2, 0).unwrap(),
+            Hash::of(b"policy"),
+        )
+        .unwrap();
+        let first = FileIndexV2Key::new(first_copy, b"a".to_vec()).unwrap();
+        let second = FileIndexV2Key::new(first_copy, b"b".to_vec()).unwrap();
+        let other = FileIndexV2Key::new(second_copy, b"a".to_vec()).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        txn.put_file_index_v2_batch(&[
+            (first.clone(), entry.clone()),
+            (second.clone(), entry.clone()),
+            (other, entry.clone()),
+        ])
+        .unwrap();
+        assert_eq!(
+            txn.get_file_index_v2_batch(&[first.clone(), second.clone()])
+                .unwrap(),
+            vec![Some(entry.clone()), Some(entry.clone())]
+        );
+        assert_eq!(
+            txn.iter_file_index_v2(first_copy)
+                .unwrap()
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        txn.del_file_index_v2_batch(&[first, second]).unwrap();
+        assert!(txn.iter_file_index_v2(first_copy).unwrap().is_empty());
+        assert_eq!(txn.iter_file_index_v2(second_copy).unwrap().len(), 1);
+        txn.abort().unwrap();
+    }
+
+    #[test]
+    fn malformed_persisted_file_index_v2_row_fails_closed() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let working_copy = WorkingCopyId::from_bytes([9; 16]);
+        let key = FileIndexV2Key::new(working_copy, b"bad".to_vec()).unwrap();
+        let txn = pristine.write_txn().unwrap();
+        {
+            let mut table = txn.txn.open_table(FILE_INDEX_V2).unwrap();
+            table
+                .insert(key.encode().as_slice(), &[2u8, 0, 0][..])
+                .unwrap();
+        }
+        assert!(txn.get_file_index_v2(working_copy, b"bad").is_err());
+        txn.abort().unwrap();
     }
 
     #[test]

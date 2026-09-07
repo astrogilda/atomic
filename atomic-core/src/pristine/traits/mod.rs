@@ -24,6 +24,7 @@
 
 mod crdt_read;
 mod embeddings;
+mod file_index_v2;
 mod graph;
 mod mutate;
 mod native_derived;
@@ -42,6 +43,7 @@ mod tests;
 
 pub use crdt_read::CrdtTxnT;
 pub use embeddings::{EmbeddingsMutTxnT, EmbeddingsTxnT};
+pub use file_index_v2::{FileIndexV2MutTxnT, FileIndexV2TxnT};
 pub use graph::GraphTxnT;
 pub use mutate::MutTxnT;
 pub use native_derived::{NativeDerivedIndexes, NativeDerivedIndexesMutTxnT};

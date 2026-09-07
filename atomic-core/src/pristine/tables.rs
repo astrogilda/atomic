@@ -419,6 +419,12 @@ pub const GIT_SHA_INDEX: TableDefinition<&str, u64> = TableDefinition::new("git_
 /// graph content.
 pub const FILE_INDEX: TableDefinition<&str, &[u8; 52]> = TableDefinition::new("file_index");
 
+/// Versioned working-copy filesystem index keyed by encoded raw repository path.
+///
+/// This table is intentionally separate from [`FILE_INDEX`], whose key/value
+/// schema and bytes remain legacy-format authoritative.
+pub const FILE_INDEX_V2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_index_v2");
+
 /// Encode file metadata for the FILE_INDEX table.
 ///
 /// Packs (mtime_secs, mtime_nanos, file_size, content_hash) into 52 bytes.
