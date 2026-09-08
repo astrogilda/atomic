@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Builder, Database, ReadableTable};
+use redb::{Builder, Database, ReadableDatabase, ReadableTable};
 
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
@@ -34,6 +34,39 @@ use super::write::WriteTxn;
 /// Return `max_id + 1`, or error if the ID space is exhausted.
 fn next_id(max_id: u64) -> PristineResult<u64> {
     max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
+}
+
+fn legacy_upgrade_error(error: impl std::fmt::Display) -> PristineError {
+    PristineError::Io(std::io::Error::other(format!(
+        "failed to upgrade legacy redb database: {error}"
+    )))
+}
+
+fn upgrade_legacy_database(path: &Path) -> PristineResult<()> {
+    let mut legacy = redb_2_6::Database::open(path).map_err(legacy_upgrade_error)?;
+    legacy.upgrade().map_err(legacy_upgrade_error)?;
+    Ok(())
+}
+
+fn open_database(path: &Path, create: bool, cache_bytes: usize) -> PristineResult<Database> {
+    let open = || {
+        let mut builder = Builder::new();
+        builder.set_cache_size(cache_bytes);
+        if create {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        }
+    };
+
+    match open() {
+        Ok(database) => Ok(database),
+        Err(redb::DatabaseError::UpgradeRequired(_)) => {
+            upgrade_legacy_database(path)?;
+            Ok(open()?)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The pristine database handle
@@ -74,7 +107,7 @@ impl Pristine {
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
+        let db = open_database(path.as_ref(), true, cache_bytes)?;
 
         // Initialize all tables
         let write_txn = db.begin_write()?;
@@ -199,7 +232,7 @@ impl Pristine {
     /// or the ID-scan read transaction fails.
     pub fn open_existing<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
+        let db = open_database(path.as_ref(), false, cache_bytes)?;
         Self::scan_ids(db)
     }
 
@@ -227,7 +260,7 @@ impl Pristine {
         // Open database without creating (read-only mode)
         // Use the same 8 GiB cache as open() for consistent performance.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
+        let db = open_database(path.as_ref(), false, cache_bytes)?;
         Self::scan_ids(db)
     }
 
@@ -293,8 +326,7 @@ impl Pristine {
     /// must be explicitly committed with `commit()` or it will be rolled back
     /// when dropped.
     pub fn write_txn(&self) -> PristineResult<WriteTxn<'_>> {
-        let mut txn = self.db.begin_write()?;
-        txn.set_durability(redb::Durability::Eventual);
+        let txn = self.db.begin_write()?;
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
@@ -330,6 +362,35 @@ mod tests {
         // Should be able to create transactions
         let _read = pristine.read_txn().unwrap();
         let _write = pristine.write_txn().unwrap();
+    }
+
+    #[test]
+    fn test_open_upgrades_legacy_v2_database() {
+        use redb_2_6::Database as LegacyDatabase;
+
+        const LEGACY_EXTERNAL: redb_2_6::TableDefinition<u64, &[u8; 32]> =
+            redb_2_6::TableDefinition::new("external");
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let expected_hash = [42u8; 32];
+
+        {
+            let legacy = LegacyDatabase::create(&db_path).unwrap();
+            let txn = legacy.begin_write().unwrap();
+            {
+                let mut external = txn.open_table(LEGACY_EXTERNAL).unwrap();
+                external.insert(7, &expected_hash).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let pristine = Pristine::open(&db_path).unwrap();
+        assert_eq!(pristine.peek_next_node_id(), 8);
+
+        let txn = pristine.read_txn().unwrap();
+        let external = txn.txn.open_table(EXTERNAL).unwrap();
+        assert_eq!(external.get(7).unwrap().unwrap().value(), &expected_hash);
     }
 
     #[test]

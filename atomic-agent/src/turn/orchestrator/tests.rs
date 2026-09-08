@@ -39,6 +39,44 @@ fn session_end_event(session_id: &str) -> TurnEvent {
     TurnEvent::new(session_id, HookType::SessionEnd)
 }
 
+#[test]
+fn concurrent_provenance_updates_are_serialized() {
+    use crate::provenance::accumulator::ProvenanceAccumulator;
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 16;
+    const SESSION_ID: &str = "concurrent-provenance";
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join(".atomic/sessions")).unwrap();
+    let barrier = Arc::new(Barrier::new(WRITERS));
+
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                let session_store = SessionStore::for_repo(&root).unwrap();
+                let watcher = FallbackWatcher::new(WatcherConfig::new(&root));
+                let orchestrator =
+                    TurnOrchestrator::with_watcher(&root, session_store, Box::new(watcher));
+
+                barrier.wait();
+                orchestrator
+                    .update_accumulator(SESSION_ID, |acc| {
+                        acc.append_goal(&format!("goal-{writer}"), writer as i64);
+                    })
+                    .unwrap();
+            });
+        }
+    });
+
+    let graph_dir = root.join(".atomic/sessions").join(SESSION_ID);
+    let accumulator = ProvenanceAccumulator::load_or_create(&graph_dir, SESSION_ID).unwrap();
+    assert_eq!(accumulator.nodes.len(), WRITERS);
+}
+
 // DispatchResult tests
 
 #[test]

@@ -49,7 +49,8 @@ impl TurnOrchestrator {
     /// lock is released.  If `f` returns `false`, the accumulator is
     /// discarded (read-only access).
     ///
-    /// Best-effort: returns `None` if the lock or load fails.
+    /// Best-effort: waits for concurrent updates and returns `None` if the lock
+    /// or load fails.
     fn with_accumulator<F>(&self, session_id: &str, f: F) -> Option<ProvenanceAccumulator>
     where
         F: FnOnce(&mut ProvenanceAccumulator) -> bool,
@@ -79,15 +80,8 @@ impl TurnOrchestrator {
             }
         };
 
-        if let Err(e) = lock_file.try_lock_exclusive() {
-            if super::is_lock_contended(&e) {
-                log::warn!(
-                    "Provenance accumulator for session {} is already locked; skipping best-effort provenance update",
-                    session_id,
-                );
-            } else {
-                log::warn!("Failed to acquire lock for session {}: {}", session_id, e,);
-            }
+        if let Err(e) = lock_file.lock_exclusive() {
+            log::warn!("Failed to acquire lock for session {}: {}", session_id, e,);
             return None;
         }
 
@@ -125,59 +119,21 @@ impl TurnOrchestrator {
         Some(acc)
     }
 
-    /// Load the provenance accumulator for a session (read-only, locked).
+    /// Mutate and save a session's provenance accumulator under one lock.
     ///
-    /// Best-effort: returns `None` on failure (logged, never fatal).
-    pub(crate) fn load_accumulator(&self, session_id: &str) -> Option<ProvenanceAccumulator> {
-        self.with_accumulator(session_id, |_| false)
-    }
-
-    /// Save the provenance accumulator for a session.
-    ///
-    /// Best-effort: failures are logged but never fatal.
-    pub(crate) fn save_accumulator(&self, session_id: &str, acc: &ProvenanceAccumulator) {
-        // We can't reuse with_accumulator here because we already have
-        // the accumulator in hand.  Acquire the lock, write, release.
-        use fs2::FileExt;
-
-        let dir = self.session_graph_dir(session_id);
-        let _ = std::fs::create_dir_all(&dir);
-        let lock_path = dir.join(LOCK_FILENAME);
-
-        let lock_file = match std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("Failed to open lock file for session {}: {}", session_id, e);
-                return;
-            }
-        };
-
-        if let Err(e) = lock_file.try_lock_exclusive() {
-            if super::is_lock_contended(&e) {
-                log::warn!(
-                    "Provenance accumulator for session {} is already locked; skipping save",
-                    session_id,
-                );
-            } else {
-                log::warn!("Failed to acquire lock for session {}: {}", session_id, e);
-            }
-            return;
-        }
-
-        if let Err(e) = acc.save(&dir) {
-            log::warn!(
-                "Failed to save provenance accumulator for {}: {}",
-                session_id,
-                e,
-            );
-        }
-
-        let _ = lock_file.unlock();
+    /// Concurrent hook processes wait their turn rather than dropping an update.
+    pub(super) fn update_accumulator<F>(
+        &self,
+        session_id: &str,
+        update: F,
+    ) -> Option<ProvenanceAccumulator>
+    where
+        F: FnOnce(&mut ProvenanceAccumulator),
+    {
+        self.with_accumulator(session_id, |acc| {
+            update(acc);
+            true
+        })
     }
 
     /// Inject reasoning/thinking blocks from the stop event into the

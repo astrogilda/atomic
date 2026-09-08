@@ -105,10 +105,9 @@ impl TurnOrchestrator {
         // Best-effort — failures are logged but never block the session.
         if let Some(ref prompt) = event.prompt {
             if !prompt.is_empty() {
-                if let Some(mut acc) = self.load_accumulator(session_id) {
+                self.update_accumulator(session_id, |acc| {
                     acc.append_goal(prompt, event.timestamp.timestamp());
-                    self.save_accumulator(session_id, &acc);
-                }
+                });
             }
         }
 
@@ -394,7 +393,7 @@ impl TurnOrchestrator {
         // The classifier uses tool name + input + output to determine
         // the node kind (Exploration, Commitment, Verification, etc.).
         if event.event_type == HookType::PostToolUse {
-            if let Some(mut acc) = self.load_accumulator(session_id) {
+            self.update_accumulator(session_id, |acc| {
                 let tool_name = event.tool_name.as_deref().unwrap_or("unknown");
                 let tool_call_id = event.tool_use_id.as_deref();
 
@@ -444,9 +443,7 @@ impl TurnOrchestrator {
                     duration_ms,
                     event.timestamp.timestamp(),
                 );
-
-                self.save_accumulator(session_id, &acc);
-            }
+            });
         }
 
         Ok(DispatchResult::new(session_id, session.phase))

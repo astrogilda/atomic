@@ -18,7 +18,7 @@ pub use queries::{StoreStats, StoredContentChunk};
 use atomic_core::change::format_v3::{self, ChangeReader, FormatError, SectionType};
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::pristine::tables;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
