@@ -11,7 +11,8 @@
 //! sandbox pointer) so sandbox hooks see project-root lifecycles.
 //!
 //! `expires_at` is crash protection, not a session limit: a dead
-//! orchestrator's lease expires on its own and is cleaned up lazily.
+//! orchestrator's lease expires on its own, stops governing hooks, and remains
+//! visible as stale until `lifecycle end` harvests and removes it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -210,7 +211,9 @@ struct LifecycleEndResult {
 #[derive(Debug, Serialize)]
 struct LifecycleStatus {
     active: bool,
+    interrupted: bool,
     lifecycles: Vec<ManagedLifecycle>,
+    stale_lifecycles: Vec<ManagedLifecycle>,
 }
 
 impl Command for Lifecycle {
@@ -237,7 +240,6 @@ impl Begin {
 
         let now = now_secs();
         let dir = lifecycle_dir(&dot_dir);
-        cleanup_expired(&dir, now);
 
         // Idempotent begin: the same owner+session renews its existing run
         // (noname retries begin on reconnect) instead of minting a new id.
@@ -344,26 +346,42 @@ impl Status {
     fn run(&self) -> CliResult<()> {
         let dot_dir = resolve_dot_dir()?;
         let dir = lifecycle_dir(&dot_dir);
-        let lifecycles = list_active(&dir, now_secs());
+        let (lifecycles, stale_lifecycles) = list_by_state(&dir, now_secs());
 
         if self.json {
             let status = LifecycleStatus {
                 active: !lifecycles.is_empty(),
+                interrupted: !stale_lifecycles.is_empty(),
                 lifecycles,
+                stale_lifecycles,
             };
             println!("{}", serde_json::to_string(&status).unwrap());
-        } else if lifecycles.is_empty() {
-            println!("No active managed lifecycles.");
         } else {
-            for l in lifecycles {
+            if lifecycles.is_empty() {
+                println!("No active managed lifecycles.");
+            } else {
+                for l in lifecycles {
+                    println!(
+                        "Managed run {}: owner={} session={} view={} workdir={} expires_at={}",
+                        l.run_id,
+                        l.owner_agent,
+                        l.owner_session_id,
+                        l.view.as_deref().unwrap_or("-"),
+                        l.workdir.display(),
+                        l.expires_at,
+                    );
+                }
+            }
+            for l in stale_lifecycles {
                 println!(
-                    "Managed run {}: owner={} session={} view={} workdir={} expires_at={}",
+                    "Interrupted managed run {}: owner={} session={} view={} workdir={} lease_expired_at={} (run lifecycle end --run-id {} to harvest and remove)",
                     l.run_id,
                     l.owner_agent,
                     l.owner_session_id,
                     l.view.as_deref().unwrap_or("-"),
                     l.workdir.display(),
                     l.expires_at,
+                    l.run_id,
                 );
             }
         }
@@ -436,13 +454,13 @@ fn current_dir_canonical() -> CliResult<PathBuf> {
     Ok(canonicalize_lenient(&cwd))
 }
 
-fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
+fn list_lifecycles(dir: &Path) -> Vec<ManagedLifecycle> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
 
-    let mut active = Vec::new();
+    let mut lifecycles = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -455,32 +473,19 @@ fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
             log::warn!("skipping unparseable lifecycle file {}", path.display());
             continue;
         };
-        if !lifecycle.is_expired(now) {
-            active.push(lifecycle);
-        }
+        lifecycles.push(lifecycle);
     }
-    active
+    lifecycles
 }
 
-fn cleanup_expired(dir: &Path, now: i64) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let expired = fs::read_to_string(&path)
-            .ok()
-            .and_then(|data| serde_json::from_str::<ManagedLifecycle>(&data).ok())
-            .map(|l| l.is_expired(now))
-            .unwrap_or(false);
-        if expired {
-            let _ = fs::remove_file(&path);
-        }
-    }
+fn list_by_state(dir: &Path, now: i64) -> (Vec<ManagedLifecycle>, Vec<ManagedLifecycle>) {
+    list_lifecycles(dir)
+        .into_iter()
+        .partition(|lifecycle| !lifecycle.is_expired(now))
+}
+
+fn list_active(dir: &Path, now: i64) -> Vec<ManagedLifecycle> {
+    list_by_state(dir, now).0
 }
 
 fn load_lifecycle(dir: &Path, run_id: &str) -> CliResult<Option<ManagedLifecycle>> {
@@ -626,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_lifecycles_are_ignored_and_cleaned() {
+    fn expired_lifecycles_are_ignored_but_retained_for_interruption_detection() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join(LIFECYCLE_DIR);
         let now = now_secs();
@@ -634,13 +639,30 @@ mod tests {
         save_lifecycle(&dir, &lifecycle("run-old", "sherpa", temp.path(), now - 1)).unwrap();
         save_lifecycle(&dir, &lifecycle("run-new", "sherpa", temp.path(), now + 60)).unwrap();
 
-        let active = list_active(&dir, now);
+        let (active, stale) = list_by_state(&dir, now);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-new");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run_id, "run-old");
 
-        cleanup_expired(&dir, now);
-        assert!(!lifecycle_path(&dir, "run-old").exists());
+        assert!(lifecycle_path(&dir, "run-old").exists());
         assert!(lifecycle_path(&dir, "run-new").exists());
+    }
+
+    #[test]
+    fn lifecycle_status_reports_interrupted_stale_runs() {
+        let temp = TempDir::new().unwrap();
+        let status = LifecycleStatus {
+            active: false,
+            interrupted: true,
+            lifecycles: Vec::new(),
+            stale_lifecycles: vec![lifecycle("run-old", "sherpa", temp.path(), 1)],
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["active"], false);
+        assert_eq!(json["interrupted"], true);
+        assert_eq!(json["stale_lifecycles"][0]["run_id"], "run-old");
     }
 
     #[test]
