@@ -54,6 +54,8 @@ Each repository has an independent ownership namespace:
 | Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
 | Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
 
+These runtime resources do **not** require `sudo`. The owner process runs as the current user: it creates the repository lock and database under the user-writable `.atomic` directory and creates its Unix socket in `/tmp`, which is a shared, sticky-bit-protected runtime directory. Elevated privileges are only needed when installing or replacing the `atomic` executable in a system-owned prefix such as `/usr/local/bin`; they are unrelated to socket creation or owner election.
+
 The endpoint digest is derived from the canonical `.atomic` path and uses 96 bits of BLAKE3 output. Different project paths therefore get different owners, locks, databases, and endpoints. Multiple agents working in one project intentionally share that project's owner; agents working in other projects use different owners and proceed independently. Agent sandboxes and symlinked paths resolve back to the canonical repository, so they share its owner rather than creating competing databases. A clone at a different path gets its own owner.
 
 ```text
@@ -418,12 +420,24 @@ cargo build --release
 # Run tests
 cargo test
 
-# Install CLI
+# User-local install to ~/.cargo/bin (normally no sudo)
 cargo install --path atomic-cli
 
 # Verify installation
 atomic --version
 ```
+
+To install a locally built binary system-wide, the destination directory may require administrator privileges. On macOS, replacing the file rather than overwriting its existing inode also avoids retaining stale Gatekeeper provenance metadata:
+
+```bash
+cargo build -p atomic-cli --release
+sudo rm -f /usr/local/bin/atomic
+sudo cp -X target/release/atomic /usr/local/bin/atomic
+sudo chmod 0755 /usr/local/bin/atomic
+/usr/local/bin/atomic --version
+```
+
+Do not run normal Atomic commands or the database owner with `sudo`. Repository state, owner locks, and `/tmp/atomic-owner-*.sock` endpoints should remain owned by the user running Atomic.
 
 ## Project Structure
 

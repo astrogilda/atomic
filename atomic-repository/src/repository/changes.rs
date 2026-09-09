@@ -1057,9 +1057,19 @@ impl Repository {
     pub fn publish_provenance_checkpoint(
         &self,
         graph: &atomic_core::change::ProvenanceGraph,
-        turn: atomic_core::change::session::SessionTurn,
+        mut turn: atomic_core::change::session::SessionTurn,
     ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
         use atomic_core::pristine::MutTxnT;
+
+        let existing_turns = self
+            .get_session_ledger(&turn.session_id)?
+            .map(|(_, turns)| turns)
+            .unwrap_or_default();
+        turn.turn_number = existing_turns
+            .iter()
+            .find(|existing| existing.provenance_hash == turn.provenance_hash)
+            .map(|existing| existing.turn_number)
+            .unwrap_or(existing_turns.len() as u32);
 
         let hash = self
             .change_store

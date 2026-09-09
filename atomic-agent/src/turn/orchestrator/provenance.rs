@@ -636,10 +636,17 @@ impl TurnOrchestrator {
             return Ok(());
         };
 
-        let previous_provenance = atomic_repository::Repository::open_existing(&self.repo_root)
-            .ok()
-            .and_then(|repository| repository.get_session_ledger(session_id).ok().flatten())
-            .and_then(|(_, turns)| turns.last().map(|turn| turn.provenance_hash));
+        let (previous_provenance, ledger_turn_number) =
+            atomic_repository::Repository::open_existing(&self.repo_root)
+                .ok()
+                .and_then(|repository| repository.get_session_ledger(session_id).ok().flatten())
+                .map(|(_, turns)| {
+                    (
+                        turns.last().map(|turn| turn.provenance_hash),
+                        turns.len() as u32,
+                    )
+                })
+                .unwrap_or((None, 0));
         let source = super::JournalCheckpointSource {
             agent_name: session.agent_name.clone(),
             agent_display_name: session.agent_display_name.clone(),
@@ -650,7 +657,7 @@ impl TurnOrchestrator {
                 .managed_run
                 .as_ref()
                 .and_then(|run| run.work_item_id.clone()),
-            ledger_turn_number: session.turn_count.saturating_sub(1),
+            ledger_turn_number,
         };
         let reservation = sink
             .reserve_turn(

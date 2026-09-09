@@ -8,6 +8,45 @@ use atomic_repository::redb_change_store::{
 use atomic_repository::{ChangeStore, Repository, DEFAULT_CACHE_CAPACITY};
 
 #[test]
+fn legacy_agent_turn_count_is_normalized_to_next_immutable_ledger_ordinal() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let repository = Repository::init(&root).unwrap();
+    let source_change = Hash::of(b"legacy source");
+    let graph = ProvenanceGraph::builder("legacy-count", "opencode")
+        .changes_explained(vec![source_change])
+        .timestamp(1_000)
+        .build();
+    let hash = ChangeStore::new(repository.changes_dir(), DEFAULT_CACHE_CAPACITY)
+        .unwrap()
+        .save_provenance_graph(&graph)
+        .unwrap();
+    let publication = repository
+        .publish_provenance_checkpoint(
+            &graph,
+            SessionTurn {
+                session_id: "legacy-count".to_string(),
+                turn_number: 20,
+                goal: None,
+                provenance_hash: hash,
+                change_hashes: vec![source_change],
+                previous_provenance: None,
+                timestamp: graph.timestamp,
+                plan_id: None,
+                todos: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(publication.turn.turn_number, 0);
+    let (_, turns) = repository
+        .get_session_ledger("legacy-count")
+        .unwrap()
+        .unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_number, 0);
+}
+
+#[test]
 fn checkpoint_recovers_idempotently_across_every_publication_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");

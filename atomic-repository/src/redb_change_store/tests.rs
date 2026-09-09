@@ -823,6 +823,60 @@ fn stop_resume_and_abandon_preserve_identity_frontier_and_fencing() {
 }
 
 #[test]
+fn bound_checkpoint_repairs_only_legacy_ledger_ordinal() {
+    let (_dir, store) = temp_store();
+    let running = store
+        .reserve_provenance_turn("legacy-count", 21, 1)
+        .unwrap();
+    let source = ProvenanceCheckpointSource {
+        agent_name: "opencode".to_string(),
+        agent_display_name: "OpenCode".to_string(),
+        agent_vendor: "openai".to_string(),
+        change_hashes: vec![Hash::of(b"source")],
+        previous_provenance: None,
+        plan_id: None,
+        ledger_turn_number: 20,
+    };
+    let prepared = store
+        .prepare_provenance_checkpoint(running.provenance_id, running.generation, source.clone(), 2)
+        .unwrap();
+    let hash = Hash::of(b"provenance");
+    let turn = atomic_core::change::session::SessionTurn {
+        session_id: "legacy-count".to_string(),
+        turn_number: 20,
+        goal: None,
+        provenance_hash: hash,
+        change_hashes: source.change_hashes.clone(),
+        previous_provenance: None,
+        timestamp: 3,
+        plan_id: None,
+        todos: Vec::new(),
+    };
+    store
+        .bind_provenance_checkpoint_hash(
+            running.provenance_id,
+            prepared.attempt_generation,
+            hash,
+            turn,
+            3,
+        )
+        .unwrap();
+
+    let mut corrected_source = source;
+    corrected_source.ledger_turn_number = 0;
+    let corrected = store
+        .prepare_provenance_checkpoint(
+            running.provenance_id,
+            running.generation,
+            corrected_source,
+            4,
+        )
+        .unwrap();
+    assert_eq!(corrected.source.ledger_turn_number, 0);
+    assert_eq!(corrected.session_turn.unwrap().turn_number, 0);
+}
+
+#[test]
 fn stopped_provenance_turn_resumes_and_finalizes_once() {
     let (_dir, store) = temp_store();
     let running = store.reserve_provenance_turn("session-a", 0, 1).unwrap();

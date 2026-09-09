@@ -854,6 +854,53 @@ fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
 }
 
 #[test]
+fn pre_cutover_session_count_gap_publishes_at_next_ledger_ordinal() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    assert!(run_hook(
+        &repository,
+        "session-start",
+        br#"{"session_id":"legacy-gap"}"#,
+    )
+    .status
+    .success());
+    assert!(run_hook(
+        &repository,
+        "user-prompt-submit",
+        br#"{"session_id":"legacy-gap","prompt":"publish after legacy turns"}"#,
+    )
+    .status
+    .success());
+
+    let session_path = repository.join(".atomic/sessions/legacy-gap.json");
+    let mut session: Value =
+        serde_json::from_slice(&std::fs::read(&session_path).unwrap()).unwrap();
+    session["turn_count"] = Value::from(20);
+    std::fs::write(&session_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
+    std::fs::write(repository.join("legacy-gap.txt"), b"record me\n").unwrap();
+
+    let stop = run_hook(
+        &repository,
+        "stop",
+        br#"{"session_id":"legacy-gap","response":"published"}"#,
+    );
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    thread::sleep(Duration::from_millis(100));
+
+    let repo = Repository::open(&repository).unwrap();
+    let (_, turns) = repo.get_session_ledger("legacy-gap").unwrap().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_number, 0);
+}
+
+#[test]
 fn crashing_second_checkpoint_keeps_first_turn_immutable() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");

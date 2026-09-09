@@ -224,6 +224,18 @@ fn load_turn(
     StoredProvenanceTurn::from_bytes(value.value())
 }
 
+fn checkpoint_source_matches_except_ordinal(
+    left: &ProvenanceCheckpointSource,
+    right: &ProvenanceCheckpointSource,
+) -> bool {
+    left.agent_name == right.agent_name
+        && left.agent_display_name == right.agent_display_name
+        && left.agent_vendor == right.agent_vendor
+        && left.change_hashes == right.change_hashes
+        && left.previous_provenance == right.previous_provenance
+        && left.plan_id == right.plan_id
+}
+
 fn ensure_generation(turn: &StoredProvenanceTurn, expected: u64) -> RedbStoreResult<()> {
     if turn.generation != expected {
         return Err(RedbStoreError::ProvenanceFenced {
@@ -575,9 +587,28 @@ impl RedbChangeStore {
         let mut turns = txn.open_table(tables::PROVENANCE_TURNS)?;
         let mut turn = load_turn(&turns, id)?;
 
-        if let Some(attempt) = &turn.checkpoint_attempt {
+        if let Some(mut attempt) = turn.checkpoint_attempt.clone() {
             if attempt.source == source {
-                return Ok(attempt.clone());
+                return Ok(attempt);
+            }
+            if attempt.phase != ProvenanceCheckpointPhase::Published
+                && checkpoint_source_matches_except_ordinal(&attempt.source, &source)
+            {
+                // Pre-cutover AgentSession counters may include turns that were
+                // never indexed in SESSION_TURNS. The immutable ledger supplies
+                // the authoritative append ordinal; graph/hash identity is
+                // unchanged, so a bound attempt can be repaired safely.
+                attempt.source.ledger_turn_number = source.ledger_turn_number;
+                if let Some(session_turn) = attempt.session_turn.as_mut() {
+                    session_turn.turn_number = source.ledger_turn_number;
+                }
+                attempt.updated_at = now;
+                turn.checkpoint_attempt = Some(attempt.clone());
+                let bytes = turn.to_bytes()?;
+                turns.insert(id.get(), bytes.as_slice())?;
+                drop(turns);
+                txn.commit()?;
+                return Ok(attempt);
             }
             return Err(RedbStoreError::ProvenanceCheckpointConflict { id: id.get() });
         }
