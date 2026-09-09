@@ -518,3 +518,471 @@ fn test_debug_format() {
     assert!(debug.contains("RedbChangeStore"));
     assert!(debug.contains("CHANGE_META"));
 }
+
+fn provenance_event(label: &str) -> atomic_core::change::session::SessionEvent {
+    atomic_core::change::session::SessionEvent {
+        seq: u64::MAX,
+        timestamp: "2026-09-08T16:00:00Z".to_string(),
+        event_kind: "tool".to_string(),
+        place: None,
+        transition: None,
+        token_id: label.to_string(),
+        token_kind: "artifact".to_string(),
+        token_data: format!(r#"{{"label":"{label}"}}"#),
+        record_type: Some("tool".to_string()),
+    }
+}
+
+#[test]
+fn provenance_turn_reservation_is_idempotent_and_persistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.redb");
+    let first_id;
+    {
+        let store = RedbChangeStore::open(&path).unwrap();
+        let first = store.reserve_provenance_turn("session-a", 3, 100).unwrap();
+        let duplicate = store.reserve_provenance_turn("session-a", 3, 200).unwrap();
+        let next = store.reserve_provenance_turn("session-a", 4, 200).unwrap();
+        assert_eq!(first, duplicate);
+        assert_ne!(first.provenance_id, next.provenance_id);
+        assert_eq!(
+            store
+                .get_provenance_turn_for("session-a", 3)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        first_id = first.provenance_id;
+    }
+
+    let reopened = RedbChangeStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_provenance_turn(first_id)
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "session-a"
+    );
+    assert_ne!(
+        reopened
+            .reserve_provenance_turn("session-b", 0, 300)
+            .unwrap()
+            .provenance_id,
+        first_id
+    );
+}
+
+#[test]
+fn provenance_events_are_ordered_idempotent_and_fenced() {
+    let (_dir, store) = temp_store();
+    let turn = store.reserve_provenance_turn("session-a", 0, 1).unwrap();
+
+    let first = store
+        .append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "event-a",
+            provenance_event("a"),
+            2,
+        )
+        .unwrap();
+    let duplicate = store
+        .append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "event-a",
+            provenance_event("a"),
+            3,
+        )
+        .unwrap();
+    assert_eq!(first, duplicate);
+
+    store
+        .append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "event-b",
+            provenance_event("b"),
+            4,
+        )
+        .unwrap();
+    let events = store.load_provenance_events(turn.provenance_id).unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    let stopped = store
+        .stop_provenance_turn(
+            turn.provenance_id,
+            turn.generation,
+            StopState {
+                cause: StopCause::ProcessExited,
+                observed_at: 5,
+                last_event_seq: Some(1),
+                resumable: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(stopped.state, ProvenanceTurnState::Stopped(_)));
+    assert!(matches!(
+        store.append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "event-c",
+            provenance_event("c"),
+            6,
+        ),
+        Err(RedbStoreError::ProvenanceFenced { .. })
+    ));
+}
+
+#[test]
+fn lossless_envelopes_share_sequence_space_and_preserve_legacy_events() {
+    let (_dir, store) = temp_store();
+    let turn = store.reserve_provenance_turn("session-a", 1, 1).unwrap();
+
+    store
+        .append_provenance_event(
+            turn.provenance_id,
+            turn.generation,
+            "legacy",
+            provenance_event("legacy"),
+            2,
+        )
+        .unwrap();
+    let first = store
+        .append_provenance_envelope(
+            turn.provenance_id,
+            turn.generation,
+            "envelope-a",
+            br#"{"schema_version":1,"event_id":"envelope-a"}"#,
+            3,
+        )
+        .unwrap();
+    let retry = store
+        .append_provenance_envelope(
+            turn.provenance_id,
+            turn.generation,
+            "envelope-a",
+            br#"{\"schema_version\":1,\"event_id\":\"envelope-a\",\"retry_observed_at\":4}"#,
+            4,
+        )
+        .unwrap();
+    assert_eq!(first, retry);
+    assert_eq!(first.seq, 1);
+    assert_eq!(
+        store
+            .load_provenance_events(turn.provenance_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.load_provenance_envelopes(turn.provenance_id).unwrap(),
+        vec![first]
+    );
+
+    let stopped = store
+        .stop_provenance_turn(
+            turn.provenance_id,
+            turn.generation,
+            StopState {
+                cause: StopCause::ProcessExited,
+                observed_at: 5,
+                last_event_seq: Some(1),
+                resumable: true,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store.append_provenance_envelope(
+            stopped.provenance_id,
+            turn.generation,
+            "stale",
+            b"stale",
+            6,
+        ),
+        Err(RedbStoreError::ProvenanceFenced { .. })
+    ));
+}
+
+#[test]
+fn stop_resume_and_abandon_preserve_identity_frontier_and_fencing() {
+    let (_dir, store) = temp_store();
+    let running = store.reserve_provenance_turn("lifecycle", 1, 1).unwrap();
+    for index in 0..2 {
+        store
+            .append_provenance_envelope(
+                running.provenance_id,
+                running.generation,
+                &format!("event-{index}"),
+                format!("event-{index}").as_bytes(),
+                2 + index,
+            )
+            .unwrap();
+    }
+
+    let stopped = store
+        .stop_provenance_turn(
+            running.provenance_id,
+            running.generation,
+            StopState {
+                cause: StopCause::ProcessExited,
+                observed_at: 5,
+                last_event_seq: Some(999),
+                resumable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(stopped.provenance_id, running.provenance_id);
+    assert_eq!(stopped.generation, running.generation + 1);
+    match &stopped.state {
+        ProvenanceTurnState::Stopped(stop) => {
+            assert_eq!(stop.cause, StopCause::ProcessExited);
+            assert_eq!(stop.last_event_seq, Some(1));
+            assert!(stop.resumable);
+        }
+        other => panic!("expected stopped turn, got {other:?}"),
+    }
+    let stopped_retry = store
+        .stop_provenance_turn(
+            running.provenance_id,
+            running.generation,
+            StopState {
+                cause: StopCause::ProcessExited,
+                observed_at: 9,
+                last_event_seq: None,
+                resumable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(stopped_retry, stopped);
+    assert!(matches!(
+        store.append_provenance_envelope(
+            running.provenance_id,
+            running.generation,
+            "zombie",
+            b"zombie",
+            6,
+        ),
+        Err(RedbStoreError::ProvenanceFenced { .. })
+    ));
+
+    let resumed = store
+        .resume_provenance_turn(stopped.provenance_id, stopped.generation, 7)
+        .unwrap();
+    assert_eq!(resumed.provenance_id, running.provenance_id);
+    assert_eq!(resumed.generation, stopped.generation + 1);
+    assert!(matches!(resumed.state, ProvenanceTurnState::Running));
+    assert!(matches!(
+        store.append_provenance_envelope(
+            running.provenance_id,
+            stopped.generation,
+            "old-generation",
+            b"old",
+            8,
+        ),
+        Err(RedbStoreError::ProvenanceFenced { .. })
+    ));
+    store
+        .append_provenance_envelope(
+            running.provenance_id,
+            resumed.generation,
+            "resumed",
+            b"resumed",
+            8,
+        )
+        .unwrap();
+
+    let abandoned = store
+        .abandon_provenance_turn(
+            resumed.provenance_id,
+            resumed.generation,
+            StopState {
+                cause: StopCause::UserRequested,
+                observed_at: 9,
+                last_event_seq: None,
+                resumable: true,
+            },
+        )
+        .unwrap();
+    match &abandoned.state {
+        ProvenanceTurnState::Abandoned(stop) => {
+            assert_eq!(stop.cause, StopCause::Abandoned);
+            assert_eq!(stop.last_event_seq, Some(2));
+            assert!(!stop.resumable);
+        }
+        other => panic!("expected abandoned turn, got {other:?}"),
+    }
+    assert!(matches!(
+        store.resume_provenance_turn(abandoned.provenance_id, abandoned.generation, 10,),
+        Err(RedbStoreError::InvalidProvenanceTransition { .. })
+    ));
+}
+
+#[test]
+fn stopped_provenance_turn_resumes_and_finalizes_once() {
+    let (_dir, store) = temp_store();
+    let running = store.reserve_provenance_turn("session-a", 0, 1).unwrap();
+    let stopped = store
+        .stop_provenance_turn(
+            running.provenance_id,
+            running.generation,
+            StopState {
+                cause: StopCause::UserRequested,
+                observed_at: 2,
+                last_event_seq: None,
+                resumable: true,
+            },
+        )
+        .unwrap();
+    let resumed = store
+        .resume_provenance_turn(stopped.provenance_id, stopped.generation, 3)
+        .unwrap();
+    assert!(matches!(resumed.state, ProvenanceTurnState::Running));
+
+    let stopped_again = store
+        .stop_provenance_turn(
+            resumed.provenance_id,
+            resumed.generation,
+            StopState {
+                cause: StopCause::UserRequested,
+                observed_at: 3,
+                last_event_seq: None,
+                resumable: true,
+            },
+        )
+        .unwrap();
+    let checkpoint = store
+        .begin_provenance_checkpoint(stopped_again.provenance_id, stopped_again.generation, 4)
+        .unwrap();
+    let hash = Hash::of(b"provenance");
+    let completed = store
+        .bind_final_provenance_hash(checkpoint.provenance_id, checkpoint.generation, hash, 4)
+        .unwrap();
+    assert!(matches!(completed.state, ProvenanceTurnState::Completed));
+    assert_eq!(completed.final_hash, Some(hash));
+    assert_eq!(
+        store.get_provenance_turn_by_hash(&hash).unwrap().unwrap(),
+        completed
+    );
+
+    let same = store
+        .bind_final_provenance_hash(completed.provenance_id, 0, hash, 5)
+        .unwrap();
+    assert_eq!(same, completed);
+    assert_eq!(
+        store.reserve_provenance_turn("session-a", 0, 99).unwrap(),
+        completed
+    );
+    assert_eq!(
+        store
+            .stop_provenance_turn(
+                completed.provenance_id,
+                completed.generation,
+                StopState {
+                    cause: StopCause::SystemShutdown,
+                    observed_at: 6,
+                    last_event_seq: None,
+                    resumable: true,
+                },
+            )
+            .unwrap(),
+        completed
+    );
+    assert_eq!(
+        store
+            .abandon_provenance_turn(
+                completed.provenance_id,
+                completed.generation,
+                StopState {
+                    cause: StopCause::Abandoned,
+                    observed_at: 7,
+                    last_event_seq: None,
+                    resumable: false,
+                },
+            )
+            .unwrap(),
+        completed
+    );
+}
+
+#[test]
+fn non_resumable_provenance_stop_rejects_resume() {
+    let (_dir, store) = temp_store();
+    let running = store.reserve_provenance_turn("session-a", 0, 1).unwrap();
+    let stopped = store
+        .stop_provenance_turn(
+            running.provenance_id,
+            running.generation,
+            StopState {
+                cause: StopCause::LeaseExpired,
+                observed_at: 2,
+                last_event_seq: None,
+                resumable: false,
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.resume_provenance_turn(stopped.provenance_id, stopped.generation, 3),
+        Err(RedbStoreError::InvalidProvenanceTransition { .. })
+    ));
+}
+
+#[test]
+fn final_provenance_hash_is_unique_across_turns() {
+    let (_dir, store) = temp_store();
+    let mut checkpoints = Vec::new();
+    for turn_number in 0..2 {
+        let running = store
+            .reserve_provenance_turn("session-a", turn_number, 1)
+            .unwrap();
+        let stopped = store
+            .stop_provenance_turn(
+                running.provenance_id,
+                running.generation,
+                StopState {
+                    cause: StopCause::UserRequested,
+                    observed_at: 2,
+                    last_event_seq: None,
+                    resumable: true,
+                },
+            )
+            .unwrap();
+        checkpoints.push(
+            store
+                .begin_provenance_checkpoint(stopped.provenance_id, stopped.generation, 3)
+                .unwrap(),
+        );
+    }
+
+    let hash = Hash::of(b"same-provenance");
+    store
+        .bind_final_provenance_hash(
+            checkpoints[0].provenance_id,
+            checkpoints[0].generation,
+            hash,
+            3,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.bind_final_provenance_hash(
+            checkpoints[1].provenance_id,
+            checkpoints[1].generation,
+            hash,
+            3,
+        ),
+        Err(RedbStoreError::ProvenanceFinalHashAlreadyBound { .. })
+    ));
+    assert!(matches!(
+        store
+            .get_provenance_turn(checkpoints[1].provenance_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ProvenanceTurnState::Checkpointing
+    ));
+}

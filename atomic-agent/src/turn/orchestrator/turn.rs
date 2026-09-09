@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{HookType, TurnEvent};
+use crate::event::TurnEvent;
 use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
 
@@ -41,6 +41,11 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+        let turn_number = session.turn_count.saturating_add(1);
+        if session.managed_run.is_none() || self.managed_run.is_some() {
+            self.resume_journal_turn(session_id, turn_number, event.timestamp.timestamp())?;
+        }
+        self.commit_hook_event(&event, turn_number)?;
 
         // Store the prompt
         if let Some(ref prompt) = event.prompt {
@@ -101,16 +106,6 @@ impl TurnOrchestrator {
             }
         }
 
-        // Provenance: append a goal node from the user's prompt.
-        // Best-effort — failures are logged but never block the session.
-        if let Some(ref prompt) = event.prompt {
-            if !prompt.is_empty() {
-                self.update_accumulator(session_id, |acc| {
-                    acc.append_goal(prompt, event.timestamp.timestamp());
-                });
-            }
-        }
-
         self.session_store.save(&session)?;
 
         Ok(dispatch)
@@ -151,22 +146,6 @@ impl TurnOrchestrator {
             TurnEndLock::Unavailable => None,
         };
 
-        // Fast gate: check if anything changed since the last record.
-        // This bypasses the entire status machinery (TREE scan, filesystem
-        // walk, etc.) and just checks the pristine database mtime.
-        // If the DB hasn't been written since the last record, nothing
-        // in the working copy could have been recorded — but files may
-        // have been edited. We check the working copy for recent mtimes
-        // by scanning only the repo root (not recursively) and common
-        // source directories.
-        if !self.has_working_copy_changes() {
-            log::info!(
-                "Turn end for session {} — no changes detected, skipping record",
-                session_id
-            );
-            return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
-        }
-
         let mut session = self.load_or_create_session(session_id, &event)?;
 
         // Extract model/provider from the TurnEnd event's raw_json.
@@ -199,7 +178,19 @@ impl TurnOrchestrator {
         // OpenCode: recover transcript/reasoning/response from its local
         // store before recording — thin plugins send none of these, and
         // OpenCode writes no transcript file of its own.
-        self.enrich_opencode_turn(&mut session, &mut event);
+        self.enrich_opencode_turn(&mut session, &mut event)?;
+        let pending_turn_number = session.turn_count.saturating_add(1);
+        self.commit_turn_completion_events(&session, &event, pending_turn_number)?;
+
+        // The terminal event is durably journaled even for an empty turn. The
+        // graph/checkpoint path below remains conditional until intent 108.
+        if !self.has_working_copy_changes() {
+            log::info!(
+                "Turn end for session {} — no changes detected, skipping record",
+                session_id
+            );
+            return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
+        }
 
         // Release the watcher if it was active (best-effort, ignore errors)
         if self.watcher.is_active() {
@@ -282,15 +273,17 @@ impl TurnOrchestrator {
                                 .and_then(|r| r.get("trace_file"))
                                 .and_then(|v| v.as_str())
                             {
-                                self.ingest_sherpa_trace(session_id, Path::new(trace_path));
+                                self.ingest_sherpa_trace(
+                                    session_id,
+                                    turn_number,
+                                    Path::new(trace_path),
+                                )?;
                             }
 
                             // Provenance: inject reasoning blocks as Decision nodes
                             // and the agent's closing message as an LlmResponse node,
                             // then append a patch proposal node and save the graph.
-                            self.inject_reasoning_nodes(session_id, &event);
-                            self.inject_response_node(session_id, &session, &event);
-                            self.save_turn_provenance(session_id, &session, &outcome, &event);
+                            self.save_turn_provenance(session_id, &session, &outcome, &event)?;
 
                             log::info!(
                                 "Recorded turn {} for session {}: {}",
@@ -375,6 +368,8 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let session = self.load_or_create_session(session_id, &event)?;
+        let turn_number = session.turn_count.saturating_add(1);
+        self.commit_hook_event(&event, turn_number)?;
 
         // Log tool usage
         if let Some(ref tool_name) = event.tool_name {
@@ -384,66 +379,6 @@ impl TurnOrchestrator {
                 tool_name,
                 event.event_type,
             );
-        }
-
-        // Provenance: append tool call nodes on PostToolUse.
-        //
-        // PreToolUse doesn't have output or duration yet, so we only
-        // record on PostToolUse where the full picture is available.
-        // The classifier uses tool name + input + output to determine
-        // the node kind (Exploration, Commitment, Verification, etc.).
-        if event.event_type == HookType::PostToolUse {
-            self.update_accumulator(session_id, |acc| {
-                let tool_name = event.tool_name.as_deref().unwrap_or("unknown");
-                let tool_call_id = event.tool_use_id.as_deref();
-
-                // Extract tool_input, tool_output, status, duration from raw_json.
-                //
-                // The enriched OpenCode plugin sends top-level fields alongside
-                // tool_input: filediff, diagnostics, title, file_path, exit_code.
-                // We merge these INTO tool_input so the accumulator's classify
-                // and detail-building functions can find them without changing
-                // their signature.
-                let raw = event.raw_json.as_ref();
-                let tool_output = raw.and_then(|r| r.get("tool_output").and_then(|v| v.as_str()));
-                let status = raw.and_then(|r| r.get("status").and_then(|v| v.as_str()));
-                let duration_ms = raw.and_then(|r| r.get("duration").and_then(|v| v.as_u64()));
-
-                // Build a merged tool_input that includes both the original
-                // tool_input fields AND the top-level enriched fields.
-                let merged_input: Option<serde_json::Value> = raw.map(|r| {
-                    let mut merged = r
-                        .get("tool_input")
-                        .and_then(|v| v.as_object().cloned())
-                        .unwrap_or_default();
-
-                    // Merge enriched top-level fields into tool_input
-                    for key in &[
-                        "filediff",
-                        "diagnostics",
-                        "title",
-                        "file_path",
-                        "exit_code",
-                        "diff",
-                    ] {
-                        if let Some(val) = r.get(*key) {
-                            merged.insert(key.to_string(), val.clone());
-                        }
-                    }
-
-                    serde_json::Value::Object(merged)
-                });
-
-                acc.append_tool_call(
-                    tool_name,
-                    tool_call_id,
-                    merged_input.as_ref(),
-                    tool_output,
-                    status,
-                    duration_ms,
-                    event.timestamp.timestamp(),
-                );
-            });
         }
 
         Ok(DispatchResult::new(session_id, session.phase))
