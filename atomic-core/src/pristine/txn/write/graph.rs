@@ -44,6 +44,31 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         Ok(changes)
     }
 
+    fn resolve_vertex_alias(&self, node: GraphNode<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        let origin = node;
+        let mut current = node;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            if !seen.insert(current) {
+                return Err(PristineError::Inconsistent {
+                    message: format!("patch alias cycle while resolving {origin:?}"),
+                });
+            }
+            match PatchRelinkTxnT::get_patch_relink(self, current)? {
+                None => return Ok(current),
+                Some(PatchRelinkTarget::Mapped(next)) => current = next,
+                Some(PatchRelinkTarget::Removed) => {
+                    return Err(PristineError::Inconsistent {
+                        message: format!("patch node {current:?} was removed by replacement"),
+                    });
+                }
+            }
+        }
+        Err(PristineError::Inconsistent {
+            message: format!("patch alias depth exceeded while resolving {origin:?}"),
+        })
+    }
+
     fn iter_adjacent(
         &self,
         node: GraphNode<NodeId>,

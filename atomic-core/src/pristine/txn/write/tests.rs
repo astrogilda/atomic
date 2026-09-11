@@ -30,6 +30,109 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_relink_mapped_removed_absent_and_idempotent() {
+        use crate::change::{PatchRelink, PositionRelink};
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let old_hash = Hash::of(b"old patch");
+        let new_hash = Hash::of(b"new patch");
+        let old_mapped = GraphNode::new(old_hash, ChangePosition::new(0), ChangePosition::new(4));
+        let new_mapped = GraphNode::new(new_hash, ChangePosition::new(8), ChangePosition::new(12));
+        let old_removed = GraphNode::new(old_hash, ChangePosition::new(4), ChangePosition::new(8));
+        let old_absent = GraphNode::new(old_hash, ChangePosition::new(12), ChangePosition::new(16));
+        let relink = PatchRelink::new(
+            old_hash,
+            new_hash,
+            vec![PositionRelink::new(old_mapped, new_mapped)],
+            vec![old_removed],
+            vec![],
+            vec![7],
+            1,
+            vec![0; 64],
+        )
+        .unwrap();
+
+        let (old_id, new_id) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let old_id = txn.register_change(&old_hash).unwrap();
+            let new_id = txn.register_change(&new_hash).unwrap();
+            txn.put_patch_relink(&relink).unwrap();
+            txn.put_patch_relink(&relink).unwrap();
+            txn.commit().unwrap();
+            (old_id, new_id)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(txn.get_patch_alias(old_id).unwrap(), Some(new_id));
+        assert_eq!(txn.get_patch_alias_sources(new_id).unwrap(), vec![old_id]);
+        assert_eq!(
+            txn.resolve_vertex_alias(GraphNode::from_parts(old_id, 0, 4))
+                .unwrap(),
+            GraphNode::from_parts(new_id, 8, 12)
+        );
+        assert_eq!(
+            txn.get_patch_relink(GraphNode::from_parts(old_id, 0, 4))
+                .unwrap(),
+            Some(PatchRelinkTarget::Mapped(GraphNode::from_parts(
+                new_id, 8, 12
+            )))
+        );
+        assert_eq!(
+            txn.get_patch_relink(GraphNode::from_parts(old_id, 4, 8))
+                .unwrap(),
+            Some(PatchRelinkTarget::Removed)
+        );
+        assert_eq!(
+            txn.get_patch_relink(GraphNode::new(old_id, old_absent.start, old_absent.end))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_patch_relink_rejects_missing_change_and_conflict() {
+        use crate::change::{PatchRelink, PositionRelink};
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let old_hash = Hash::of(b"old patch");
+        let new_hash = Hash::of(b"new patch");
+        let other_hash = Hash::of(b"other patch");
+        let make_relink = |target| {
+            PatchRelink::new(
+                old_hash,
+                target,
+                vec![PositionRelink::new(
+                    GraphNode::new(old_hash, ChangePosition::new(0), ChangePosition::new(4)),
+                    GraphNode::new(target, ChangePosition::new(0), ChangePosition::new(4)),
+                )],
+                vec![],
+                vec![],
+                vec![7],
+                1,
+                vec![0; 64],
+            )
+            .unwrap()
+        };
+
+        let mut txn = pristine.write_txn().unwrap();
+        txn.register_change(&old_hash).unwrap();
+        assert!(matches!(
+            txn.put_patch_relink(&make_relink(new_hash)),
+            Err(PristineError::HashNotFound { .. })
+        ));
+        txn.register_change(&new_hash).unwrap();
+        txn.register_change(&other_hash).unwrap();
+        txn.put_patch_relink(&make_relink(new_hash)).unwrap();
+        assert!(matches!(
+            txn.put_patch_relink(&make_relink(other_hash)),
+            Err(PristineError::Inconsistent { .. })
+        ));
+        txn.abort().unwrap();
+    }
+
+    #[test]
     fn test_view_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");

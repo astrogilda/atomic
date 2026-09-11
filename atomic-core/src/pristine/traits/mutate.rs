@@ -3,6 +3,7 @@
 //! `MutTxnT` extends all read traits with write operations for modifying
 //! the repository graph, file tree, views, and CRDT tables.
 
+use crate::change::PatchRelink;
 use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 use crate::pristine::error::PristineError;
@@ -32,7 +33,7 @@ use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 ///
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
-pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
+pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT + super::PatchRelinkTxnT {
     // ── Change Registration ─────────────────────────────────────
 
     /// Register a new internal ID for an external hash.
@@ -55,6 +56,12 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
 
     /// Register a provenance graph and get its internal ID.
     fn register_provenance(&mut self, hash: &Hash) -> Result<NodeId, PristineError>;
+
+    /// Persist all aliases and node outcomes declared by a patch relink artifact.
+    ///
+    /// Both referenced changes must already be registered. Repeating the same
+    /// artifact is idempotent; conflicting aliases or node outcomes are rejected.
+    fn put_patch_relink(&mut self, relink: &PatchRelink) -> Result<(), PristineError>;
 
     // ── Graph Modification ──────────────────────────────────────
 

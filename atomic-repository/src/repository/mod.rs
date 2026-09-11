@@ -80,6 +80,7 @@ mod deferred_tree;
 mod filter;
 mod materialize;
 mod sandbox;
+mod selective_repair;
 mod semantic_materialize;
 mod split;
 mod switch;
@@ -92,6 +93,11 @@ pub use filter::{
     expand_indexed_dependency_closure, view_set_id,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
+pub use selective_repair::{
+    OrderedChange, Replacement, SelectiveRepairEvaluation, SelectiveRepairPhase,
+    SelectiveRepairPlan, SelectiveRepairTimestamps, StructuralBlocker,
+    SELECTIVE_REPAIR_PLAN_VERSION,
+};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
@@ -106,6 +112,7 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod provenance_relink;
 mod provenance_summary;
 mod record;
 mod remotes;

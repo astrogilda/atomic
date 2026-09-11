@@ -70,6 +70,7 @@ use commands::{
     Init,
     Insert,
     Intent,
+    Isolate,
     Log,
     Memory,
     Move,
@@ -841,6 +842,9 @@ enum Commands {
     /// ```
     Unrecord(Unrecord),
 
+    /// Isolate a structurally connected patch subgraph for repair.
+    Isolate(Isolate),
+
     /// Check for available updates and route to the correct upgrade path.
     ///
     /// Detects how this binary was installed (Homebrew, Cargo, official
@@ -1039,6 +1043,8 @@ fn main() {
         Commands::Tag(tag) => tag.run(),
 
         Commands::Unrecord(unrecord) => unrecord.run(),
+
+        Commands::Isolate(isolate) => isolate.run(),
 
         Commands::Update(update) => update.run(),
 

@@ -120,6 +120,9 @@ impl Pristine {
             // Graph tables
             write_txn.open_multimap_table(GRAPH)?;
             write_txn.open_multimap_table(INODE_GRAPH)?;
+            write_txn.open_table(PATCH_ALIASES)?;
+            write_txn.open_multimap_table(REV_PATCH_ALIASES)?;
+            write_txn.open_table(PATCH_RELINKS)?;
 
             // View tables
             write_txn.open_table(VIEWS)?;

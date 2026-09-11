@@ -35,6 +35,69 @@ fn record_all(repo: &Repository, message: &str) {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+#[test]
+fn cross_view_insert_plans_dependency_order_once_for_non_current_target() {
+    let (temp_dir, mut repo) = create_temp_repo();
+    let file = temp_dir.path().join("ordered.txt");
+
+    std::fs::write(&file, "base\n").unwrap();
+    repo.add("ordered.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base");
+    repo.create_view_from("feature", "dev").unwrap();
+    repo.switch_view("feature").unwrap();
+
+    std::fs::write(&file, "base\none\n").unwrap();
+    record_all(&repo, "one");
+    std::fs::write(&file, "base\none\ntwo\n").unwrap();
+    record_all(&repo, "two");
+
+    let stored_feature_changes: Vec<_> = repo
+        .get_view_changes(Some("feature"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, hash)| hash)
+        .collect();
+    let feature_changes = repo
+        .get_missing_changes_between("feature", Some("dev"))
+        .unwrap();
+    assert_eq!(feature_changes.len(), 2);
+
+    // Keep feature checked out: promoting into dev must use the ambient-graph
+    // metadata path, with the earlier dependency before its dependent.
+    let outcome = repo
+        .insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
+        .unwrap();
+    assert_eq!(outcome.applied_hashes, feature_changes);
+    assert_eq!(outcome.changes_applied, 2);
+
+    let dev_changes: Vec<_> = repo
+        .get_view_changes(Some("dev"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, hash)| hash)
+        .collect();
+    assert_eq!(
+        &dev_changes[dev_changes.len() - 2..],
+        feature_changes.as_slice()
+    );
+
+    let repeated = repo
+        .insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
+        .unwrap();
+    assert_eq!(repeated.changes_applied, 0);
+
+    // Promotion changes the parent's membership, not the draft's historical
+    // record. Every stored draft entry must remain visible in its log.
+    let logged: Vec<_> = repo
+        .reverse_log(HistoryOptions::default())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.hash)
+        .collect();
+    let expected: Vec<_> = stored_feature_changes.into_iter().rev().collect();
+    assert_eq!(logged, expected);
+}
+
 /// Non-overlapping edits to different sections of the same file.
 ///
 /// Draft changes section 1 (host), dev changes section 3 (log level).

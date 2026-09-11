@@ -597,6 +597,29 @@ impl Change {
         self.hashed.dependencies.contains(hash)
     }
 
+    /// Return the external changes structurally referenced by graph hunks.
+    ///
+    /// Unlike [`depends_on`](Self::depends_on), this derives references from
+    /// actual positions, graph nodes, inode contexts, and edge introducers.
+    /// It is the proof primitive for deciding whether a declared dependency is
+    /// required by patch structure or is merely conservative recorded context.
+    pub fn structurally_referenced_changes(&self) -> Result<Vec<Hash>, format_v3::FormatError> {
+        let mut table = format_v3::HashDedupTable::empty();
+        self.collect_hunk_hashes(&mut table)?;
+        Ok(table
+            .iter()
+            .map(|(_, bytes)| Hash::from_bytes(*bytes))
+            .collect())
+    }
+
+    /// Check whether graph hunks structurally reference another change.
+    pub fn structurally_references(&self, hash: &Hash) -> Result<bool, format_v3::FormatError> {
+        Ok(self
+            .structurally_referenced_changes()?
+            .iter()
+            .any(|referenced| referenced == hash))
+    }
+
     /// Check if this change knows about another change.
     ///
     /// A change "knows" another if it's either a dependency or extra_known.
@@ -990,6 +1013,28 @@ mod tests {
         change.add_hunk(graph_op);
 
         assert_eq!(change.hunks().len(), 1);
+    }
+
+    #[test]
+    fn structural_references_distinguish_required_from_declared_dependencies() {
+        let structural = Hash::of(b"test");
+        let conservative = Hash::of(b"conservative");
+        let graph_op: GraphOp<Option<Hash>> = GraphOp::Edit {
+            change: Atom::Insertion(test_new_vertex()),
+            local: Local::new("test.rs", 1),
+            encoding: Some(Encoding::Utf8),
+        };
+        let change = Change::new(
+            ChangeHeader::new("Test"),
+            vec![graph_op],
+            Vec::new(),
+            vec![structural, conservative],
+        );
+
+        assert!(change.depends_on(&structural));
+        assert!(change.depends_on(&conservative));
+        assert!(change.structurally_references(&structural).unwrap());
+        assert!(!change.structurally_references(&conservative).unwrap());
     }
 
     #[test]

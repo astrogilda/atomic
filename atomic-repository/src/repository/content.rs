@@ -176,6 +176,15 @@ impl Repository {
         path: P,
         exclude_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        self.get_file_content_excluding_many(path, std::slice::from_ref(exclude_hash))
+    }
+
+    /// Retrieve file content under a hypothetical filter excluding several changes.
+    pub fn get_file_content_excluding_many<P: AsRef<Path>>(
+        &self,
+        path: P,
+        exclude_hashes: &[Hash],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
         use atomic_core::output::alive::RetrieveOptions;
         let path = path.as_ref();
         let normalized = normalize_path(path);
@@ -214,9 +223,12 @@ impl Repository {
             collect_visible_change_ids_with_deps(&txn, &view)?
         };
 
-        // Remove the excluded change from the filter
-        if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
-            change_filter.remove(&exclude_id);
+        // Remove excluded changes without re-expanding dependency closure: this
+        // is deliberately a counterfactual graph filter.
+        for exclude_hash in exclude_hashes {
+            if let Ok(Some(exclude_id)) = txn.get_internal(exclude_hash) {
+                change_filter.remove(&exclude_id);
+            }
         }
 
         let options = RetrieveOptions::new().with_change_filter(change_filter);
@@ -237,6 +249,43 @@ impl Repository {
         } else {
             Ok(Some(content))
         }
+    }
+
+    /// Retrieve content at a change's sequence frontier while excluding changes.
+    pub fn get_file_content_after_change_excluding<P: AsRef<Path>>(
+        &self,
+        path: P,
+        at_change: &Hash,
+        exclude_hashes: &[Hash],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        use crate::history::get_changes_up_to_change;
+        let normalized = normalize_path(path.as_ref());
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(&self.current_view)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view.clone(),
+            })?;
+        let mut change_set = get_changes_up_to_change(&txn, &view, at_change)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ChangeNotFound {
+                hash: at_change.to_base32(),
+            })?;
+        for exclude_hash in exclude_hashes {
+            if let Some(exclude_id) = txn
+                .get_internal(exclude_hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                change_set.remove(&exclude_id);
+            }
+        }
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.get_file_content_with_filter(&cached_txn, &normalized, change_set, false)
     }
 
     /// Diff two views: returns (changes only in A, changes only in B, common changes).

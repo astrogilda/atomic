@@ -99,8 +99,10 @@ mod graph_op;
 mod header;
 mod local;
 pub mod ops;
+pub mod patch_relink;
 mod provenance;
 pub mod provenance_graph;
+pub mod provenance_relink;
 pub mod session;
 mod store;
 
@@ -116,11 +118,13 @@ pub use change::{Change, ChangeError, HashedChange};
 pub use credit::{Credit, CreditRange, CreditStats, CreditType, FileCredits, LineCredit};
 pub use encoding::Encoding;
 pub use header::{Author, ChangeHeader};
+pub use patch_relink::{PatchRelink, PatchRelinkError, PositionRelink};
 pub use provenance_graph::{
     ProvenanceEdge, ProvenanceEdgeKind, ProvenanceGraph, ProvenanceGraphBuilder,
     ProvenanceGraphError, ProvenanceNode, ProvenanceNodeKind, ProvenanceStats,
     PROVENANCE_GRAPH_EXTENSION,
 };
+pub use provenance_relink::{ProvenanceRelink, ProvenanceRelinkError};
 
 pub use graph_op::{AtomRef, GraphOp, HunkAtomIter};
 pub use local::{Local, LocalByte};

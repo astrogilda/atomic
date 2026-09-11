@@ -60,6 +60,15 @@ pub trait GraphTxnT {
         Ok(Vec::new())
     }
 
+    /// Resolve an exact historical node through patch relinks.
+    /// Lightweight graph implementations default to identity resolution.
+    fn resolve_vertex_alias(
+        &self,
+        node: GraphNode<NodeId>,
+    ) -> Result<GraphNode<NodeId>, PristineError> {
+        Ok(node)
+    }
+
     /// Initialize an adjacency iterator for a span.
     ///
     /// Returns an iterator over edges from the given span that have flags

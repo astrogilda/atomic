@@ -138,16 +138,15 @@ impl Command for Delete {
         // Get view info for warning message
         if !self.force {
             if let Ok(info) = repo.get_view_info(name) {
-                if info.change_count > 0 {
+                if info.own_change_count > 0 {
                     println!(
                         "{}",
                         warning(&format!(
                             "View '{}' has {} change(s). Use --force to confirm deletion.",
-                            name, info.change_count
+                            name, info.own_change_count
                         ))
                     );
-                    // In a real implementation, we might prompt for confirmation here
-                    // For now, we'll just warn but proceed
+                    return Ok(());
                 }
             }
         }

@@ -38,11 +38,18 @@
 //! Would unrecord: ABCDEF12 "Add feature file"
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use clap::Parser;
 
 use atomic_core::types::Base32;
+use atomic_repository::history::HistoryOptions;
 use atomic_repository::unrecord::UnrecordOptions;
-use atomic_repository::Repository;
+use atomic_repository::{
+    OrderedChange, Repository, SelectiveRepairPhase, SelectiveRepairPlan,
+    SelectiveRepairTimestamps, StructuralBlocker, SELECTIVE_REPAIR_PLAN_VERSION,
+};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -78,6 +85,10 @@ pub struct Unrecord {
     /// Preview what would be unrecorded without doing it.
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
+
+    /// Persist the read-only commutation analysis as a crash-safe repair plan.
+    #[arg(long, requires = "change")]
+    pub plan: bool,
 }
 
 impl Command for Unrecord {
@@ -90,18 +101,174 @@ impl Command for Unrecord {
             other => CliError::Repository(other),
         })?;
 
-        let options = if self.dry_run {
+        let options = if self.dry_run || self.plan {
             UnrecordOptions::dry_run()
         } else {
             UnrecordOptions::new()
         };
 
-        let outcome = if let Some(ref _prefix) = self.change {
-            // TODO: support unrecording a specific change by hash prefix
-            // once hash_from_prefix is available on the transaction trait.
+        let outcome = if let Some(ref prefix) = self.change {
+            let hash = repo
+                .find_change_by_prefix(prefix)
+                .map_err(CliError::Repository)?
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: format!("Change not found: {prefix}"),
+                })?;
+
+            if self.dry_run || self.plan {
+                let history = repo
+                    .log(HistoryOptions::default())
+                    .map_err(CliError::Repository)?;
+                let target = history
+                    .iter()
+                    .find(|entry| entry.hash == hash)
+                    .ok_or_else(|| CliError::InvalidArgument {
+                        message: format!("Change {} is not in the current view", hash.to_base32()),
+                    })?;
+
+                let target_provenance_hashes = repo
+                    .find_provenance_for_change(&hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(provenance_hash, _)| provenance_hash)
+                    .collect::<Vec<_>>();
+                let target_provenance = if target_provenance_hashes.is_empty() {
+                    "none".to_string()
+                } else {
+                    target_provenance_hashes
+                        .iter()
+                        .map(|provenance_hash| provenance_hash.to_base32())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let mut repair_closure = BTreeSet::from([hash]);
+                let mut blockers = Vec::new();
+                let mut commuting_changes = Vec::new();
+                let mut provenance_inventory = BTreeMap::from([(hash, target_provenance_hashes)]);
+                println!(
+                    "Commutation analysis for {} provenance={}:",
+                    hash.to_base32(),
+                    target_provenance
+                );
+                for entry in history
+                    .iter()
+                    .filter(|entry| entry.sequence > target.sequence)
+                {
+                    let change = repo.load_change(&entry.hash).map_err(|error| {
+                        CliError::Internal(anyhow::anyhow!(
+                            "Failed to load {}: {}",
+                            entry.hash.to_base32(),
+                            error
+                        ))
+                    })?;
+                    let provenance = repo
+                        .find_provenance_for_change(&entry.hash)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(provenance_hash, _)| provenance_hash)
+                        .collect::<Vec<_>>();
+                    let provenance_display = if provenance.is_empty() {
+                        "none".to_string()
+                    } else {
+                        provenance
+                            .iter()
+                            .map(|provenance_hash| provenance_hash.to_base32())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    let references = change
+                        .structurally_referenced_changes()
+                        .map_err(|error| {
+                            CliError::Internal(anyhow::anyhow!(
+                                "Failed to inspect {}: {}",
+                                entry.hash.to_base32(),
+                                error
+                            ))
+                        })?
+                        .into_iter()
+                        .filter(|referenced| repair_closure.contains(referenced))
+                        .collect::<Vec<_>>();
+                    if !references.is_empty() {
+                        repair_closure.insert(entry.hash);
+                        provenance_inventory.insert(entry.hash, provenance);
+                        blockers.push(StructuralBlocker {
+                            change: entry.hash,
+                            references,
+                        });
+                        println!(
+                            "  BLOCKS   {} provenance={}",
+                            entry.hash.to_base32(),
+                            provenance_display
+                        );
+                    } else {
+                        commuting_changes.push(entry.hash);
+                        println!(
+                            "  COMMUTES {} provenance={}",
+                            entry.hash.to_base32(),
+                            provenance_display
+                        );
+                    }
+                }
+                println!(
+                    "Summary: {} commuting, {} structurally dependent",
+                    commuting_changes.len(),
+                    blockers.len()
+                );
+
+                if self.plan {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|error| CliError::Internal(anyhow::anyhow!(error)))?
+                        .as_secs();
+                    let view = repo.current_view().to_string();
+                    let view_info = repo.get_view_info(&view).map_err(CliError::Repository)?;
+                    let plan = SelectiveRepairPlan {
+                        version: SELECTIVE_REPAIR_PLAN_VERSION,
+                        plan_id: format!("repair-{}-{now}", &hash.to_base32()[..12]),
+                        generation: 0,
+                        phase: SelectiveRepairPhase::Planned,
+                        view,
+                        original_state: view_info.state,
+                        original_order: history
+                            .iter()
+                            .map(|entry| OrderedChange {
+                                change: entry.hash,
+                                order: entry.sequence,
+                            })
+                            .collect(),
+                        target: hash,
+                        blockers,
+                        commuting: commuting_changes,
+                        replacements: BTreeMap::new(),
+                        replacement_order: Vec::new(),
+                        original_provenance: provenance_inventory,
+                        evaluation: None,
+                        timestamps: SelectiveRepairTimestamps {
+                            created_at: now.to_string(),
+                            updated_at: now.to_string(),
+                            completed_at: None,
+                        },
+                    };
+                    repo.save_selective_repair_plan(&plan)
+                        .map_err(CliError::Repository)?;
+                    let persisted = repo
+                        .load_selective_repair_plan()
+                        .map_err(CliError::Repository)?
+                        .ok_or_else(|| {
+                            CliError::Internal(anyhow::anyhow!(
+                                "selective repair plan disappeared after persistence"
+                            ))
+                        })?;
+                    println!(
+                        "Saved repair plan {} generation={} phase={:?}",
+                        persisted.plan_id, persisted.generation, persisted.phase
+                    );
+                }
+                return Ok(());
+            }
+
             return Err(CliError::InvalidArgument {
-                message: "Unrecording a specific change by hash is not yet supported. \
-                          Use `atomic unrecord` (no argument) to unrecord the last change."
+                message: "Selective unrecord is experimental. Run with --dry-run to inspect commutation first."
                     .to_string(),
             });
         } else {

@@ -20,7 +20,8 @@ use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, PatchRelinkTarget, PatchRelinkTxnT,
+    StoredConflict, TreeTxnT, ViewState, ViewTxnT,
 };
 
 use super::helpers::{
@@ -70,6 +71,60 @@ impl ReadTxn {
     }
 }
 
+impl PatchRelinkTxnT for ReadTxn {
+    fn get_patch_alias(&self, old_change: NodeId) -> PristineResult<Option<NodeId>> {
+        let table = self.txn.open_table(PATCH_ALIASES)?;
+        let alias = table
+            .get(old_change.get())?
+            .map(|value| NodeId::new(value.value()));
+        Ok(alias)
+    }
+
+    fn get_patch_alias_sources(&self, replacement: NodeId) -> PristineResult<Vec<NodeId>> {
+        let table = self.txn.open_multimap_table(REV_PATCH_ALIASES)?;
+        table
+            .get(replacement.get())?
+            .map(|value| {
+                value
+                    .map(|value| NodeId::new(value.value()))
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    fn get_patch_relink(
+        &self,
+        old_node: GraphNode<NodeId>,
+    ) -> PristineResult<Option<PatchRelinkTarget>> {
+        let table = self.txn.open_table(PATCH_RELINKS)?;
+        let key = encode_vertex(
+            old_node.change.get(),
+            old_node.start.get(),
+            old_node.end.get(),
+        );
+        let Some(value) = table.get(&key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        match bytes[0] {
+            0 => {
+                let mut node = [0; 24];
+                node.copy_from_slice(&bytes[1..]);
+                let (change, start, end) = decode_vertex(&node);
+                Ok(Some(PatchRelinkTarget::Mapped(GraphNode::new(
+                    NodeId::new(change),
+                    ChangePosition::new(start),
+                    ChangePosition::new(end),
+                ))))
+            }
+            1 => Ok(Some(PatchRelinkTarget::Removed)),
+            tag => Err(PristineError::Inconsistent {
+                message: format!("invalid patch relink tag {tag}"),
+            }),
+        }
+    }
+}
+
 // GraphTxnT Implementation
 
 impl GraphTxnT for ReadTxn {
@@ -112,6 +167,31 @@ impl GraphTxnT for ReadTxn {
             }
         }
         Ok(changes)
+    }
+
+    fn resolve_vertex_alias(&self, node: GraphNode<NodeId>) -> PristineResult<GraphNode<NodeId>> {
+        let origin = node;
+        let mut current = node;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            if !seen.insert(current) {
+                return Err(PristineError::Inconsistent {
+                    message: format!("patch alias cycle while resolving {origin:?}"),
+                });
+            }
+            match crate::pristine::traits::PatchRelinkTxnT::get_patch_relink(self, current)? {
+                None => return Ok(current),
+                Some(crate::pristine::traits::PatchRelinkTarget::Mapped(next)) => current = next,
+                Some(crate::pristine::traits::PatchRelinkTarget::Removed) => {
+                    return Err(PristineError::Inconsistent {
+                        message: format!("patch node {current:?} was removed by replacement"),
+                    });
+                }
+            }
+        }
+        Err(PristineError::Inconsistent {
+            message: format!("patch alias depth exceeded while resolving {origin:?}"),
+        })
     }
 
     fn iter_adjacent(

@@ -111,12 +111,27 @@ pub fn collect_visible_change_ids<T: ViewTxnT>(
 /// If a visible change predates the dependency index, this helper deliberately
 /// does **not** fall back to loading the `.change` file. Bulk object-store reads
 /// belong in an explicit repair/backfill path, not in `status`.
-pub fn collect_visible_change_ids_with_deps<T: ViewTxnT>(
+pub fn collect_visible_change_ids_with_deps<
+    T: ViewTxnT + atomic_core::pristine::PatchRelinkTxnT,
+>(
     txn: &T,
     view: &atomic_core::pristine::ViewState,
 ) -> Result<HashSet<NodeId>, RepositoryError> {
     let mut ids = collect_visible_change_ids(txn, view)?;
-    expand_indexed_dependency_closure(txn, &mut ids)?;
+    loop {
+        let before = ids.len();
+        expand_indexed_dependency_closure(txn, &mut ids)?;
+        let visible: Vec<_> = ids.iter().copied().collect();
+        for replacement in visible {
+            let replaced = txn
+                .get_patch_alias_sources(replacement)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            ids.extend(replaced);
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
     Ok(ids)
 }
 
@@ -228,4 +243,59 @@ pub fn expand_indexed_dependency_closure<T: GraphTxnT>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod patch_alias_tests {
+    use super::*;
+    use atomic_core::change::{PatchRelink, PositionRelink};
+    use atomic_core::pristine::{MutTxnT, Pristine};
+    use atomic_core::types::{ChangePosition, GraphNode};
+
+    #[test]
+    fn replacement_visibility_activates_old_identity_only_in_reverse_direction() {
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("pristine.redb")).unwrap();
+        let old_hash = Hash::of(b"old");
+        let new_hash = Hash::of(b"new");
+        let (old_id, new_id) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let old_id = txn.register_change(&old_hash).unwrap();
+            let new_id = txn.register_change(&new_hash).unwrap();
+            let old_node = GraphNode::new(old_hash, ChangePosition::new(0), ChangePosition::new(1));
+            let new_node = GraphNode::new(new_hash, ChangePosition::new(0), ChangePosition::new(1));
+            let relink = PatchRelink::new(
+                old_hash,
+                new_hash,
+                vec![PositionRelink::new(old_node, new_node)],
+                Vec::new(),
+                Vec::new(),
+                vec![1; 32],
+                1,
+                vec![2; 64],
+            )
+            .unwrap();
+            txn.put_patch_relink(&relink).unwrap();
+
+            let mut historical = txn.open_or_create_view("historical").unwrap();
+            txn.put_change(&mut historical, old_id, &old_hash).unwrap();
+            txn.update_view(&historical).unwrap();
+            let mut repaired = txn.open_or_create_view("repaired").unwrap();
+            txn.put_change(&mut repaired, new_id, &new_hash).unwrap();
+            txn.update_view(&repaired).unwrap();
+            txn.commit().unwrap();
+            (old_id, new_id)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        let repaired = txn.get_view("repaired").unwrap().unwrap();
+        let repaired_visible = collect_visible_change_ids_with_deps(&txn, &repaired).unwrap();
+        assert!(repaired_visible.contains(&new_id));
+        assert!(repaired_visible.contains(&old_id));
+
+        let historical = txn.get_view("historical").unwrap().unwrap();
+        let historical_visible = collect_visible_change_ids_with_deps(&txn, &historical).unwrap();
+        assert!(historical_visible.contains(&old_id));
+        assert!(!historical_visible.contains(&new_id));
+    }
 }

@@ -14,6 +14,7 @@ use crate::crdt::tables::{
     TRUNK_BRANCHES, VERTEX_BRANCH,
 };
 
+use crate::change::PatchRelink;
 use crate::types::{
     ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
     SerializedGraphEdge,
@@ -22,8 +23,8 @@ use crate::types::{
 use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, StoredConflict, TreeTxnT,
-    ViewScope, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, PatchRelinkTarget,
+    PatchRelinkTxnT, StoredConflict, TreeTxnT, ViewScope, ViewState, ViewTxnT,
 };
 
 use super::helpers::{
@@ -906,6 +907,61 @@ impl<'a> WriteTxn<'a> {
     }
 }
 
+impl PatchRelinkTxnT for WriteTxn<'_> {
+    fn get_patch_alias(&self, old_change: NodeId) -> PristineResult<Option<NodeId>> {
+        let table = self.txn.open_table(PATCH_ALIASES)?;
+        let alias = table
+            .get(old_change.get())?
+            .map(|value| NodeId::new(value.value()));
+        Ok(alias)
+    }
+
+    fn get_patch_alias_sources(&self, replacement: NodeId) -> PristineResult<Vec<NodeId>> {
+        let table = self.txn.open_multimap_table(REV_PATCH_ALIASES)?;
+        let values = table
+            .get(replacement.get())?
+            .map(|value| {
+                value
+                    .map(|value| NodeId::new(value.value()))
+                    .map_err(Into::into)
+            })
+            .collect();
+        values
+    }
+
+    fn get_patch_relink(
+        &self,
+        old_node: GraphNode<NodeId>,
+    ) -> PristineResult<Option<PatchRelinkTarget>> {
+        let table = self.txn.open_table(PATCH_RELINKS)?;
+        let key = encode_vertex(
+            old_node.change.get(),
+            old_node.start.get(),
+            old_node.end.get(),
+        );
+        let Some(value) = table.get(&key)? else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        match bytes[0] {
+            0 => {
+                let mut node = [0; 24];
+                node.copy_from_slice(&bytes[1..]);
+                let (change, start, end) = decode_vertex(&node);
+                Ok(Some(PatchRelinkTarget::Mapped(GraphNode::new(
+                    NodeId::new(change),
+                    ChangePosition::new(start),
+                    ChangePosition::new(end),
+                ))))
+            }
+            1 => Ok(Some(PatchRelinkTarget::Removed)),
+            tag => Err(PristineError::Inconsistent {
+                message: format!("invalid patch relink tag {tag}"),
+            }),
+        }
+    }
+}
+
 // MutTxnT Implementation
 
 impl<'a> MutTxnT for WriteTxn<'a> {
@@ -923,6 +979,87 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
     fn register_provenance(&mut self, hash: &Hash) -> PristineResult<NodeId> {
         self.register_entity(hash, node_type::PROVENANCE)
+    }
+
+    fn put_patch_relink(&mut self, relink: &PatchRelink) -> PristineResult<()> {
+        let resolve_change = |hash: &Hash| -> PristineResult<NodeId> {
+            let internal = self.txn.open_table(INTERNAL)?;
+            let id = internal
+                .get(hash.as_bytes())?
+                .map(|value| NodeId::new(value.value()))
+                .ok_or_else(|| PristineError::HashNotFound {
+                    hash: format!("{hash:?}"),
+                })?;
+            let node_types = self.txn.open_table(NODE_TYPES)?;
+            if node_types.get(id.get())?.map(|value| value.value()) != Some(node_type::CHANGE) {
+                return Err(PristineError::ChangeNotFound { id: id.get() });
+            }
+            Ok(id)
+        };
+
+        let old_change = resolve_change(relink.old_change())?;
+        let new_change = resolve_change(relink.new_change())?;
+
+        if let Some(existing) = self.get_patch_alias(old_change)? {
+            if existing != new_change {
+                return Err(PristineError::Inconsistent {
+                    message: format!(
+                        "patch {} is already aliased to {}, not {}",
+                        old_change.get(),
+                        existing.get(),
+                        new_change.get()
+                    ),
+                });
+            }
+        }
+
+        let mut outcomes =
+            Vec::with_capacity(relink.position_map().len() + relink.removed_ranges().len());
+        for mapping in relink.position_map() {
+            let old = GraphNode::new(old_change, mapping.old().start, mapping.old().end);
+            let new = GraphNode::new(new_change, mapping.new_node().start, mapping.new_node().end);
+            outcomes.push((old, PatchRelinkTarget::Mapped(new)));
+        }
+        for removed in relink.removed_ranges() {
+            outcomes.push((
+                GraphNode::new(old_change, removed.start, removed.end),
+                PatchRelinkTarget::Removed,
+            ));
+        }
+
+        for (old, outcome) in &outcomes {
+            if let Some(existing) = self.get_patch_relink(*old)? {
+                if existing != *outcome {
+                    return Err(PristineError::Inconsistent {
+                        message: format!("conflicting patch relink for {old:?}"),
+                    });
+                }
+            }
+        }
+
+        self.txn
+            .open_table(PATCH_ALIASES)?
+            .insert(old_change.get(), new_change.get())?;
+        self.txn
+            .open_multimap_table(REV_PATCH_ALIASES)?
+            .insert(new_change.get(), old_change.get())?;
+        let mut table = self.txn.open_table(PATCH_RELINKS)?;
+        for (old, outcome) in outcomes {
+            let key = encode_vertex(old.change.get(), old.start.get(), old.end.get());
+            let mut value = [0; 25];
+            match outcome {
+                PatchRelinkTarget::Mapped(new) => {
+                    value[1..].copy_from_slice(&encode_vertex(
+                        new.change.get(),
+                        new.start.get(),
+                        new.end.get(),
+                    ));
+                }
+                PatchRelinkTarget::Removed => value[0] = 1,
+            }
+            table.insert(&key, &value)?;
+        }
+        Ok(())
     }
 
     fn put_graph(
@@ -1390,7 +1527,20 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             table.remove(view.name.as_str())?;
         }
 
-        // Remove all change log entries for this view
+        // Capture change IDs before removing the forward log so the reverse
+        // index can be cleaned consistently.
+        let change_ids = {
+            let table = self.txn.open_table(VIEW_CHANGES)?;
+            let mut ids = Vec::with_capacity(view.change_count as usize);
+            for seq in 0..view.change_count {
+                let key = encode_view_seq(view.id, seq);
+                if let Some(change_id) = table.get(&key)? {
+                    ids.push(change_id.value());
+                }
+            }
+            ids
+        };
+
         {
             let mut table = self.txn.open_table(VIEW_CHANGES)?;
             for seq in 0..view.change_count {
@@ -1399,16 +1549,11 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             }
         }
 
-        // Remove all reverse change log entries
         {
             let mut rev_table = self.txn.open_table(REV_VIEW_CHANGES)?;
-            let table = self.txn.open_table(VIEW_CHANGES)?;
-            for seq in 0..view.change_count {
-                let key = encode_view_seq(view.id, seq);
-                if let Some(change_id) = table.get(&key)? {
-                    let rev_key = encode_view_seq(view.id, change_id.value());
-                    rev_table.remove(&rev_key)?;
-                }
+            for change_id in change_ids {
+                let rev_key = encode_view_seq(view.id, change_id);
+                rev_table.remove(&rev_key)?;
             }
         }
 

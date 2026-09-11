@@ -63,6 +63,20 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
+/// Replaced patch NodeId → replacement patch NodeId.
+pub const PATCH_ALIASES: TableDefinition<u64, u64> = TableDefinition::new("patch_aliases");
+
+/// Replacement patch NodeId → replaced patch NodeIds.
+pub const REV_PATCH_ALIASES: MultimapTableDefinition<u64, u64> =
+    MultimapTableDefinition::new("rev_patch_aliases");
+
+/// Old encoded GraphNode → tagged relink outcome.
+///
+/// Values are 25 bytes: tag `0` followed by an encoded mapped GraphNode, or
+/// tag `1` followed by zeroes for an explicitly removed node.
+pub const PATCH_RELINKS: TableDefinition<&[u8; 24], &[u8; 25]> =
+    TableDefinition::new("patch_relinks");
+
 // View Tables
 
 /// View metadata

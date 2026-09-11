@@ -2519,7 +2519,9 @@ impl Repository {
             );
         }
 
-        // Filter to changes not already in target
+        // Plan the complete missing dependency closure once. DFS postorder is
+        // required here: reversing breadth-first discovery does not produce a
+        // valid topological order for a general dependency DAG.
         let txn = self
             .pristine
             .read_txn()
@@ -2531,21 +2533,92 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: options.to_view.clone(),
             })?;
+        let target_visible = collect_visible_change_ids_with_deps(&txn, &to_view)?;
 
-        let missing = filter_missing_in_view(&txn, &to_view, &source_changes)
-            .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+        let mut ordered = Vec::<(Hash, NodeId)>::new();
+        let mut complete = HashSet::<Hash>::new();
+        let mut visiting = HashSet::<Hash>::new();
 
-        // Track skipped changes
-        let missing_set: std::collections::HashSet<_> = missing.iter().collect();
-        for hash in &source_changes {
-            if !missing_set.contains(hash) {
-                outcome.skipped_hashes.push(*hash);
+        for root in &source_changes {
+            if let Some(root_id) = txn
+                .get_internal(root)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                if target_visible.contains(&root_id) {
+                    outcome.skipped_hashes.push(*root);
+                    complete.insert(*root);
+                    continue;
+                }
+            }
+
+            // `(hash, parent, expanded)` implements recursive DFS without
+            // risking stack overflow. Dependencies are pushed in reverse so
+            // their declaration order is retained in the final postorder.
+            let mut stack = vec![(*root, None::<Hash>, false)];
+            while let Some((hash, parent, expanded)) = stack.pop() {
+                if complete.contains(&hash) {
+                    continue;
+                }
+
+                let change_id = txn
+                    .get_internal(&hash)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::MissingDependency {
+                        change: parent.unwrap_or(hash).to_base32(),
+                        dependency: hash.to_base32(),
+                    })?;
+
+                if target_visible.contains(&change_id) {
+                    complete.insert(hash);
+                    visiting.remove(&hash);
+                    continue;
+                }
+
+                if expanded {
+                    visiting.remove(&hash);
+                    if complete.insert(hash) {
+                        ordered.push((hash, change_id));
+                    }
+                    continue;
+                }
+
+                if !visiting.insert(hash) {
+                    return Err(RepositoryError::Apply(format!(
+                        "cyclic change dependency involving {}",
+                        hash.to_base32()
+                    )));
+                }
+
+                stack.push((hash, parent, true));
+                if options.apply_dependencies {
+                    let dependencies = if txn
+                        .is_change_deps_indexed(change_id)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    {
+                        txn.get_change_deps(change_id)
+                            .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    } else {
+                        self.load_change(&hash)?.dependencies().to_vec()
+                    };
+                    for dependency in dependencies.into_iter().rev() {
+                        if !complete.contains(&dependency) {
+                            stack.push((dependency, Some(hash), false));
+                        }
+                    }
+                }
             }
         }
 
+        let all_ambient = ordered.iter().try_fold(true, |all, (_, change_id)| {
+            txn.has_change_in_graph(*change_id)
+                .map(|present| all && present)
+                .map_err(|e| RepositoryError::Database(e.to_string()))
+        })?;
+        let missing: Vec<Hash> = ordered.iter().map(|(hash, _)| *hash).collect();
+
         if trace_insert {
             eprintln!(
-                "[insert_from_view] filter_missing complete missing={} skipped={} elapsed={:?}",
+                "[insert_from_view] closure_plan complete missing={} skipped={} elapsed={:?}",
                 missing.len(),
                 outcome.skipped_hashes.len(),
                 t0.elapsed(),
@@ -2569,10 +2642,54 @@ impl Repository {
             return Ok(outcome);
         }
 
-        // If dry run, just return what would be inserted
+        // Dry-run uses the same dependency-ordered closure as the write path.
         if options.dry_run {
             outcome.applied_hashes = missing;
             outcome.changes_applied = outcome.applied_hashes.len();
+            outcome.new_state = to_view.state;
+            outcome.sequence = to_view.change_count;
+            return Ok(outcome);
+        }
+
+        // A non-checked-out target needs only view-membership metadata: every
+        // source change and dependency already inhabits the ambient graph.
+        // Commit the complete closure atomically instead of reapplying and
+        // durably committing every change independently.
+        if options.to_view != self.current_view && all_ambient {
+            let mut txn = self
+                .pristine
+                .write_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut target = txn
+                .get_view(&options.to_view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: options.to_view.clone(),
+                })?;
+
+            let mut applied = Vec::with_capacity(ordered.len());
+            for (hash, change_id) in &ordered {
+                // Recheck direct membership under the exclusive writer in case
+                // the plan was made from a stale read snapshot.
+                if txn
+                    .get_change_seq(&target, *change_id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .is_none()
+                {
+                    txn.put_change(&mut target, *change_id, hash)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    applied.push(*hash);
+                }
+            }
+            txn.update_view(&target)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+            outcome.applied_hashes = applied;
+            outcome.changes_applied = outcome.applied_hashes.len();
+            outcome.new_state = target.state;
+            outcome.sequence = target.change_count;
             return Ok(outcome);
         }
 

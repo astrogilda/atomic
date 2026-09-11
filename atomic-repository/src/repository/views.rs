@@ -512,21 +512,24 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
-        // Delete the view.
-        //
-        // `del_view` enforces:
-        // - Shared views cannot be deleted (returns CannotDeleteSharedView)
-        // - Views with children cannot be deleted (returns ViewHasChildren)
-        // Remove workspace directory for this view before deleting
-        // the view from the database.  This cleans up any shelved
-        // artifacts (node_modules, dist, etc.) that were stored when
-        // the user last switched away from this view.
+        // Quarantine the workspace with an O(1) rename before committing the
+        // metadata deletion. Recursively deleting shelved build/run trees can
+        // take minutes and must not delay view deletion. A later workspace GC
+        // can reclaim quarantined directories.
         let ws = workspace_path(&self.dot_dir, name);
-        if ws.is_dir() {
-            let _ = std::fs::remove_dir_all(&ws);
-        }
+        let quarantined_ws = if ws.is_dir() {
+            let trash = self.dot_dir.join("workspaces").join(format!(
+                ".deleted-{}-{}",
+                view.id,
+                std::process::id()
+            ));
+            std::fs::rename(&ws, &trash)?;
+            Some(trash)
+        } else {
+            None
+        };
 
-        txn.del_view(&view).map_err(|e| match &e {
+        let delete_result = txn.del_view(&view).map_err(|e| match &e {
             atomic_core::pristine::PristineError::CannotDeleteSharedView { name } => {
                 RepositoryError::InvalidOperation {
                     message: format!(
@@ -547,10 +550,20 @@ impl Repository {
                 }
             }
             _ => RepositoryError::Database(e.to_string()),
-        })?;
+        });
+        if let Err(error) = delete_result {
+            if let Some(trash) = quarantined_ws.as_ref() {
+                let _ = std::fs::rename(trash, &ws);
+            }
+            return Err(error);
+        }
 
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if let Err(error) = txn.commit() {
+            if let Some(trash) = quarantined_ws.as_ref() {
+                let _ = std::fs::rename(trash, &ws);
+            }
+            return Err(RepositoryError::Database(error.to_string()));
+        }
 
         Ok(())
     }

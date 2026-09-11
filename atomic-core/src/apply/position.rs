@@ -136,10 +136,13 @@ pub fn resolve_vertex<T: GraphTxnT>(
         None => current_change,
     };
 
-    Ok(GraphNode {
+    txn.resolve_vertex_alias(GraphNode {
         change: change_id,
         start: node.start,
         end: node.end,
+    })
+    .map_err(|e| LocalApplyError::Internal {
+        message: format!("Failed to resolve patch alias: {e}"),
     })
 }
 
