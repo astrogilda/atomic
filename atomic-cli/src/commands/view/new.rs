@@ -253,11 +253,14 @@ impl New {
     fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
         use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
 
-        let kind = if self.draft {
-            ViewScope::Draft
-        } else {
-            ViewScope::Shared
-        };
+        // A parented view is ALWAYS a Draft (overlay) workspace. Parent-chain
+        // visibility exists only for Draft views — `collect_visible_change_ids`
+        // (atomic-repository/repository/filter.rs) never follows the parent of
+        // a Shared view. A Shared view with a parent therefore has an EMPTY
+        // visible change set, and `view switch` into it would delete the
+        // entire working tree. Use `--from <view>` to fork a permanent Shared
+        // view with a snapshot of the source's changes instead.
+        let kind = resolve_two_tier_kind(self.draft, self.parent.is_some());
 
         // Resolve the parent view name → ID
         let parent_name = self
@@ -424,6 +427,25 @@ impl Command for New {
 }
 
 // Tests
+
+/// Resolve the view kind for the two-tier (--draft/--parent) creation path.
+///
+/// # Invariant
+///
+/// A view with a parent is ALWAYS a Draft (overlay) workspace. The overlay
+/// chain — the only visibility that follows parent pointers — exists solely
+/// for Draft views (`collect_visible_change_ids` in atomic-repository never
+/// follows a Shared view's parent). Creating a Shared view with a parent
+/// yields an empty visible change set, and `view switch` into it deletes the
+/// ENTIRE working tree. `--from <view>` is the way to fork a permanent
+/// Shared view with a snapshot of the source's changes.
+pub fn resolve_two_tier_kind(draft: bool, has_parent: bool) -> atomic_core::pristine::ViewScope {
+    if draft || has_parent {
+        atomic_core::pristine::ViewScope::Draft
+    } else {
+        atomic_core::pristine::ViewScope::Shared
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -766,5 +788,20 @@ mod tests {
             }
             other => panic!("Expected ViewNotFound, got: {:?}", other),
         }
+    }
+    // -------------------------------------------------------------------------
+    // View kind resolution for the two-tier (--draft/--parent) path
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn two_tier_kind_parent_implies_draft() {
+        // Regression: `--parent` WITHOUT `--draft` must create a Draft
+        // (overlay) workspace. Previously it created a Shared view with a
+        // parent — whose visible change set is EMPTY, so switching into it
+        // deleted the entire working tree.
+        assert!(resolve_two_tier_kind(false, true).is_draft());
+        assert!(resolve_two_tier_kind(true, false).is_draft());
+        assert!(resolve_two_tier_kind(true, true).is_draft());
+        assert!(!resolve_two_tier_kind(false, false).is_draft());
     }
 }
