@@ -268,14 +268,17 @@ impl Repository {
             }
         }
 
-        // REV_TREE recovery: TREE is single-valued per path, so a second
-        // inode that visibly claims the same path (cross-view creates, a
-        // materialization name-conflict) is invisible to iter_tree. A view
-        // switch must NOT treat such a path as "absent from the new view" —
-        // that silently DELETED inherited files on switch (see
-        // `switch_file_loss_tests`). Re-insert any path that has a visible
-        // binding among its REV_TREE inodes, mirroring the materializer's
-        // name-conflict detection (which walks REV_TREE for the same reason).
+        // REV_TREE recovery: a view is a FILTER over the global graph — every
+        // node it exposes already lives in the graph, and TREE is just a
+        // single-valued bookkeeping index over that graph. When two inodes
+        // claim the same path (cross-view creates, a materialization
+        // name-conflict), iter_tree can only expose the one binding — so a
+        // switch used to classify a path that the target view's filter DOES
+        // render as "absent from the new view" and silently DELETED it (see
+        // `switch_file_loss_tests`). Re-insert any path that the filter
+        // renders: some REV_TREE-claimed inode whose introducing change is
+        // visible on the view AND alive under that filter — the same
+        // predicate the materializer's name-conflict detection uses.
         {
             use atomic_core::pristine::TreeTxnT;
             let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
@@ -291,7 +294,19 @@ impl Repository {
                 }
                 for inode in inodes {
                     if let Ok(Some(position)) = txn.inode_position(inode) {
-                        if view_change_ids.contains(&position.change) {
+                        if !view_change_ids.contains(&position.change) {
+                            continue;
+                        }
+                        // The filter exposes this path only if the claimed
+                        // inode's content chain is ALIVE under the filter;
+                        // a visible-but-superseded claimant must not keep
+                        // a path the view does not render.
+                        if crate::repository::status::is_file_alive_via_retrieval(
+                            &txn,
+                            inode,
+                            position,
+                            &view_change_ids,
+                        ) {
                             paths.insert(path);
                             break;
                         }
