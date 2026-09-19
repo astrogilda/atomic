@@ -268,6 +268,38 @@ impl Repository {
             }
         }
 
+        // REV_TREE recovery: TREE is single-valued per path, so a second
+        // inode that visibly claims the same path (cross-view creates, a
+        // materialization name-conflict) is invisible to iter_tree. A view
+        // switch must NOT treat such a path as "absent from the new view" —
+        // that silently DELETED inherited files on switch (see
+        // `switch_file_loss_tests`). Re-insert any path that has a visible
+        // binding among its REV_TREE inodes, mirroring the materializer's
+        // name-conflict detection (which walks REV_TREE for the same reason).
+        {
+            use atomic_core::pristine::TreeTxnT;
+            let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
+                std::collections::HashMap::new();
+            if let Ok(pairs) = txn.iter_rev_tree() {
+                for (inode, path) in pairs {
+                    by_path.entry(path).or_default().push(inode);
+                }
+            }
+            for (path, inodes) in by_path {
+                if paths.contains(&path) {
+                    continue;
+                }
+                for inode in inodes {
+                    if let Ok(Some(position)) = txn.inode_position(inode) {
+                        if view_change_ids.contains(&position.change) {
+                            paths.insert(path);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(paths)
     }
 
