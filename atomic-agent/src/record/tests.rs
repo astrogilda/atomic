@@ -1213,7 +1213,8 @@ fn scoped_record_keeps_sibling_and_preexisting_files_out() {
 }
 
 #[test]
-fn scoped_record_empty_missing_invalid_or_stale_manifest_never_sweeps() {    let dir = tempfile::tempdir().unwrap();
+fn scoped_record_empty_missing_invalid_or_stale_manifest_never_sweeps() {
+    let dir = tempfile::tempdir().unwrap();
     let repo = atomic_repository::Repository::init(dir.path()).unwrap();
     let mut session = make_session();
     session.view_name = repo.current_view().to_string();
@@ -1253,7 +1254,11 @@ fn scoped_record_recovers_session_touched_deletions_after_claim_loss() {
     session.explicit_record_files = true;
     drop(repo);
     std::fs::write(dir.path().join("mine.txt"), "recorded by this session").unwrap();
-    std::fs::write(dir.path().join("foreign.txt"), "recorded by another session").unwrap();
+    std::fs::write(
+        dir.path().join("foreign.txt"),
+        "recorded by another session",
+    )
+    .unwrap();
 
     // This session records mine.txt; the recorded paths land in the
     // persisted session state (files_touched), like the orchestrator does.
