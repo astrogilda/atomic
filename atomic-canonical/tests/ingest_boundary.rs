@@ -67,17 +67,20 @@ fn duplicate_member_is_refused() {
     assert_eq!(parsed["toolName"], "delete_repository");
 }
 
-/// `vd94ac70c9f0d84bf` (`aia-c-12`). One container past the 128 cap, refused
-/// with a catchable error naming the cap rather than by recursing. The cap this
-/// crate's hashing and proof paths rely on today is `serde_json`'s incidental
-/// parser default, which is a bound neither of them asserts.
+/// `vd94ac70c9f0d84bf` (`aia-c-12`). One container past the cap, refused with
+/// a catchable error naming the cap rather than by recursing. The cap is
+/// `jcs::MAX_DEPTH`, declared once and the only depth bound on the path;
+/// `tests/depth_boundary.rs` sits on it from both sides.
 #[test]
 fn nesting_one_past_the_cap_is_refused() {
     let bytes = vector("statements/vd94ac70c9f0d84bf.json");
     assert!(
         matches!(
             admission_error(&bytes),
-            Admission::TooDeep { limit: 128, .. }
+            Admission::TooDeep {
+                limit: jcs::MAX_DEPTH,
+                ..
+            }
         ),
         "vd94ac70c9f0d84bf must be refused at the depth cap"
     );

@@ -43,3 +43,28 @@ d94ac70c9f0d84bf1fc287376d1e2416785ce51df443a97a2d13765f5867883e  statements/vd9
 Two of the four are refused by RFC 8785 alone; the other two need the RFC 7493
 profile `jcs::admit_document` applies. `tests/ingest_boundary.rs` says which is
 which, and asserts the variant rather than a message.
+
+## The depth cap from both sides, generated here
+
+Three documents that did not come from the conformance suite. They were
+generated for this crate as the bytes `[` repeated *d* times, `null`, `]`
+repeated *d* times, with no trailing newline, so each file is exactly 2*d* + 4
+bytes and `tests/depth_boundary.rs` asserts that length before it reads
+anything else. `aia-c-12` above is one container past the cap on a real
+statement; these sit on the cap itself, one either side, which is where a
+second, undeclared depth bound shows up as a disagreement between the
+admission and the parse that follows it.
+
+| file | depth | bytes | condition | expected |
+| --- | --- | --- | --- | --- |
+| `depth/127.json` | 127 | 258 | one under `jcs::MAX_DEPTH` | admitted |
+| `depth/128.json` | 128 | 260 | at `jcs::MAX_DEPTH` | admitted; canonicalizes to the same bytes; identity through `encode_for_transport` and `decode_from_transport` |
+| `depth/129.json` | 129 | 262 | one past `jcs::MAX_DEPTH` | `Error::TooDeep { limit: 128, offset: 128 }` |
+
+SHA-256 of each file as committed:
+
+```
+89fed8bdcec19b53a9cfeb6365642fcd7f84a12c0a8435224c1821f0183fa908  depth/127.json
+9c2ec3e5c558bde9c95f21cd30b81503b5a76ab11f0a1bcbc9e55f45fa38bcf4  depth/128.json
+aea6374322f648efe766b46b158da515b832005c4c2b2ba76de0f3f770bed699  depth/129.json
+```
