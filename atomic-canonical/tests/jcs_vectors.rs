@@ -31,7 +31,9 @@ fn fixture(name: &str) -> Value {
 /// it, and require the exact bytes.
 fn assert_canonical(name: &str) {
     let f = fixture(name);
-    let text = f["input"].as_str().expect("fixture carries an input string");
+    let text = f["input"]
+        .as_str()
+        .expect("fixture carries an input string");
     let value: Value = serde_json::from_str(text).expect("fixture input is valid JSON");
     let expected = f["expect"]["canonical"]
         .as_str()
@@ -109,5 +111,8 @@ fn depth_at_the_cap_is_canonicalized() {
         value = Value::Array(vec![value]);
     }
     let canonical = jcs::canonicalize(&value);
-    assert_eq!(canonical, format!("{}null{}", "[".repeat(128), "]".repeat(128)));
+    assert_eq!(
+        canonical,
+        format!("{}null{}", "[".repeat(128), "]".repeat(128))
+    );
 }
