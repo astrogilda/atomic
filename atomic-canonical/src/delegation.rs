@@ -294,6 +294,33 @@ pub fn encode_for_transport(document: &Value) -> String {
     data_encoding::BASE64URL_NOPAD.encode(canonical.as_bytes())
 }
 
+/// Render a minted certificate for the identity store, admitting the bytes it
+/// produces before handing them back.
+///
+/// Every reader of a stored grant admits it under the profile in
+/// [`crate::jcs`] before it verifies anything: [`load_for_delegate`], and the
+/// CLI's `grant list`, `grant verify`, `grant push` and `grant revoke`. So a
+/// certificate written outside that profile is signed, stored and then skipped
+/// by every one of them. [`mint`] takes a `u64` count and free-text names, and
+/// both can leave the profile: a `maxChanges` of 2^53 or more, or a Unicode
+/// noncharacter in a name or description. Refusing here, before anything is
+/// stored, exported or printed, keeps what this crate writes and what it reads
+/// back the same set of documents.
+///
+/// The bytes returned are the indented form the store has always held, so a
+/// certificate that passes is stored exactly as before.
+///
+/// # Errors
+///
+/// [`CanonicalError::Admission`] naming the fault when the reader would refuse
+/// the document, or [`CanonicalError::Proof`] if it does not serialize.
+pub fn encode_for_storage(document: &Value) -> Result<String> {
+    let rendered = serde_json::to_string_pretty(document)
+        .map_err(|e| CanonicalError::Proof(format!("certificate does not serialize: {e}")))?;
+    jcs::admit_document(rendered.as_bytes())?;
+    Ok(rendered)
+}
+
 /// Decode a certificate presented in a request header.
 ///
 /// Checks the size cap first, then base64, then admission. Does **not** verify —

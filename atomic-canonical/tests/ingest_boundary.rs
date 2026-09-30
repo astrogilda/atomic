@@ -249,3 +249,66 @@ fn load_for_delegate_skips_a_stored_document_with_a_repeated_member() {
         "the admissible certificate survives and the repeated member does not"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The writer holds the readers' profile
+// ---------------------------------------------------------------------------
+
+fn certificate_with(p: &Pair, max_changes: u64, description: Option<&str>) -> Value {
+    let mut scope = DelegationScope::builder()
+        .permission(atomic_identity::delegation::DelegationPermission::Record)
+        .project("acme/*")
+        .max_changes(max_changes);
+    if let Some(text) = description {
+        scope = scope.description(text);
+    }
+    let terms = Delegation::new(&p.human, &p.agent, scope.build());
+    delegation::mint(&p.human, &p.human_key, &terms)
+}
+
+/// The largest count the admission profile takes is stored, and it reads back
+/// through the same boundary every stored grant passes on the way in.
+#[test]
+fn the_largest_safe_count_is_stored_and_read_back() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = IdentityStore::open(root.path()).expect("open store");
+    let p = pair();
+    let doc = certificate_with(&p, 9_007_199_254_740_991, None);
+    let stored = delegation::encode_for_storage(&doc).expect("2^53 - 1 is a safe integer");
+    let parsed = delegation::parse(&doc).expect("parse the minted certificate");
+    store
+        .save_delegation(&parsed.id.to_base32(), &stored)
+        .expect("save");
+
+    let found = delegation::load_for_delegate(&store, &p.agent).expect("load");
+    assert_eq!(
+        found.len(),
+        1,
+        "a grant the writer stored is a grant the reader finds"
+    );
+}
+
+/// One past it. `mint` signs a `maxChanges` of 2^53 without complaint, and every
+/// reader of the store then refuses the document, so `load_for_delegate` finds
+/// nothing. The writer refuses it first, naming the same fault.
+#[test]
+fn a_count_the_readers_refuse_is_not_stored() {
+    let p = pair();
+    let doc = certificate_with(&p, 9_007_199_254_740_992, None);
+    match delegation::encode_for_storage(&doc) {
+        Err(CanonicalError::Admission(Admission::UnsafeInteger { .. })) => {}
+        other => panic!("expected an unsafe-integer refusal, got {other:?}"),
+    }
+}
+
+/// The same for text: a Unicode noncharacter in a description is signed by
+/// `mint` and refused by every reader, so the writer refuses it too.
+#[test]
+fn a_noncharacter_the_readers_refuse_is_not_stored() {
+    let p = pair();
+    let doc = certificate_with(&p, 64, Some("scratch \u{FDD0} lane"));
+    match delegation::encode_for_storage(&doc) {
+        Err(CanonicalError::Admission(Admission::StringNotScalar { .. })) => {}
+        other => panic!("expected a noncharacter refusal, got {other:?}"),
+    }
+}
