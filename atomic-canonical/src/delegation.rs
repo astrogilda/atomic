@@ -541,8 +541,8 @@ impl StoredDelegation {
 /// Certificates that fail admission or verification are **skipped**, not
 /// returned as errors. This is the one place a corrupt or foreign file in the
 /// store could otherwise take down every agent operation, and a certificate that
-/// does not verify has no authority to convey in any case. Each skip is logged
-/// at warn.
+/// does not verify has no authority to convey in any case. A skip is not
+/// logged: this crate has no logging dependency.
 ///
 /// Verification is self-contained — it uses the delegator key the certificate
 /// carries — so this works on a machine that holds only the agent's key.
