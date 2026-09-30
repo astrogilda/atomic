@@ -170,4 +170,19 @@ mod tests {
             "supplementary-plane keys must sort by UTF-16 code units"
         );
     }
+
+    /// `canonicalize` expects the delegate never to fail on a `Value`. That
+    /// holds because a `Value` cannot carry a number the delegate refuses to
+    /// format, and it holds only while `serde_json`'s `arbitrary_precision`
+    /// feature is off: with it on, a `Value` keeps `1e400` as text, the delegate
+    /// parses that text to infinity and returns an error, and the `expect`
+    /// panics on input anyone can supply. Features unify across the workspace,
+    /// so any dependency could turn it on. This fails the build the day one does.
+    #[test]
+    fn a_value_cannot_carry_a_number_the_delegate_refuses() {
+        assert!(
+            serde_json::from_str::<Value>("1e400").is_err(),
+            "serde_json's arbitrary_precision feature is on, so canonicalize can panic"
+        );
+    }
 }
