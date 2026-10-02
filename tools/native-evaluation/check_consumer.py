@@ -121,26 +121,34 @@ def main():
     selection_digest = sha(selection)
     outcomes = {}
 
-    def check(name, target=packet, selection_path=selection, pin=selection_digest):
+    def check(name, target=packet, selection_path=selection, pin=selection_digest, expected_reason=None):
         result = run([str(args.reader.resolve()), "verify", "--packet", str(target),
                       "--selection", str(selection_path), "--selection-sha256", pin,
                       "--output", str(output / (name + ".json"))], output, name, output)
         outcomes[name] = result.returncode
+        receipt = json_file(output / (name + ".json"))
+        if expected_reason is None:
+            require(result.returncode == 0 and receipt.get("accepted") is True,
+                    "positive consumer verification failed")
+        else:
+            require(result.returncode != 0 and receipt.get("accepted") is False
+                    and receipt.get("reason") == expected_reason,
+                    "consumer refusal did not establish the intended boundary: " + name)
 
     check("selected-native-run")
     changed = output / "changed-raw-packet"
     shutil.copytree(packet, changed)
     with (changed / "case-0.stdout").open("ab") as stream:
         stream.write(b"changed raw native bytes\n")
-    check("changed-raw-bytes", changed)
+    check("changed-raw-bytes", changed, expected_reason="artifact_pin_mismatch:case-0.stdout")
     shutil.rmtree(changed)
     widened = json_file(selection)
     widened["artifacts"]["unselected-extra-source"] = {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
     widened_path = output / "widened-inputs.json"
     widened_path.write_text(json.dumps(widened, indent=2) + "\n")
     # Refuse widening even when the caller re-pins the altered selection.
-    check("widened-selection", selection_path=widened_path, pin=sha(widened_path))
-    check("wrong-selection-digest", pin="0" * 64)
+    check("widened-selection", selection_path=widened_path, pin=sha(widened_path), expected_reason="artifact_population")
+    check("wrong-selection-digest", pin="0" * 64, expected_reason="selection_pin_mismatch")
     require(outcomes["selected-native-run"] == 0
             and all(value != 0 for key, value in outcomes.items() if key != "selected-native-run"),
             "consumer positive/refusal control failed")
