@@ -15,6 +15,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY = Path(__file__).with_name("consumer-policy.json")
+MAX_JSON = 8 * 1024 * 1024
+MAX_ARTIFACT = 256 * 1024 * 1024
 NATIVE_SOURCES = (
     "Cargo.lock", "atomic-canonical/tests/delegation_restart.rs",
     "tools/native-evaluation/run.py", "tools/native-evaluation/README.md",
@@ -23,12 +25,35 @@ NATIVE_SOURCES = (
 
 
 def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    require(path.is_file() and path.stat().st_size <= MAX_ARTIFACT, "artifact size or missing file")
+    value = hashlib.sha256()
+    total = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            total += len(block)
+            require(total <= MAX_ARTIFACT, "artifact exceeds consumer budget")
+            value.update(block)
+    return value.hexdigest()
 
 
 def require(condition, reason):
     if not condition:
         raise ValueError(reason)
+
+
+def bounded_bytes(path, limit):
+    require(path.is_file() and path.absolute() == path.resolve(), "missing or noncanonical source path")
+    require(path.stat().st_size <= limit, "input exceeds consumer budget")
+    with path.open("rb") as stream:
+        content = stream.read(limit + 1)
+    require(len(content) <= limit, "input exceeds consumer budget")
+    return content
+
+
+def json_file(path):
+    content = bounded_bytes(path, MAX_JSON)
+    require(bool(content), "empty JSON input")
+    return json.loads(content)
 
 
 def run(argv, output, name, cwd):
@@ -49,18 +74,20 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    output, packet = args.output.resolve(), args.packet.resolve()
+    output, packet = args.output.resolve(), args.packet.absolute()
+    require(packet == packet.resolve(), "packet path must be canonical")
     require(not output.is_relative_to(packet), "consumer output must be outside packet")
-    policy = json.loads(POLICY.read_text())
+    policy = json_file(POLICY)
     require(args.observer_source_commit == policy["observer_source_commit"], "observer source pin mismatch")
     actual_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
     require(args.expected_source == actual_head, "expected source differs from host checkout")
-    report = json.loads((packet / "report.json").read_text())
+    report = json_file(packet / "report.json")
     require(report["source"]["commit"] == actual_head and report["source"]["status"] == "",
             "native source is not the clean host checkout")
     require(report["schema"] == policy["expected_native_schema"], "native schema mismatch")
     for name in NATIVE_SOURCES:
-        require((packet / "source" / name).read_bytes() == (ROOT / name).read_bytes(),
+        expected = bounded_bytes(ROOT / name, MAX_JSON)
+        require(bounded_bytes(packet / "source" / name, len(expected)) == expected,
                 "native source snapshot differs from host checkout: " + name)
     # An isolated interpreter must resolve the reader from its installed wheel,
     # with no repository checkout or agent framework on its import path.
@@ -83,6 +110,7 @@ def main():
     described = run([str(args.reader.resolve()), "describe", "--packet", str(packet)],
                     output, "candidate-selection", output)
     require(described.returncode == 0, "reader candidate description failed")
+    require(0 < len(described.stdout) <= MAX_JSON, "candidate selection exceeds consumer budget")
     selected = json.loads(described.stdout)
     require(selected["source_commit"] == args.expected_source
             and selected["reader_sha256"] == policy["reader_sha256"], "candidate source/reader mismatch")
@@ -106,7 +134,7 @@ def main():
         stream.write(b"changed raw native bytes\n")
     check("changed-raw-bytes", changed)
     shutil.rmtree(changed)
-    widened = json.loads(selection.read_text())
+    widened = json_file(selection)
     widened["artifacts"]["unselected-extra-source"] = {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
     widened_path = output / "widened-selection.json"
     widened_path.write_text(json.dumps(widened, indent=2) + "\n")
