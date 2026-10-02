@@ -136,7 +136,7 @@ def main():
     shutil.rmtree(changed)
     widened = json_file(selection)
     widened["artifacts"]["unselected-extra-source"] = {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
-    widened_path = output / "widened-selection.json"
+    widened_path = output / "widened-inputs.json"
     widened_path.write_text(json.dumps(widened, indent=2) + "\n")
     # Refuse widening even when the caller re-pins the altered selection.
     check("widened-selection", selection_path=widened_path, pin=sha(widened_path))
