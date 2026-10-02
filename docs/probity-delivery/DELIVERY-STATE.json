@@ -1,7 +1,7 @@
 {
   "schema": "probity-atomic-delivery-state/v1",
   "scope": "Atomic contribution lane; full Probity program remains separately owned",
-  "updated_at": "2026-10-02T22:59:54.009518+00:00",
+  "updated_at": "2026-10-02T23:23:14.418029+00:00",
   "checkpoint_branch": "docs/probity-atomic-delivery-2026-10-02",
   "upstream_base": {
     "repository": "atomicdotdev/atomic",
@@ -160,7 +160,7 @@
     "archive_type": "author-assembled complete retention, not original provider CI ZIP"
   },
   "upstream_authentication": {
-    "state": "user configuring owned-fork Actions secret",
+    "state": "user confirms repository secret saved; activating hosted submission",
     "observed_error": "HTTP403 Resource not accessible by integration",
     "tested_clients": [
       "GitHub CLI GraphQL",
@@ -173,7 +173,9 @@
     "supplied_user_token_forwarded": false,
     "supplied_token_value_recorded": false,
     "supported_fallback": "GitHub-hosted on-push workflow uses encrypted ATOMIC_UPSTREAM_PAT repository secret; exact actor/scopes/heads checked before submission",
-    "secret_management_app_permission": false
+    "secret_management_app_permission": false,
+    "user_reports_secret_saved": true,
+    "fork_actions_enabled": "await actual run"
   },
   "claims": {
     "implementation": "published fork proposals and merged owned support work",

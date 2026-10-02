@@ -56,8 +56,8 @@
     {
       "id": "authentication",
       "owner": "user credential setup; Probity verifies effective access",
-      "state": "pending user Actions-secret setup",
-      "next": "user adds encrypted repository secret and enables fork Actions; trigger fixed publication workflow and verify actual upstream PR readback"
+      "state": "secret saved; submission workflow activation",
+      "next": "observe actual fork workflow and effective scopes, then read back upstream PRs"
     }
   ]
 }
