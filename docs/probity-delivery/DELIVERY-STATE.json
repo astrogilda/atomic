@@ -1,0 +1,226 @@
+{
+  "schema": "probity-atomic-delivery-state/v1",
+  "scope": "Atomic contribution lane; full Probity program remains separately owned",
+  "updated_at": "2026-10-02T22:59:54.009518+00:00",
+  "checkpoint_branch": "docs/probity-atomic-delivery-2026-10-02",
+  "upstream_base": {
+    "repository": "atomicdotdev/atomic",
+    "branch": "dev",
+    "sha": "35b4b9ad56dd6e6dd1e824f89dd3afe1cbf5cdbc"
+  },
+  "proposals": [
+    {
+      "lane": "criterion",
+      "branch": "feat/criterion-evidence-replay",
+      "head": "403130f8df9964081094f32f58a70d53f13e419c",
+      "fork_published": true,
+      "upstream_pr": null,
+      "local_tests": 2038,
+      "checks": "native integration, six replay controls, five installed Verify controls, source mutation/stale pins and strict selected Clippy passed"
+    },
+    {
+      "lane": "dsse",
+      "branch": "feat/provenance-dsse-export",
+      "head": "b8b7188ab1054841acb32411da9b30a13eb939f8",
+      "fork_published": true,
+      "upstream_pr": null,
+      "local_tests": {
+        "canonical": 169,
+        "doctests": 2,
+        "native_cli_python": 6,
+        "ordinary_compatibility": 5
+      },
+      "checks": "all dedicated feature workflow steps passed with RUSTFLAGS=-Dwarnings"
+    },
+    {
+      "lane": "native",
+      "branch": "test/native-authority-recovery",
+      "head": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
+      "fork_published": true,
+      "upstream_pr": null,
+      "historical_measurement_head": "80be8dae6feb8b9106181b78fba2c7c6a7c8f4d8",
+      "historical_workspace_tests": 9094,
+      "historical_workspace_failures": 0,
+      "native_cases": 4,
+      "worker_observations": 12,
+      "installed_consumer": {
+        "source": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
+        "observer_merge": "16d31f6ae1874389a6d5dc56e54997b88a7e2397",
+        "reader_sha256": "acb9f0dbc4efe7099f65d309e77f14b0521e3affca2f2765de6d6dcea366b6ff",
+        "native_report_sha256": "eafa89c35551be498db2c61b111b4af38d6ab7246f2b15f9451f2d3a3fb2e838",
+        "returncodes": {
+          "selected-native-run": 0,
+          "changed-raw-bytes": 1,
+          "widened-selection": 1,
+          "wrong-selection-digest": 1
+        },
+        "specific_refusal_reasons": {
+          "changed-raw-bytes": "artifact_pin_mismatch:case-0.stdout",
+          "widened-selection": "artifact_population",
+          "wrong-selection-digest": "selection_pin_mismatch"
+        },
+        "input_budget_controls": {
+          "passed": true,
+          "source_commit": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
+          "controls": {
+            "oversized-report": {
+              "returncode": 1,
+              "reason": "input exceeds consumer budget"
+            },
+            "oversized-source": {
+              "returncode": 1,
+              "reason": "input exceeds consumer budget"
+            },
+            "symlink-report": {
+              "returncode": 1,
+              "reason": "missing or noncanonical source path"
+            }
+          }
+        },
+        "checks": {
+          "canonical_tests": 170,
+          "doctests": 1,
+          "canonical_log": "/workspace/atomic-pr-delivery/native-host-reviewed-canonical.log",
+          "strict_cli_repository_clippy": true,
+          "clippy_log": "/workspace/atomic-pr-delivery/native-host-reviewed-clippy.log",
+          "format": true,
+          "diff": true
+        }
+      }
+    }
+  ],
+  "owned_delivery": {
+    "observer": {
+      "pr": 52,
+      "url": "https://github.com/probityai/agent-evidence-observer/pull/52",
+      "head": "e4f723a2f994770d1cb1036421d99c37aeb61c46",
+      "state": "MERGED",
+      "merge": "16d31f6ae1874389a6d5dc56e54997b88a7e2397",
+      "local_tests": 1242,
+      "reader_tests": 24,
+      "installed_acceptance": true,
+      "installed_refusal_controls": 7
+    },
+    "atlas": {
+      "pr": 18,
+      "url": "https://github.com/probityai/agent-evidence-atlas/pull/18",
+      "head": "0fa39264dc62d30489b4243ffa4d287c0d66a7fc",
+      "state": "MERGED",
+      "merge": "1bdfce81e3afff4ec1c18afdfe3c7d423b693198",
+      "local_tests": 174,
+      "baseline_records_preserved": 15,
+      "records_total": 16
+    },
+    "vocabulary": {
+      "pr": 12,
+      "url": "https://github.com/probityai/agent-evidence-vocabulary/pull/12",
+      "head": "b528fd0c89b2c8d9c09c0aac4e7b6f22ed58cbf8",
+      "state": "OPEN",
+      "green_checks": 12,
+      "blocking_requirement": "independent source evidence review under GOVERNANCE.md",
+      "second_agent_audit": "same-operator advisory, not independent review"
+    }
+  },
+  "hosted_runs": [
+    {
+      "id": 37073379879,
+      "name": "Installed Atomic native reader",
+      "head_sha": "e4f723a2f994770d1cb1036421d99c37aeb61c46",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/probityai/agent-evidence-observer/actions/runs/37073379879"
+    },
+    {
+      "id": 37073613309,
+      "name": "Installed Atomic native reader",
+      "head_sha": "16d31f6ae1874389a6d5dc56e54997b88a7e2397",
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/probityai/agent-evidence-observer/actions/runs/37073613309"
+    },
+    {
+      "id": 37073615314,
+      "name": "site",
+      "head_sha": "1bdfce81e3afff4ec1c18afdfe3c7d423b693198",
+      "event": "push",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/probityai/agent-evidence-atlas/actions/runs/37073615314"
+    }
+  ],
+  "original_retention": {
+    "native_source": "80be8dae6feb8b9106181b78fba2c7c6a7c8f4d8",
+    "report_sha256": "92b6cd64f85e7a87e8aee04bff128195e578acfd969170c231bbb1ac55f5f7c1",
+    "binary_sha256": "68bb01c3dffaf5fc6b9131ce22f330664b04c8f79f66d84150df6b8f8af33c",
+    "capsule_sha256": "ba31071e1f0a60644117e3f4c300b16b07bc75c58caf3a5259047054132c3719",
+    "capsule_bytes": 2126900,
+    "original_files": 19,
+    "archive_type": "author-assembled complete retention, not original provider CI ZIP"
+  },
+  "upstream_authentication": {
+    "state": "user configuring owned-fork Actions secret",
+    "observed_error": "HTTP403 Resource not accessible by integration",
+    "tested_clients": [
+      "GitHub CLI GraphQL",
+      "REST",
+      "connected GitHub app"
+    ],
+    "reason": "App user token has no observed Atomic organization installation",
+    "browser_available": false,
+    "credential_value_recorded": false,
+    "supplied_user_token_forwarded": false,
+    "supplied_token_value_recorded": false,
+    "supported_fallback": "GitHub-hosted on-push workflow uses encrypted ATOMIC_UPSTREAM_PAT repository secret; exact actor/scopes/heads checked before submission",
+    "secret_management_app_permission": false
+  },
+  "claims": {
+    "implementation": "published fork proposals and merged owned support work",
+    "probity_host_ci": "successful PR and main native reader workflows",
+    "upstream_host_ci": "not established for new proposals",
+    "producer_acceptance": "not established for new proposals",
+    "outside_recurring_adoption": "not established for new proposals",
+    "independent_effect_custody": "not established"
+  },
+  "preserved_ownership": {
+    "upstream": [
+      228,
+      230,
+      231,
+      207,
+      216,
+      224,
+      220,
+      221,
+      233
+    ],
+    "full_program": "other active session",
+    "vectors_release": "existing release/conformance owner"
+  },
+  "program_constraints": {
+    "allocation_percent": {
+      "capability_integration": 40,
+      "consumers_distribution": 25,
+      "review_closure": 20,
+      "research_records": 15
+    },
+    "targets": [
+      "2026-10-08",
+      "2026-10-31",
+      "2026-12-30"
+    ],
+    "exact_target_definitions": "unchanged in separately owned full-program records",
+    "targets_are_goals": true,
+    "seven_tracks_eight_components_five_tiers": "unchanged"
+  },
+  "provider_archive": {
+    "id": 11255672493,
+    "name": "atomic-native-reader",
+    "size_in_bytes": 2298239,
+    "digest": "sha256:1a632542c7ca5d623a59b0ac28a3e20aca8e1c10e0ba9010fabcfc799b324556",
+    "expired": false,
+    "download_locally_retained": false,
+    "download_error": "storage endpoint refused archive request"
+  }
+}

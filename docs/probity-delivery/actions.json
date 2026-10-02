@@ -1,0 +1,63 @@
+{
+  "schema": "probity-atomic-actions/v1",
+  "scope": "Atomic lane only",
+  "actions": [
+    {
+      "id": "atomic-criterion",
+      "owner": "Probity Atomic contribution lane",
+      "state": "implemented-verified-fork-published",
+      "branch": "feat/criterion-evidence-replay",
+      "next": "use authenticated user route to submit proper upstream PR; follow CI and maintainer review"
+    },
+    {
+      "id": "atomic-dsse",
+      "owner": "Probity Atomic contribution lane",
+      "state": "implemented-verified-fork-published",
+      "branch": "feat/provenance-dsse-export",
+      "next": "submit optional export PR and retain interoperability results; no native signature replacement"
+    },
+    {
+      "id": "atomic-native",
+      "owner": "Probity Atomic contribution lane",
+      "state": "implemented-verified-fork-published",
+      "branch": "test/native-authority-recovery",
+      "next": "submit proper upstream PR including installed consumer workflow; preserve original80 source measurement"
+    },
+    {
+      "id": "observer52",
+      "owner": "Probity",
+      "state": "merged-main-workflow-passed",
+      "next": "retain exact installed reader pin; package release remains separately coordinated"
+    },
+    {
+      "id": "atlas18",
+      "owner": "Probity",
+      "state": "merged-main-site-passed",
+      "next": "preserve original packet and all fifteen prior records; add subsequent independently operated result only when established"
+    },
+    {
+      "id": "vocabulary12",
+      "owner": "independent conflict-free source reviewer required",
+      "state": "review-ready-checks-green-review-blocked",
+      "next": "obtain actual independent evidence review; do not bypass GOVERNANCE.md"
+    },
+    {
+      "id": "vectors228",
+      "owner": "existing corpus/release owner and Atomic maintainers",
+      "state": "open-green-existing-owner",
+      "next": "preserve owner; normal maintainer merge, no duplicate corpus contribution"
+    },
+    {
+      "id": "admission-consumer",
+      "owner": "not yet assigned to a named downstream deployment host",
+      "state": "conditional",
+      "next": "identify real deployment decision and authenticated evidence contract before implementation/adoption claims"
+    },
+    {
+      "id": "authentication",
+      "owner": "user credential setup; Probity verifies effective access",
+      "state": "pending user Actions-secret setup",
+      "next": "user adds encrypted repository secret and enables fork Actions; trigger fixed publication workflow and verify actual upstream PR readback"
+    }
+  ]
+}
