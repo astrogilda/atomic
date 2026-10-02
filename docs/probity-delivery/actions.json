@@ -5,29 +5,32 @@
     {
       "id": "atomic-criterion",
       "owner": "Probity Atomic contribution lane",
-      "state": "upstream PR open; CI running",
+      "state": "upstream PR open; seven of eight current-head checks green; Windows pending",
       "branch": "feat/criterion-evidence-replay",
-      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "next": "observe the single fresh normal CI attempt; if inherited Windows owner failure repeats, preserve active owner investigation; respond to actual review requests",
       "pr": 234,
-      "url": "https://github.com/atomicdotdev/atomic/pull/234"
+      "url": "https://github.com/atomicdotdev/atomic/pull/234",
+      "head": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6"
     },
     {
       "id": "atomic-dsse",
       "owner": "Probity Atomic contribution lane",
-      "state": "upstream PR open; CI running",
+      "state": "upstream PR open; all nine hosted checks green; awaiting maintainer review",
       "branch": "feat/provenance-dsse-export",
-      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "next": "resolve actual maintainer requests; Atomic holds upstream protected merge authority; track repeated use separately",
       "pr": 235,
-      "url": "https://github.com/atomicdotdev/atomic/pull/235"
+      "url": "https://github.com/atomicdotdev/atomic/pull/235",
+      "head": "b8b7188ab1054841acb32411da9b30a13eb939f8"
     },
     {
       "id": "atomic-native",
       "owner": "Probity Atomic contribution lane",
-      "state": "upstream PR open; CI running",
+      "state": "upstream PR open; all nine hosted checks green; awaiting maintainer review",
       "branch": "test/native-authority-recovery",
-      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "next": "resolve actual maintainer requests; Atomic holds upstream protected merge authority; track repeated use separately",
       "pr": 236,
-      "url": "https://github.com/atomicdotdev/atomic/pull/236"
+      "url": "https://github.com/atomicdotdev/atomic/pull/236",
+      "head": "a3dd51519b350fb3b863248d0cb45a4c68e93407"
     },
     {
       "id": "observer52",
@@ -64,6 +67,14 @@
       "owner": "user credential setup; Probity verifies effective access",
       "state": "hosted submission succeeded; one-shot active helper archived",
       "next": "user revokes temporary credential and removes repository Actions secret; future PR maintenance uses normal source pushes"
+    },
+    {
+      "id": "windows-owner-survey237",
+      "owner": "vinceblock99",
+      "state": "temporary upstream survey; explicitly do not merge",
+      "pr": 237,
+      "head": "dcbc068517f83b514757633a289f3d25592fa6a7",
+      "next": "preserve existing owner; do not duplicate survey, alter database lifecycle or merge temporary survey"
     }
   ]
 }

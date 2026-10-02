@@ -21,50 +21,56 @@ requests, preserving existing owners. Atomic's maintainers hold merge authority.
 The following submission instructions and inactive workflow template preserve
 the route for a fresh session; they are not instructions to submit these again.
 
-The `proposals/` directory retains review-ready descriptions. Once a usable
-credential is available, first verify its effective GitHub identity and public
-contribution access through the approved transport. Do not expose credentials in
-logs, commit them or bypass the network configuration.
+### Windows result and bounded followup
 
-Create each PR in `atomicdotdev/atomic` with base `dev` and the corresponding
-head `astrogilda:<branch>`. Refresh existing PRs first to prevent duplicates.
-Set maintainer modification permission and preserve the bounded descriptions.
-Follow actual CI and maintainer review; opening a PR is not completed adoption.
-Normal upstream merge authority belongs to Atomic's maintainers.
+The first #234 run at `403130f8df9964081094f32f58a70d53f13e419c` passed seven
+checks but failed the existing Windows database-owner concurrency test:
+`concurrent_stops_publish_ordered_ledgers_without_external_serialization`.
+Prompt dispatch timed out waiting for the owner to become healthy. The test and
+owner implementation were byte-unchanged from base; all Windows CLI unit tests
+passed. A direct failed-job rerun was refused with HTTP403.
 
-### Supported hosted submission route
+The documentation-only followup
+`814c9aa5d77f07836a935acf216f7f2cfb2bdfd6` clarifies POSIX wrapper support,
+Linux installed-checker results, macOS native integration and the lack of a
+packaged Windows checker wrapper. Its ordinary PR synchronize event starts one
+fresh full CI attempt. It does not claim to fix the owner failure. Keep the old
+failure and new results separate. If the owner failure repeats, preserve the
+active investigation rather than weaken checks or repeatedly reroll CI.
 
-The current managed transport continued using App authentication when a user
-credential was supplied, refusing the criterion and DSSE submissions. The
-secret value is not recorded here. The owned fork's App access also lacks
-repository secret management permission.
+`vinceblock99` owns temporary Windows survey #237 at
+`dcbc068517f83b514757633a289f3d25592fa6a7`, based on #207 and marked do-not-merge.
+That survey does not change our PRs and must not be merged or duplicated by this
+lane. The exact failure log digest and subsequent CI state are retained in
+`DELIVERY-STATE.json`.
 
-The user can add an encrypted repository Actions secret named
-`ATOMIC_UPSTREAM_PAT` through
-[the fork's secret settings](https://github.com/astrogilda/atomic/settings/secrets/actions/new)
-and enable workflows through
-[the fork's Actions tab](https://github.com/astrogilda/atomic/actions).
-Add the secret before queuing the job. Once the user confirms configuration,
-publish the prepared `submit-probity-atomic-prs.yml` workflow on this checkpoint
-branch and make a normal fast-forward push to trigger it. No default-branch
-merge or GitHub App installation in Atomic is required for that trigger.
+The `proposals/` directory retains the submitted descriptions. Do not reopen
+these PRs or reactivate submission merely because a fresh environment has limited
+access. The normal next step is CI and maintainer review on the existing PRs.
 
-The fixed submission helper checks effective user/scopes, all three published
-head SHAs, existing PRs and returned upstream head/base before recording URLs.
-It creates only the three listed review-ready PRs and does not request merges.
-Its credential is available only to that API step. Observe the actual run and
-upstream PRs; a prepared workflow is not a submitted PR. Partial progress is
-safe to resume because each lane checks for an existing matching PR first.
+### Completed hosted submission route
 
-The active workflow has been removed after its successful one-shot execution.
-Its reviewed inactive template remains at
-`docs/probity-delivery/submit-probity-atomic-prs.yml`.
+Direct managed requests historically used App authentication even when a user
+credential was supplied. The user configured the encrypted owned-fork Actions
+secret `ATOMIC_UPSTREAM_PAT`; the restricted hosted submission run37077337708
+succeeded, verified the exact heads and base, and created #234/#235/#236 with
+maintainer modifications enabled. The credential value is not recorded here.
 
-`python3 docs/probity-delivery/submit_prs.py` prints an offline plan.
-`--execute` requires the user secret and runs the requests. If hosted submission
-is unavailable, `comparison-links.json` contains prefilled GitHub browser forms.
-After submission, revoke the temporary credential and remove the temporary
-Actions secret through the user's settings.
+The active workflow was removed after its successful one-shot execution. Its
+reviewed inactive template remains at
+`docs/probity-delivery/submit-probity-atomic-prs.yml`. No credential is needed for
+normal source pushes through the existing owned-fork access. User revocation of
+the temporary token and deletion of its repository Actions secret are recommended
+cleanup steps; completion has not been confirmed. The inactive helper and
+`comparison-links.json` retain historical fallback preparation, not outstanding
+submission work.
+
+DSSE #235 and native #236 each passed all nine actual hosted checks, including
+all three operating systems and their dedicated consumer jobs. They are open,
+mergeable and have no reviews or comments at this checkpoint. The author has
+read access but no upstream push, maintain or admin authority. Atomic maintainers
+hold the next review and protected merge decision; green CI is separate from
+acceptance, merging and recurring adoption.
 
 Existing owner boundaries remain: #228 owns the canonical corpus job; #230/#231
 own publication/database work; #207/#216 own the bridge and its failure harness;

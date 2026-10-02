@@ -46,8 +46,11 @@ publication is not maintainer acceptance or completed adoption.
 The one-shot active submission workflow is removed after successful use; its
 reviewed inactive template remains in this checkpoint directory. The temporary
 token and encrypted repository secret can now be revoked/removed by the user.
-Standard multi-platform tests are still being monitored; exact hosted results
-are in the state file. The author has no upstream push, maintain or admin
+DSSE #235 and native #236 each passed all nine hosted checks, including the
+Linux, macOS and Windows workspace tests. Criterion #234 at its current head
+passed seven checks; its Windows job is still being monitored. The prior Windows
+owner-startup failure and the single fresh attempt are recorded separately in
+the state file. The author has no upstream push, maintain or admin
 permission, so final upstream review and protected merge belong to Atomic.
 
 ## Scope and next boundary

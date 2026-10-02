@@ -1,7 +1,7 @@
 {
   "schema": "probity-atomic-delivery-state/v1",
   "scope": "Atomic contribution lane; full Probity program remains separately owned",
-  "updated_at": "2026-10-02T23:31:21.184175+00:00",
+  "updated_at": "2026-10-02T23:53:00.142523+00:00",
   "checkpoint_branch": "docs/probity-atomic-delivery-2026-10-02",
   "upstream_base": {
     "repository": "atomicdotdev/atomic",
@@ -12,7 +12,7 @@
     {
       "lane": "criterion",
       "branch": "feat/criterion-evidence-replay",
-      "head": "403130f8df9964081094f32f58a70d53f13e419c",
+      "head": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6",
       "fork_published": true,
       "upstream_pr": 234,
       "local_tests": 2038,
@@ -21,7 +21,7 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:34:12.168575+00:00",
+        "observed_at": "2026-10-02T23:52:59.958929+00:00",
         "passed": [
           "Check",
           "Test (ubuntu-latest)",
@@ -38,7 +38,116 @@
         "reviews": 0,
         "comments": 0,
         "mergeable": "MERGEABLE",
-        "maintainer_can_modify": true
+        "merge_state": "UNSTABLE",
+        "maintainer_can_modify": true,
+        "check_details": [
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:43:35Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758522",
+            "name": "Check",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:49:32Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758546",
+            "name": "Test (ubuntu-latest)",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:48:59Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758633",
+            "name": "Test (macos-latest)",
+            "startedAt": "2026-10-02T23:43:01Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "0001-01-01T00:00:00Z",
+            "conclusion": "",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758627",
+            "name": "Test (windows-latest)",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "IN_PROGRESS",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:43:13Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758552",
+            "name": "Format",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:43:36Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758622",
+            "name": "Clippy",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:43:35Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758647",
+            "name": "Documentation",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:43:32Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758562",
+            "name": "Minimum Supported Rust Version",
+            "startedAt": "2026-10-02T23:42:57Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          }
+        ]
+      },
+      "local_test_source": "403130f8df9964081094f32f58a70d53f13e419c",
+      "doc_followup": {
+        "head": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6",
+        "code_changed": false,
+        "purpose": "clarify actual optional-checker platform coverage and trigger one fresh normal CI attempt",
+        "failure_not_claimed_fixed": true
+      },
+      "prior_hosted_ci_failure": {
+        "head": "403130f8df9964081094f32f58a70d53f13e419c",
+        "run": 37077352667,
+        "job": 111070098731,
+        "platform": "Windows",
+        "test": "concurrent_stops_publish_ordered_ledgers_without_external_serialization",
+        "source": "atomic-cli/tests/database_owner_integration_test.rs:90",
+        "reason": "database owner did not become healthy before timeout",
+        "owner_code_unchanged_from_base": true,
+        "log_bytes": 588182,
+        "log_sha256": "204f519c2a94eb8a86bb97feeba57a4560e5c3577f6ae71691830e36332fadb1",
+        "direct_rerun_refused": "HTTP403 Resource not accessible by integration",
+        "owner_survey": {
+          "pr": 237,
+          "head": "dcbc068517f83b514757633a289f3d25592fa6a7",
+          "owner": "vinceblock99",
+          "state": "temporary do-not-merge Windows survey; preserve owner"
+        }
       }
     },
     {
@@ -58,25 +167,117 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:34:12.943555+00:00",
+        "observed_at": "2026-10-02T23:53:00.141733+00:00",
         "passed": [
           "Check",
           "export-consumer",
           "Test (ubuntu-latest)",
+          "Test (macos-latest)",
+          "Test (windows-latest)",
           "Format",
           "Clippy",
           "Documentation",
           "Minimum Supported Rust Version"
         ],
-        "pending": [
-          "Test (macos-latest)",
-          "Test (windows-latest)"
-        ],
+        "pending": [],
         "failed": [],
         "reviews": 0,
         "comments": 0,
         "mergeable": "MERGEABLE",
-        "maintainer_can_modify": true
+        "merge_state": "CLEAN",
+        "maintainer_can_modify": true,
+        "check_details": [
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:26:27Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103046",
+            "name": "Check",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:29:28Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354459/job/111070103466",
+            "name": "export-consumer",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "Provenance DSSE interoperability"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:31:14Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103290",
+            "name": "Test (ubuntu-latest)",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:35:08Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103265",
+            "name": "Test (macos-latest)",
+            "startedAt": "2026-10-02T23:23:47Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:46:01Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103275",
+            "name": "Test (windows-latest)",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:23:56Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103223",
+            "name": "Format",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:25:53Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103250",
+            "name": "Clippy",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:26:21Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103270",
+            "name": "Documentation",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:26:23Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407/job/111070103462",
+            "name": "Minimum Supported Rust Version",
+            "startedAt": "2026-10-02T23:23:39Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          }
+        ]
       }
     },
     {
@@ -138,25 +339,117 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:34:13.628897+00:00",
+        "observed_at": "2026-10-02T23:52:59.979402+00:00",
         "passed": [
           "Check",
           "native-delegation-consumer",
           "Test (ubuntu-latest)",
           "Test (macos-latest)",
+          "Test (windows-latest)",
           "Format",
           "Clippy",
           "Documentation",
           "Minimum Supported Rust Version"
         ],
-        "pending": [
-          "Test (windows-latest)"
-        ],
+        "pending": [],
         "failed": [],
         "reviews": 0,
         "comments": 0,
         "mergeable": "MERGEABLE",
-        "maintainer_can_modify": true
+        "merge_state": "CLEAN",
+        "maintainer_can_modify": true,
+        "check_details": [
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:25:52Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112832",
+            "name": "Check",
+            "startedAt": "2026-10-02T23:23:42Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:24:38Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357335/job/111070112473",
+            "name": "native-delegation-consumer",
+            "startedAt": "2026-10-02T23:23:41Z",
+            "status": "COMPLETED",
+            "workflowName": "Native delegation consumer"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:33:09Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112887",
+            "name": "Test (ubuntu-latest)",
+            "startedAt": "2026-10-02T23:23:42Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:33:42Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112871",
+            "name": "Test (macos-latest)",
+            "startedAt": "2026-10-02T23:23:46Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:46:29Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112758",
+            "name": "Test (windows-latest)",
+            "startedAt": "2026-10-02T23:23:42Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:23:59Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112842",
+            "name": "Format",
+            "startedAt": "2026-10-02T23:23:42Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:26:29Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112759",
+            "name": "Clippy",
+            "startedAt": "2026-10-02T23:23:41Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:26:19Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112585",
+            "name": "Documentation",
+            "startedAt": "2026-10-02T23:23:41Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          },
+          {
+            "__typename": "CheckRun",
+            "completedAt": "2026-10-02T23:25:32Z",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363/job/111070112856",
+            "name": "Minimum Supported Rust Version",
+            "startedAt": "2026-10-02T23:23:42Z",
+            "status": "COMPLETED",
+            "workflowName": "CI"
+          }
+        ]
       }
     }
   ],
@@ -237,6 +530,33 @@
       "status": "completed",
       "conclusion": "success",
       "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37077354459"
+    },
+    {
+      "id": 37077354407,
+      "name": "CI",
+      "head_sha": "b8b7188ab1054841acb32411da9b30a13eb939f8",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37077354407"
+    },
+    {
+      "id": 37077357363,
+      "name": "CI",
+      "head_sha": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37077357363"
+    },
+    {
+      "id": 37078868661,
+      "name": "CI",
+      "head_sha": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6",
+      "event": "pull_request",
+      "status": "in_progress",
+      "conclusion": null,
+      "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661"
     }
   ],
   "original_retention": {
@@ -275,7 +595,7 @@
   "claims": {
     "implementation": "three actual review-ready upstream PRs, published fork sources and merged owned support work",
     "probity_host_ci": "successful PR and main native reader workflows",
-    "upstream_host_ci": "Dedicated native-delegation consumer and DSSE export interoperability workflows passed; three-platform full-workspace tests are being monitored",
+    "upstream_host_ci": "DSSE and native each passed all nine hosted checks, including all three OS workspace jobs and dedicated consumer jobs. Criterion current814 head has seven green checks and Windows pending; prior403 Windows failure remains historical.",
     "producer_acceptance": "not established for new proposals",
     "outside_recurring_adoption": "not established for new proposals",
     "independent_effect_custody": "not established"
@@ -290,7 +610,8 @@
       224,
       220,
       221,
-      233
+      233,
+      237
     ],
     "full_program": "other active session",
     "vectors_release": "existing release/conformance owner"
