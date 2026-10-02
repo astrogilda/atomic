@@ -14,6 +14,14 @@ an absence claim needs the adapter's declared coverage. Inspect the returned
 
 ## Try the bounded source-coverage example
 
+These commands use a POSIX shell and an executable Python wrapper with a
+shebang. The installed Python checker recipe was exercised on Linux; the native
+replay integration tests also passed hosted macOS. Windows native context unit
+tests passed, but this example supplies no packaged Windows checker wrapper.
+On Windows, select a local executable implementing the protocol below. A checker
+that cannot start, fails, or returns an invalid response remains
+`not_established`; it cannot make validation pass.
+
 Use a dedicated Python environment for the optional checker. The pinned Verify
 revision below implements the four claim adapters listed later in this document:
 
