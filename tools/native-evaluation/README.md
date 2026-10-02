@@ -36,3 +36,25 @@ retains a complete evaluation bundle using the same runner. A build failure or
 timeout produces a failed report and preserved logs; it cannot count as a passed
 native run. The helper test is ignored by the normal test runner and invoked only
 by process-level cases.
+
+## Installed offline consumer
+
+The separate `Native delegation consumer` workflow produces a fresh packet from
+the actual Atomic checkout, builds Observer's wheel from immutable reviewed
+source `16d31f6ae1874389a6d5dc56e54997b88a7e2397`, and installs it in a clean
+environment. The host selector checks the checkout commit, exact source/lockfile
+bytes and pinned installed reader before accepting the candidate selection.
+Selection policy and receipts remain outside the producer packet. The reader
+does not execute the retained binary or rerun Atomic.
+
+`check_consumer.py --help` lists explicit packet, source, wheel, installed-reader
+and output arguments. `consumer-policy.json` pins the reviewed reader outside
+the packet. The selector invokes the reader's documented `describe` and `verify`
+commands, including a separately pinned selection digest. It retains positive
+verification and refusal controls for changed raw logs, a newly pinned wider
+selection and an incorrect selection digest.
+
+This is a runnable proposed Atomic-host consumer integration. A local success
+does not establish maintainer acceptance, completed upstream CI, recurring
+outside adoption or independent operation. The source test population and local
+key/clock/store limitations above continue to apply.
