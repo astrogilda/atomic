@@ -879,6 +879,12 @@ pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliRes
     if args.id_or_path.ends_with(".md") || args.id_or_path.contains('/') {
         return Ok(false);
     }
+    // Evidence replay executes a locally selected checker and reads native
+    // pins; the wire validates the stored entity only. Never let the service
+    // path silently discard these opt-in flags.
+    if args.evidence_context || args.replay_evidence.is_some() {
+        return Ok(false);
+    }
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
