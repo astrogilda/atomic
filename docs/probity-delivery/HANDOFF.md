@@ -9,7 +9,17 @@ The full private Probity execution branch remains owned by the other active
 program session. This isolated checkpoint records public Atomic work without
 editing that owner's entrypoint, action register or implementation branches.
 
-## Submit the implemented proposals
+## Shepherd the published proposals
+
+Actual upstream PRs are #234 (criterion replay), #235 (DSSE export) and #236
+(native evaluation and installed consumer), all review-ready with maintainer
+modifications enabled. The hosted submission run37077337708 succeeded after the
+user saved the encrypted Actions secret. Refresh those PRs and their current
+heads first; do not create duplicates. Resolve actual CI failures and review
+requests, preserving existing owners. Atomic's maintainers hold merge authority.
+
+The following submission instructions and inactive workflow template preserve
+the route for a fresh session; they are not instructions to submit these again.
 
 The `proposals/` directory retains review-ready descriptions. Once a usable
 credential is available, first verify its effective GitHub identity and public
@@ -45,6 +55,10 @@ It creates only the three listed review-ready PRs and does not request merges.
 Its credential is available only to that API step. Observe the actual run and
 upstream PRs; a prepared workflow is not a submitted PR. Partial progress is
 safe to resume because each lane checks for an existing matching PR first.
+
+The active workflow has been removed after its successful one-shot execution.
+Its reviewed inactive template remains at
+`docs/probity-delivery/submit-probity-atomic-prs.yml`.
 
 `python3 docs/probity-delivery/submit_prs.py` prints an offline plan.
 `--execute` requires the user secret and runs the requests. If hosted submission

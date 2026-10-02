@@ -5,23 +5,29 @@
     {
       "id": "atomic-criterion",
       "owner": "Probity Atomic contribution lane",
-      "state": "implemented-verified-fork-published",
+      "state": "upstream PR open; CI running",
       "branch": "feat/criterion-evidence-replay",
-      "next": "use authenticated user route to submit proper upstream PR; follow CI and maintainer review"
+      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "pr": 234,
+      "url": "https://github.com/atomicdotdev/atomic/pull/234"
     },
     {
       "id": "atomic-dsse",
       "owner": "Probity Atomic contribution lane",
-      "state": "implemented-verified-fork-published",
+      "state": "upstream PR open; CI running",
       "branch": "feat/provenance-dsse-export",
-      "next": "submit optional export PR and retain interoperability results; no native signature replacement"
+      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "pr": 235,
+      "url": "https://github.com/atomicdotdev/atomic/pull/235"
     },
     {
       "id": "atomic-native",
       "owner": "Probity Atomic contribution lane",
-      "state": "implemented-verified-fork-published",
+      "state": "upstream PR open; CI running",
       "branch": "test/native-authority-recovery",
-      "next": "submit proper upstream PR including installed consumer workflow; preserve original80 source measurement"
+      "next": "resolve actual CI failures/reviews; Atomic maintainer approval and protected merge remain separate",
+      "pr": 236,
+      "url": "https://github.com/atomicdotdev/atomic/pull/236"
     },
     {
       "id": "observer52",
@@ -56,8 +62,8 @@
     {
       "id": "authentication",
       "owner": "user credential setup; Probity verifies effective access",
-      "state": "secret saved; submission workflow activation",
-      "next": "observe actual fork workflow and effective scopes, then read back upstream PRs"
+      "state": "hosted submission succeeded; one-shot active helper archived",
+      "next": "user revokes temporary credential and removes repository Actions secret; future PR maintenance uses normal source pushes"
     }
   ]
 }

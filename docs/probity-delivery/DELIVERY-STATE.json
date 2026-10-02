@@ -1,7 +1,7 @@
 {
   "schema": "probity-atomic-delivery-state/v1",
   "scope": "Atomic contribution lane; full Probity program remains separately owned",
-  "updated_at": "2026-10-02T23:23:14.418029+00:00",
+  "updated_at": "2026-10-02T23:31:21.184175+00:00",
   "checkpoint_branch": "docs/probity-atomic-delivery-2026-10-02",
   "upstream_base": {
     "repository": "atomicdotdev/atomic",
@@ -14,30 +14,77 @@
       "branch": "feat/criterion-evidence-replay",
       "head": "403130f8df9964081094f32f58a70d53f13e419c",
       "fork_published": true,
-      "upstream_pr": null,
+      "upstream_pr": 234,
       "local_tests": 2038,
-      "checks": "native integration, six replay controls, five installed Verify controls, source mutation/stale pins and strict selected Clippy passed"
+      "checks": "native integration, six replay controls, five installed Verify controls, source mutation/stale pins and strict selected Clippy passed",
+      "upstream_url": "https://github.com/atomicdotdev/atomic/pull/234",
+      "upstream_state": "OPEN",
+      "maintainer_can_modify": true,
+      "hosted_ci_observation": {
+        "observed_at": "2026-10-02T23:34:12.168575+00:00",
+        "passed": [
+          "Check",
+          "Test (ubuntu-latest)",
+          "Test (macos-latest)",
+          "Format",
+          "Clippy",
+          "Documentation",
+          "Minimum Supported Rust Version"
+        ],
+        "pending": [
+          "Test (windows-latest)"
+        ],
+        "failed": [],
+        "reviews": 0,
+        "comments": 0,
+        "mergeable": "MERGEABLE",
+        "maintainer_can_modify": true
+      }
     },
     {
       "lane": "dsse",
       "branch": "feat/provenance-dsse-export",
       "head": "b8b7188ab1054841acb32411da9b30a13eb939f8",
       "fork_published": true,
-      "upstream_pr": null,
+      "upstream_pr": 235,
       "local_tests": {
         "canonical": 169,
         "doctests": 2,
         "native_cli_python": 6,
         "ordinary_compatibility": 5
       },
-      "checks": "all dedicated feature workflow steps passed with RUSTFLAGS=-Dwarnings"
+      "checks": "all dedicated feature workflow steps passed with RUSTFLAGS=-Dwarnings",
+      "upstream_url": "https://github.com/atomicdotdev/atomic/pull/235",
+      "upstream_state": "OPEN",
+      "maintainer_can_modify": true,
+      "hosted_ci_observation": {
+        "observed_at": "2026-10-02T23:34:12.943555+00:00",
+        "passed": [
+          "Check",
+          "export-consumer",
+          "Test (ubuntu-latest)",
+          "Format",
+          "Clippy",
+          "Documentation",
+          "Minimum Supported Rust Version"
+        ],
+        "pending": [
+          "Test (macos-latest)",
+          "Test (windows-latest)"
+        ],
+        "failed": [],
+        "reviews": 0,
+        "comments": 0,
+        "mergeable": "MERGEABLE",
+        "maintainer_can_modify": true
+      }
     },
     {
       "lane": "native",
       "branch": "test/native-authority-recovery",
       "head": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
       "fork_published": true,
-      "upstream_pr": null,
+      "upstream_pr": 236,
       "historical_measurement_head": "80be8dae6feb8b9106181b78fba2c7c6a7c8f4d8",
       "historical_workspace_tests": 9094,
       "historical_workspace_failures": 0,
@@ -86,6 +133,30 @@
           "format": true,
           "diff": true
         }
+      },
+      "upstream_url": "https://github.com/atomicdotdev/atomic/pull/236",
+      "upstream_state": "OPEN",
+      "maintainer_can_modify": true,
+      "hosted_ci_observation": {
+        "observed_at": "2026-10-02T23:34:13.628897+00:00",
+        "passed": [
+          "Check",
+          "native-delegation-consumer",
+          "Test (ubuntu-latest)",
+          "Test (macos-latest)",
+          "Format",
+          "Clippy",
+          "Documentation",
+          "Minimum Supported Rust Version"
+        ],
+        "pending": [
+          "Test (windows-latest)"
+        ],
+        "failed": [],
+        "reviews": 0,
+        "comments": 0,
+        "mergeable": "MERGEABLE",
+        "maintainer_can_modify": true
       }
     }
   ],
@@ -148,6 +219,24 @@
       "status": "completed",
       "conclusion": "success",
       "html_url": "https://github.com/probityai/agent-evidence-atlas/actions/runs/37073615314"
+    },
+    {
+      "id": 37077357335,
+      "name": "Native delegation consumer",
+      "head_sha": "a3dd51519b350fb3b863248d0cb45a4c68e93407",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37077357335"
+    },
+    {
+      "id": 37077354459,
+      "name": "Provenance DSSE interoperability",
+      "head_sha": "b8b7188ab1054841acb32411da9b30a13eb939f8",
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37077354459"
     }
   ],
   "original_retention": {
@@ -160,7 +249,7 @@
     "archive_type": "author-assembled complete retention, not original provider CI ZIP"
   },
   "upstream_authentication": {
-    "state": "user confirms repository secret saved; activating hosted submission",
+    "state": "hosted submission succeeded",
     "observed_error": "HTTP403 Resource not accessible by integration",
     "tested_clients": [
       "GitHub CLI GraphQL",
@@ -170,17 +259,23 @@
     "reason": "App user token has no observed Atomic organization installation",
     "browser_available": false,
     "credential_value_recorded": false,
-    "supplied_user_token_forwarded": false,
     "supplied_token_value_recorded": false,
     "supported_fallback": "GitHub-hosted on-push workflow uses encrypted ATOMIC_UPSTREAM_PAT repository secret; exact actor/scopes/heads checked before submission",
     "secret_management_app_permission": false,
     "user_reports_secret_saved": true,
-    "fork_actions_enabled": "await actual run"
+    "fork_actions_enabled": true,
+    "submission_run": 37077337708,
+    "submission_head": "3b357232ee832994c7fcdd8cbd63c32cf3cffe9f",
+    "submission_conclusion": "success",
+    "credential_cleanup": "user revoke temporary token and remove repository Actions secret after submission",
+    "direct_managed_transport": "historical failure; effective authentication remained App",
+    "hosted_user_authentication_verified": true,
+    "direct_managed_transport_user_token_forwarded": false
   },
   "claims": {
-    "implementation": "published fork proposals and merged owned support work",
+    "implementation": "three actual review-ready upstream PRs, published fork sources and merged owned support work",
     "probity_host_ci": "successful PR and main native reader workflows",
-    "upstream_host_ci": "not established for new proposals",
+    "upstream_host_ci": "Dedicated native-delegation consumer and DSSE export interoperability workflows passed; three-platform full-workspace tests are being monitored",
     "producer_acceptance": "not established for new proposals",
     "outside_recurring_adoption": "not established for new proposals",
     "independent_effect_custody": "not established"
@@ -224,5 +319,24 @@
     "expired": false,
     "download_locally_retained": false,
     "download_error": "storage endpoint refused archive request"
-  }
+  },
+  "native_upstream_artifacts": [
+    {
+      "id": 11256704346,
+      "name": "atomic-native-consumer-d6c2fedb74047139c6c28ac7238650321ca44127",
+      "size_in_bytes": 2299358,
+      "digest": "sha256:e01be26ec835533368d5cab59b77218b5bb6318f44b61ab550aca7247575238b",
+      "expired": false,
+      "archive_locally_retained": false,
+      "capture_note": "Artifact name includes GitHub PR merge checkout SHA; do not relabel original80 source or local final-head packet as this hosted run."
+    }
+  ],
+  "upstream_merge_authority": {
+    "actor": "astrogilda",
+    "admin": false,
+    "maintain": false,
+    "push": false,
+    "next": "Atomic maintainers review and merge through protections"
+  },
+  "active_submission_workflow": "removed in this checkpoint tree after successful one-shot use; inactive template retained"
 }

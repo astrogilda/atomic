@@ -24,22 +24,31 @@ installed consumer and merged support records have since been delivered.
   is review-ready with twelve checks green. Its source-only crosswalk needs the
   independent evidence review required by its governance before merge.
 
-## Atomic proposals
+## Published Atomic PRs
 
 Three implemented proposals are published on `astrogilda/atomic`, based on
 Atomic `dev` at `35b4b9ad56dd6e6dd1e824f89dd3afe1cbf5cdbc`:
 
-| Branch | User-facing change | Verification |
+| PR / branch | User-facing change | Verification |
 | --- | --- | --- |
-| `feat/criterion-evidence-replay` | Optional native intent evidence replay with an explicitly selected local checker and an installed Verify recipe | 2,038 CLI tests, native signed-intent integration, stale/mutation controls, installed checker controls and strict Clippy passed |
-| `feat/provenance-dsse-export` | Optional exporter-signed provenance container and offline pinned-key reader | 169 canonical tests, two doctests, six actual CLI/Python tests, five ordinary compatibility tests and strict feature Clippy passed |
-| `test/native-authority-recovery` | Four native local delegation cases across process restarts, retained executable/results and an installed-reader workflow | Original run: four cases and twelve worker observations. Full workspace on the retained source: 9,094 tests passed. Subsequent source checks are separately pinned in the state file |
+| [#234](https://github.com/atomicdotdev/atomic/pull/234), `feat/criterion-evidence-replay` | Optional native intent evidence replay with an explicitly selected local checker and an installed Verify recipe | 2,038 CLI tests, native signed-intent integration, stale/mutation controls, installed checker controls and strict Clippy passed |
+| [#235](https://github.com/atomicdotdev/atomic/pull/235), `feat/provenance-dsse-export` | Optional exporter-signed provenance container and offline pinned-key reader | 169 canonical tests, two doctests, six actual CLI/Python tests, five ordinary compatibility tests and strict feature Clippy passed. Atomic-host interoperability CI passed |
+| [#236](https://github.com/atomicdotdev/atomic/pull/236), `test/native-authority-recovery` | Four native local delegation cases across process restarts, retained executable/results and an installed-reader workflow | Original run: four cases and twelve worker observations. Full workspace on the retained source: 9,094 tests passed. Atomic-host installed consumer CI also passed; subsequent source checks are separately pinned in the state file |
 
-Upstream PR creation was refused by GitHub with `Resource not accessible by
-integration`. The current GitHub App has access to the owned fork, but no
-observed Atomic installation. A working user OAuth/classic PAT with public
-repository scope, or an authenticated GitHub browser, is needed. These fork
-branches and proposal descriptions are not upstream PRs or maintainer acceptance.
+The managed environment's direct submission attempts were historically refused
+with `Resource not accessible by integration`, including when a user credential
+was supplied. The user then configured an encrypted owned-fork Actions secret.
+[The restricted hosted submission run](https://github.com/astrogilda/atomic/actions/runs/37077337708)
+succeeded and opened all three review-ready PRs at their exact published heads.
+Maintainer modifications are enabled. CI and reviews are tracked separately;
+publication is not maintainer acceptance or completed adoption.
+
+The one-shot active submission workflow is removed after successful use; its
+reviewed inactive template remains in this checkpoint directory. The temporary
+token and encrypted repository secret can now be revoked/removed by the user.
+Standard multi-platform tests are still being monitored; exact hosted results
+are in the state file. The author has no upstream push, maintain or admin
+permission, so final upstream review and protected merge belong to Atomic.
 
 ## Scope and next boundary
 
