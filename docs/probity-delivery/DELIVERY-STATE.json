@@ -1,7 +1,7 @@
 {
   "schema": "probity-atomic-delivery-state/v1",
   "scope": "Atomic contribution lane; full Probity program remains separately owned",
-  "updated_at": "2026-10-02T23:53:00.142523+00:00",
+  "updated_at": "2026-10-03T00:05:29.946319+00:00",
   "checkpoint_branch": "docs/probity-atomic-delivery-2026-10-02",
   "upstream_base": {
     "repository": "atomicdotdev/atomic",
@@ -21,24 +21,23 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:52:59.958929+00:00",
+        "observed_at": "2026-10-03T00:05:29.658274+00:00",
         "passed": [
           "Check",
           "Test (ubuntu-latest)",
           "Test (macos-latest)",
+          "Test (windows-latest)",
           "Format",
           "Clippy",
           "Documentation",
           "Minimum Supported Rust Version"
         ],
-        "pending": [
-          "Test (windows-latest)"
-        ],
+        "pending": [],
         "failed": [],
         "reviews": 0,
         "comments": 0,
         "mergeable": "MERGEABLE",
-        "merge_state": "UNSTABLE",
+        "merge_state": "CLEAN",
         "maintainer_can_modify": true,
         "check_details": [
           {
@@ -73,12 +72,12 @@
           },
           {
             "__typename": "CheckRun",
-            "completedAt": "0001-01-01T00:00:00Z",
-            "conclusion": "",
+            "completedAt": "2026-10-03T00:05:08Z",
+            "conclusion": "SUCCESS",
             "detailsUrl": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661/job/111074758627",
             "name": "Test (windows-latest)",
             "startedAt": "2026-10-02T23:42:57Z",
-            "status": "IN_PROGRESS",
+            "status": "COMPLETED",
             "workflowName": "CI"
           },
           {
@@ -148,6 +147,16 @@
           "owner": "vinceblock99",
           "state": "temporary do-not-merge Windows survey; preserve owner"
         }
+      },
+      "fresh_ci_result": {
+        "head": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6",
+        "run": 37078868661,
+        "status": "completed",
+        "conclusion": "success",
+        "windows_job": 111074758627,
+        "owner_bug_not_claimed_fixed": true,
+        "retry_count": 1,
+        "note": "All eight current-head checks passed. Prior403 Windows owner startup failure remains historical; no owner code or tests changed."
       }
     },
     {
@@ -167,7 +176,7 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:53:00.141733+00:00",
+        "observed_at": "2026-10-03T00:05:29.896084+00:00",
         "passed": [
           "Check",
           "export-consumer",
@@ -339,7 +348,7 @@
       "upstream_state": "OPEN",
       "maintainer_can_modify": true,
       "hosted_ci_observation": {
-        "observed_at": "2026-10-02T23:52:59.979402+00:00",
+        "observed_at": "2026-10-03T00:05:29.945455+00:00",
         "passed": [
           "Check",
           "native-delegation-consumer",
@@ -554,8 +563,8 @@
       "name": "CI",
       "head_sha": "814c9aa5d77f07836a935acf216f7f2cfb2bdfd6",
       "event": "pull_request",
-      "status": "in_progress",
-      "conclusion": null,
+      "status": "completed",
+      "conclusion": "success",
       "html_url": "https://github.com/atomicdotdev/atomic/actions/runs/37078868661"
     }
   ],
@@ -595,7 +604,7 @@
   "claims": {
     "implementation": "three actual review-ready upstream PRs, published fork sources and merged owned support work",
     "probity_host_ci": "successful PR and main native reader workflows",
-    "upstream_host_ci": "DSSE and native each passed all nine hosted checks, including all three OS workspace jobs and dedicated consumer jobs. Criterion current814 head has seven green checks and Windows pending; prior403 Windows failure remains historical.",
+    "upstream_host_ci": "Criterion814 passed all eight hosted checks. DSSE and native each passed all nine hosted checks, including all three OS workspace jobs and dedicated consumer jobs. Prior403 Windows failure is preserved; owner defect is not claimed fixed.",
     "producer_acceptance": "not established for new proposals",
     "outside_recurring_adoption": "not established for new proposals",
     "independent_effect_custody": "not established"

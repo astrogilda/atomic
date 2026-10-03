@@ -48,7 +48,7 @@ reviewed inactive template remains in this checkpoint directory. The temporary
 token and encrypted repository secret can now be revoked/removed by the user.
 DSSE #235 and native #236 each passed all nine hosted checks, including the
 Linux, macOS and Windows workspace tests. Criterion #234 at its current head
-passed seven checks; its Windows job is still being monitored. The prior Windows
+passed all eight checks, including Windows, on its one fresh CI attempt. The prior Windows
 owner-startup failure and the single fresh attempt are recorded separately in
 the state file. The author has no upstream push, maintain or admin
 permission, so final upstream review and protected merge belong to Atomic.

@@ -34,7 +34,8 @@ The documentation-only followup
 `814c9aa5d77f07836a935acf216f7f2cfb2bdfd6` clarifies POSIX wrapper support,
 Linux installed-checker results, macOS native integration and the lack of a
 packaged Windows checker wrapper. Its ordinary PR synchronize event starts one
-fresh full CI attempt. It does not claim to fix the owner failure. Keep the old
+fresh full CI attempt. Run37078868661 then completed successfully: all eight
+checks passed, including Windows. It does not claim to fix the owner failure. Keep the old
 failure and new results separate. If the owner failure repeats, preserve the
 active investigation rather than weaken checks or repeatedly reroll CI.
 
