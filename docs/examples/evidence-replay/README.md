@@ -95,7 +95,10 @@ and its own executable positive, negative, and coverage controls.
 Atomic invokes the **explicit** `--evidence-checker` executable directly, with no
 shell or arguments from the manifest. The executable is trusted local code with
 the caller's privileges. Choose it independently of an untrusted evidence bundle;
-this mechanism authenticates neither executables nor witnesses. The result's
+this mechanism authenticates neither executables nor witnesses. Replay runs in the
+service layer: the manifest and checker paths resolve on the service host, only
+local callers are admitted, and the service releases its repository gate while the
+checker runs before re-reading the native pins. The result's
 request digest binds context, criterion, claim, case, policy, and resolved root.
 It is an integrity binding, not an authenticated signature or independent custody.
 

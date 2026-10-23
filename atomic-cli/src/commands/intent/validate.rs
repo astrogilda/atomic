@@ -8,6 +8,7 @@ use clap::Parser;
 use atomic_canonical::lift::{lift_intent, parse_markdown};
 use atomic_canonical::{validate_intent, ValidationReport, Violation};
 use atomic_core::types::{Base32, Hash};
+use atomic_repository::intent_evidence;
 use atomic_repository::Repository;
 
 use crate::commands::intent::bridge;
@@ -52,7 +53,7 @@ impl Command for IntentValidate {
         // if a FRESH attestation sidecar exists we gate the attested node (so a
         // previously-attested intent reports conforms), a STALE one warns and
         // falls back to the raw node.
-        let mut source_hash = None;
+        let mut stored_inputs = None;
         let node = if is_path_shaped(&self.id_or_path) {
             let path = Path::new(&self.id_or_path);
             if !path.is_file() {
@@ -71,8 +72,7 @@ impl Command for IntentValidate {
             let root = find_repository_root()?;
             let repo = Repository::open(&root).map_err(CliError::Repository)?;
             let inputs = bridge::read_intent(&repo, &self.id_or_path)?;
-            source_hash = Some(bridge::source_content_hash(&inputs));
-            match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
+            let node = match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
                 bridge::Attestation::Fresh(node) => *node,
                 bridge::Attestation::Stale(_) => {
                     eprintln!(
@@ -83,7 +83,9 @@ impl Command for IntentValidate {
                     bridge::lift(&inputs)?
                 }
                 bridge::Attestation::None => bridge::lift(&inputs)?,
-            }
+            };
+            stored_inputs = Some(inputs);
+            node
         };
 
         let mut report = validate_intent(&node);
@@ -94,14 +96,13 @@ impl Command for IntentValidate {
             ));
         }
         let context = if wants_context {
+            let inputs = stored_inputs.as_ref().ok_or_else(|| {
+                validation_failed("evidence replay/context requires a stored intent ID")
+            })?;
             let root = find_repository_root()?;
-            let context = super::replay::read_context(&root, &self.id_or_path)?;
-            if source_hash.as_deref() != Some(context.source_hash()) {
-                return Err(validation_failed(
-                    "intent changed before evidence context was captured",
-                ));
-            }
-            Some(context)
+            let repo =
+                crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
+            Some(intent_evidence::context_from_inputs(&repo, inputs).map_err(evidence_error)?)
         } else {
             None
         };
@@ -122,12 +123,17 @@ impl Command for IntentValidate {
 
         let replay = match (&self.replay_evidence, &self.evidence_checker, &context) {
             (Some(manifest), Some(checker), Some(context)) => {
-                let root = find_repository_root()?;
-                let replay = super::replay::replay(manifest, checker, context, &node)?;
+                let replay = intent_evidence::replay(manifest, checker, context, &node)
+                    .map_err(evidence_error)?;
                 // Release the repository before invoking a checker, then re-read.
                 // A checker result from another intent definition or view state
                 // must not be reused as a fresh validation result.
-                let after = super::replay::read_context(&root, &self.id_or_path)?;
+                let root = find_repository_root()?;
+                let repo = crate::commands::open_readonly_repository(&root)
+                    .map_err(CliError::Repository)?;
+                let after = intent_evidence::read_context(&repo, &self.id_or_path)
+                    .map_err(evidence_error)?;
+                drop(repo);
                 let mut violations = replay.violations();
                 if &after != context {
                     violations.push(Violation {
@@ -178,6 +184,16 @@ impl Command for IntentValidate {
 /// Intent IDs are `PREFIX-N` / `N` — no `.md` suffix, no separator.
 fn is_path_shaped(arg: &str) -> bool {
     arg.ends_with(".md") || arg.contains('/') || arg.contains(std::path::MAIN_SEPARATOR)
+}
+
+/// Keep repository and I/O failures distinct; every other evidence refusal is
+/// a user-fixable gate error (exit 2).
+fn evidence_error(error: intent_evidence::EvidenceError) -> CliError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => CliError::Repository(error),
+        intent_evidence::EvidenceError::Io(error) => CliError::Io(error),
+        other => validation_failed(other.to_string()),
+    }
 }
 
 /// Resolve `urn:atomic:change:<hash>` evidence URNs against the change store at
