@@ -1203,9 +1203,8 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
 /// `atomic vault query search` over QueryGraph (KgSearch) — every form:
 /// the wire's KGNode now carries the full domain fields (source,
 /// metadata), so the JSON serializes the same shape the local body
-/// emits; `--kind` rides the request (the handler filters the candidate
-/// pool server-side, taking the limit after the filter — the local
-/// post-filter order) and `--pool` names the candidate pool. The plain
+/// emits; `--kind` rides the request (the repository filters projected nodes
+/// before ranking/pool limits) and `--pool` names the retention budget. The plain
 /// render reads the same kind/id/summary columns.
 pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
@@ -6308,9 +6307,8 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
     Ok(true)
 }
 
-/// `atomic query callers` over QueryGraph (Callers) — the handler filters
-/// the 1-hop subgraph to CALLS edges at the entity; the CLI renders the
-/// local caller lines and hints.
+/// `atomic query callers` over QueryGraph (Callers) — the handler resolves
+/// calls from the selected view's recorded source; the CLI renders callers.
 pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
         return Ok(false);
@@ -6335,6 +6333,58 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
         })
         .collect();
     super::query::render_callers(&args.entity_id, &callers, args.json)?;
+    Ok(true)
+}
+
+/// `query code` uses the same graph-filtered read over both local-service and
+/// reactor transports. Preserve the complete domain JSON/human render.
+pub fn query_code(args: &super::query::QueryCode) -> CliResult<bool> {
+    let Some(session) = Service::open()? else {
+        return Ok(false);
+    };
+    let response = session.query_graph(pb::QueryGraphRequest {
+        repository: Some(session.reference.clone()),
+        query: Some(pb::query_graph_request::Query::ContentSearch(
+            pb::ContentSearchQuery {
+                query: args.pattern.clone(),
+                paths: Vec::new(),
+                path_filter: args.path_filter.clone(),
+                file_type: args.file_type.clone(),
+                exclude_type: None,
+                case_insensitive: args.case_insensitive,
+                max_results: Some(u32::try_from(args.max_results).map_err(|_| {
+                    CliError::Internal(anyhow::anyhow!("max-results exceeds the RPC limit"))
+                })?),
+            },
+        )),
+        ..Default::default()
+    })?;
+    let result = response.content_result.ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
+            "the service returned no content search result"
+        ))
+    })?;
+    let result = atomic_repository::ContentSearchResult {
+        matches: result
+            .matches
+            .into_iter()
+            .map(|m| atomic_repository::ContentMatch {
+                path: m.path,
+                line_number: m.line_number,
+                line_content: m.line_content,
+                byte_offset: m.byte_offset,
+                submatch_start: m.submatch_start as usize,
+                submatch_end: m.submatch_end as usize,
+            })
+            .collect(),
+        total_matches: result.total_matches as usize,
+        dir_facets: result
+            .dir_facets
+            .into_iter()
+            .map(|facet| (facet.path, facet.count as usize))
+            .collect(),
+    };
+    super::query::print_code_result(&result, args.json)?;
     Ok(true)
 }
 

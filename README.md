@@ -356,19 +356,54 @@ and import edges are not stored as a parallel code graph.
 # Build/update the separate syntext source-content index
 atomic query index
 
-# Search indexed source text; -t filters language and -g filters paths
+# Search recorded source in the current view; -t filters language and -g paths
 atomic query code "replication" -t rs -g atomic-core/src/
 
 # Parse a file's functions, classes, and types with line ranges
 atomic query entities atomic-core/src/kg/iri.rs
 
-# Find callers by path-qualified symbol or bare name using live parsing
+# Find callers by path-qualified symbol or bare name in the recorded view
 atomic query callers "atomic-core/src/kg/iri.rs#mint_change" --json
 ```
 
+`query search`, `query callers`, and `query code` use the **current view's effective
+graph filter**: the view's changes, all ancestor views, and transitive dependencies.
+They read recorded source bytes, not unrecorded working-copy edits or stale content
+from another view. Deletions and renames follow the canonical view projection.
+Vault-only results, such as memories and intents, remain shared.
+
 Search combines **KG full-text search** over resource IDs, labels, and summaries
-with **syntext** indexed source-content matches. The content index can be updated
-with `atomic query index`; it is separate from the workflow graph.
+with source-content matches verified against the recorded view. Filtering precedes
+ranking and limits; no working-copy content index or checkout is required. Callers
+use request-scoped tree-sitter parsing, not persisted KG code edges. This
+correctness-first path renders/scans the selected view per query. RPC clients can
+select a view explicitly; omitting it uses the working copy's registered desired
+view. Other query verbs retain their existing scope semantics. The separate
+working-copy content index is still available to its existing consumers. Existing
+ambient ignore rules still suppress ignored paths, including recorded files; that
+policy is intentional and unchanged.
+
+Recorded code search applies path/type filters **before reading file contents**,
+then scans eligible files one at a time. It keeps at most the requested number of
+best matches while still counting every match and directory facet—even with a
+zero display limit. Facet-count ties sort by directory path. Rendered files over
+10 MiB are skipped, not searched as truncated files. Closure, path-claim, and inode
+attribute validation still precede request filtering: invalid global metadata
+fails closed, while content-only errors in excluded files are deliberately unread.
+Selected-file content errors still propagate. No persistent cache or reindex is
+required. See [query resource diagnostics](docs/query-view-performance.md) for
+memory bounds, costs excluded from those bounds, and a reproducible benchmark.
+
+For `query search`, `--kind` matches an exact, case-sensitive absolute class IRI
+against **any asserted type**, before candidate-pool truncation. An omitted or
+empty kind means no filter; an unknown class matches nothing. `--pool` defaults
+to 5000 and is a retention budget, normalized to at least the result limit—not a
+cap on which eligible candidates are examined. Without a kind filter, a larger
+pool enables cross-type diversity. With a kind filter, results are the highest-
+ranked matching nodes without cross-type diversity, so even `--pool 1` cannot hide
+their top result. CLI/service search defaults to 10 results; a service request
+limit of zero (including CLI `--limit 0`) uses that default. Direct repository
+search APIs instead interpret a zero limit literally and return no nodes.
 
 **SHACL validation** runs locally in the CLI using PurRDF. Builtin profiles and
 enterprise-authored `.atomic/shapes/*.ttl` files use the same engine:
@@ -473,7 +508,7 @@ Every change stores two parallel representations:
 | Command | Description |
 |---------|-------------|
 | `atomic query search <query>` | Search the knowledge graph (structural + content) |
-| `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
+| `atomic query code <pattern>` | Search recorded source in the current view (`-t` for file type, `-g` for path filter) |
 | `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
 | `atomic query callers <path#name\|name>` | Find callers using live source parsing, without stored KG code edges |
 | `atomic query neighbors <resource-iri>` | Explore asserted workflow relationships around a canonical resource |

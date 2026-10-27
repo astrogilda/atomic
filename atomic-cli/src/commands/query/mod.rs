@@ -22,7 +22,8 @@ pub enum QueryCommands {
     /// Search the knowledge graph by keywords.
     ///
     /// Performs full-text search over KG node IDs, labels, and summaries,
-    /// returning matching nodes ranked by relevance.
+    /// returning matching nodes ranked by relevance. VCS nodes and source
+    /// content are filtered to the current view; vault-only nodes are shared.
     ///
     /// # Examples
     ///
@@ -49,18 +50,17 @@ pub enum QueryCommands {
 
     /// Find all functions that call a given entity.
     ///
-    /// Queries the knowledge graph for CALLS edges whose destination is the
-    /// specified entity node. Useful for blast-radius analysis: see every
+    /// Resolves calls in the current view's recorded source whose destination
+    /// matches a path-qualified or bare symbol. Useful for blast-radius analysis: see every
     /// function that breaks if this function's signature changes.
     ///
-    /// Run `atomic vault query enrich` first to populate CALLS edges.
-    /// Run `atomic vault query entities <file>` to discover entity IDs.
+    /// Run `atomic vault query entities <file>` to discover symbol names.
     ///
     /// # Examples
     ///
     /// ```text
-    /// atomic vault query callers entity:src/auth.rs:verify:42
-    /// atomic vault query callers entity:src/auth.rs:verify:42 --json
+    /// atomic vault query callers 'src/auth.rs#verify'
+    /// atomic vault query callers verify --json
     /// ```
     Callers(QueryCallers),
 
@@ -80,8 +80,8 @@ pub enum QueryCommands {
     /// Build or update the content search index.
     ///
     /// Builds a syntext n-gram index over all source files in the repository.
-    /// The index is stored at `.atomic/content-index/` and is required by the
-    /// `code` subcommand.
+    /// The index is stored at `.atomic/content-index/` for working-copy content
+    /// consumers. View-scoped `query code` does not require it.
     ///
     /// Without `--rebuild`, performs an incremental update (fast).
     /// With `--rebuild`, does a full rebuild from scratch.
@@ -95,10 +95,10 @@ pub enum QueryCommands {
     /// ```
     Index(QueryIndex),
 
-    /// Search source code content using the syntext index.
+    /// Search recorded source code in the current view.
     ///
-    /// Searches the indexed content of all files in the repository.
-    /// Requires the content index to be built first via `atomic vault query enrich`.
+    /// Searches the view's ancestor/dependency closure, excluding sibling-view
+    /// and unrecorded working-copy content. No content-index rebuild is needed.
     ///
     /// # Examples
     ///
@@ -1159,23 +1159,21 @@ pub struct QueryNodes {
     /// Search query text (keyword search over node IDs, labels, and summaries).
     pub query: String,
 
-    /// Maximum results.
+    /// Maximum results (0 uses the service default of 10).
     #[arg(long, short = 'k', default_value = "10")]
     pub limit: usize,
 
     /// Filter by canonical class IRI (for example, <https://atomic.dev/ns/workflow#File>).
     ///
-    /// When set, only nodes asserting this type are returned.
-    /// Without this flag, all types are returned.
+    /// Matches any asserted type exactly and case-sensitively, before pool limits.
+    /// Omitted or empty: all types. An unknown class returns no results.
     #[arg(long, short = 't')]
     pub kind: Option<String>,
 
-    /// Candidate pool size.
+    /// Candidate retention budget (default: 5000; at least --limit).
     ///
-    /// How many candidates to score before selecting the top results.
-    /// A larger pool surfaces lower-scored node kinds (e.g. changes)
-    /// that would otherwise be crowded out by files with content matches.
-    /// Default: same as --limit.
+    /// Without --kind, a larger pool allows diversity across types. With --kind,
+    /// only matching nodes compete; a small pool cannot hide their top results.
     #[arg(long, short = 'p')]
     pub pool: Option<usize>,
 
@@ -1191,39 +1189,15 @@ impl Command for QueryNodes {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
-
-        // When filtering by kind, we need enough candidates of that kind
-        // to survive the diversity selection.  Ask for a large pool so the
-        // heap retains many candidates, then post-filter to the target kind.
-        let (fetch_limit, pool) = if self.kind.is_some() {
-            let pool_val = self.pool.unwrap_or(5000);
-            // fetch_limit = pool so all pool candidates become results
-            (pool_val, Some(pool_val))
-        } else {
-            // Without a kind filter, request a generous candidate pool so the
-            // diversity-aware selection in `vault_kg_search` engages. Otherwise
-            // (pool == limit) it falls back to plain top-N by score, and once a
-            // content index exists, high-scoring `file`/`module` nodes crowd
-            // out lower-scored vault nodes (intents, todos, sessions,
-            // memories), so an enriched repo would only ever return files.
-            (self.limit, Some(self.pool.unwrap_or(5000)))
-        };
-
-        let all_nodes = repo
-            .vault_kg_search(&self.query, fetch_limit, pool)
+        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let view = repo
+            .desired_view_name(working_copy)
             .map_err(CliError::Repository)?;
 
-        let nodes: Vec<_> = if let Some(ref kind_filter) = self.kind {
-            let k = kind_filter.to_owned();
-            all_nodes
-                .into_iter()
-                .filter(|n| n.types.contains(&k))
-                .take(self.limit)
-                .collect()
-        } else {
-            all_nodes.into_iter().take(self.limit).collect()
-        };
+        let nodes = self.search_on_view(&repo, &view)?;
 
         if self.json {
             println!("{}", serde_json::to_string_pretty(&nodes).unwrap());
@@ -1248,6 +1222,88 @@ impl Command for QueryNodes {
         }
 
         Ok(())
+    }
+}
+
+impl QueryNodes {
+    fn search_on_view(&self, repo: &Repository, view: &str) -> CliResult<Vec<KgNode>> {
+        repo.vault_kg_search_on_view_with_kind(
+            view,
+            &self.query,
+            self.limit,
+            Some(self.pool.unwrap_or(5000)),
+            self.kind.as_deref(),
+        )
+        .map_err(CliError::Repository)
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use atomic_core::kg::iri;
+    use atomic_core::pristine::VaultEntryType;
+
+    #[test]
+    fn direct_search_helper_filters_kind_before_pool_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let memory = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        repo.vault_store(
+            &format!("memory/{memory}.md"),
+            VaultEntryType::Memory,
+            b":::memory\nFallback regression.\n:::\n".to_vec(),
+            serde_json::json!({"id": memory, "kind": "context"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("pool.rs"), format!("// {memory}\n")).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.add(wc, "pool.rs", Default::default()).unwrap();
+        repo.record(
+            wc,
+            atomic_core::change::ChangeHeader::new("record fallback fixture"),
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+        let memory_id = iri::mint_memory(&repo.project_id().unwrap(), memory);
+        for pool in [0, 1, 100] {
+            let args = QueryNodes::try_parse_from([
+                "search",
+                memory,
+                "--kind",
+                Class::Memory.iri(),
+                "--pool",
+                &pool.to_string(),
+                "--limit",
+                "1",
+            ])
+            .unwrap();
+            let nodes = args.search_on_view(&repo, "dev").unwrap();
+            assert_eq!(nodes.len(), 1, "pool={pool}");
+            assert_eq!(nodes[0].id, memory_id);
+            let args = QueryNodes { limit: 0, ..args };
+            assert!(args.search_on_view(&repo, "dev").unwrap().is_empty());
+        }
+        for kind in [None, Some(String::new()), Some("urn:unknown:class".into())] {
+            let args = QueryNodes {
+                query: memory.into(),
+                limit: 1,
+                pool: Some(1),
+                kind: kind.clone(),
+                json: true,
+            };
+            let nodes = args.search_on_view(&repo, "dev").unwrap();
+            if kind.as_deref() == Some("urn:unknown:class") {
+                assert!(nodes.is_empty());
+            } else {
+                assert_eq!(nodes.len(), 1);
+                assert!(nodes[0].has_type(Class::File));
+            }
+            assert!(args.search_on_view(&repo, "missing").is_err());
+        }
     }
 }
 
@@ -1329,16 +1385,21 @@ pub struct QueryCallers {
 
 impl Command for QueryCallers {
     fn run(&self) -> CliResult<()> {
-        // Route every form through the service layer (the handler filters
-        // the subgraph to CALLS edges at the entity).
+        // The service resolves calls through the current view's recorded bytes.
         if crate::commands::rpc::query_callers(self)? {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         let callers = repo
-            .query_callers(&self.entity_id)
+            .query_callers_on_view(&view, &self.entity_id)
             .map_err(CliError::Repository)?;
         render_callers(&self.entity_id, &callers, self.json)
     }
@@ -1438,7 +1499,7 @@ impl Command for QueryEntities {
 // QueryCode — search source code content via the syntext index
 // ---------------------------------------------------------------------------
 
-/// Search source code content.
+/// Search recorded source code in the current view.
 #[derive(Parser, Debug)]
 pub struct QueryCode {
     /// Search pattern (regex supported).
@@ -1467,7 +1528,17 @@ pub struct QueryCode {
 
 impl Command for QueryCode {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_code(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
+        let repo = Repository::open_readonly(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
         let opts = atomic_repository::ContentSearchOptions {
             path_filter: self.path_filter.clone(),
@@ -1477,63 +1548,57 @@ impl Command for QueryCode {
             case_insensitive: self.case_insensitive,
         };
 
-        let result = match atomic_repository::search_content(&root, &self.pattern, opts) {
-            Ok(r) => r,
-            Err(atomic_repository::ContentSearchError::IndexNotFound) => {
-                println!(
-                    "Content index not found.\n\n  \
-                         Run `atomic vault query index` to build it, then retry.\n  \
-                         (`atomic vault query enrich` also builds it as part of full enrichment.)"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(CliError::Internal(anyhow::anyhow!(
-                    "code search failed: {e}"
-                )));
-            }
-        };
+        let result = repo
+            .search_content_on_view(&view, &self.pattern, opts)
+            .map_err(CliError::Repository)?;
 
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
-        } else if result.matches.is_empty() {
-            println!("No matches found.");
-        } else {
-            // Show matches
-            let mut files = std::collections::HashSet::new();
-            for m in &result.matches {
-                files.insert(m.path.as_str());
-                println!(
-                    "{}:{}: {}",
-                    m.path,
-                    m.line_number,
-                    m.line_content.trim_end()
-                );
-            }
+        print_code_result(&result, self.json)
+    }
+}
 
-            // Summary
+pub(crate) fn print_code_result(
+    result: &atomic_repository::ContentSearchResult,
+    json: bool,
+) -> CliResult<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    } else if result.matches.is_empty() {
+        println!("No matches found.");
+    } else {
+        // Show matches
+        let mut files = std::collections::HashSet::new();
+        for m in &result.matches {
+            files.insert(m.path.as_str());
             println!(
-                "\n{} match(es) in {} file(s).",
-                result.matches.len(),
-                files.len()
+                "{}:{}: {}",
+                m.path,
+                m.line_number,
+                m.line_content.trim_end()
             );
-
-            // Show total and facets when results were truncated
-            if result.total_matches > result.matches.len() {
-                println!(
-                    "  ({} total matches — showing top {}. Narrow with -g or -t.)\n",
-                    result.total_matches,
-                    result.matches.len()
-                );
-                println!("  Top directories:");
-                for (dir, count) in &result.dir_facets {
-                    println!("    {:<40} {} matches", format!("-g \"{}\"", dir), count);
-                }
-            }
         }
 
-        Ok(())
+        // Summary
+        println!(
+            "\n{} match(es) in {} file(s).",
+            result.matches.len(),
+            files.len()
+        );
+
+        // Show total and facets when results were truncated
+        if result.total_matches > result.matches.len() {
+            println!(
+                "  ({} total matches — showing top {}. Narrow with -g or -t.)\n",
+                result.total_matches,
+                result.matches.len()
+            );
+            println!("  Top directories:");
+            for (dir, count) in &result.dir_facets {
+                println!("    {:<40} {} matches", format!("-g \"{}\"", dir), count);
+            }
+        }
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

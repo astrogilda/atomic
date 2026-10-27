@@ -240,10 +240,76 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
-        let txn = self.pristine.read_txn()?;
+        self.vault_kg_search_inner(query, limit, pool, None, None)
+    }
+
+    /// Search VCS nodes and source content through the requested view's
+    /// validated closure. Filtering precedes candidate ranking and truncation.
+    /// Vault-only nodes remain repository-wide.
+    pub fn vault_kg_search_on_view(
+        &self,
+        view_name: &str,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        self.vault_kg_search_on_view_with_kind(view_name, query, limit, pool, None)
+    }
+
+    /// Search a recorded view, optionally filtering by an exact asserted class IRI.
+    ///
+    /// View projection and class filtering precede ranking and pool truncation.
+    /// The class is matched against every asserted type, case-sensitively; an
+    /// absent or empty class leaves the search unfiltered. Unknown classes match
+    /// nothing. Filtered results are the top `limit` nodes by score, without
+    /// cross-type diversity, regardless of `pool` (retained at least to `limit`).
+    /// A zero `limit` returns no nodes but still validates the requested view.
+    /// Vault-only nodes remain shared; no index is built or refreshed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use atomic_core::kg::ontology::Class;
+    /// use atomic_repository::{Repository, RepositoryError};
+    /// # fn main() -> Result<(), RepositoryError> {
+    /// let repo = Repository::open_readonly("path/to/repository")?;
+    /// let memories = repo.vault_kg_search_on_view_with_kind(
+    ///     "dev", "leases", 10, Some(1), Some(Class::Memory.iri()),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn vault_kg_search_on_view_with_kind(
+        &self,
+        view_name: &str,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+        kind: Option<&str>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        let scope = self.query_view(view_name)?;
+        self.vault_kg_search_inner(query, limit, pool, Some(&scope), kind)
+    }
+
+    fn vault_kg_search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+        scope: Option<&super::query::QueryView<'_>>,
+        kind: Option<&str>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        let kind = kind.filter(|kind| !kind.is_empty());
+        let unscoped_txn;
+        let txn = if let Some(scope) = scope {
+            &scope.txn
+        } else {
+            unscoped_txn = self.pristine.read_txn()?;
+            &unscoped_txn
+        };
         let mut rows = BTreeMap::new();
         let mut content = HashMap::<String, usize>::new();
-        if crate::content_search::has_content_index(self.root()) {
+        if scope.is_none() && crate::content_search::has_content_index(self.root()) {
             if let Ok(result) = crate::content_search::search_content(
                 self.root(),
                 query,
@@ -259,9 +325,50 @@ impl Repository {
         }
         for (id, _) in txn.kg_fts_match_ids(query)? {
             if let Some(node) = txn.get_kg_node(&id)? {
+                let node = if let Some(scope) = scope {
+                    let Some(node) = scope.project_node(txn, node)? else {
+                        continue;
+                    };
+                    node
+                } else {
+                    node
+                };
                 let hits = fts_hits(&node, query);
                 if hits > 0 {
                     rows.insert(id, (node, hits));
+                }
+            }
+        }
+        // A visible rename or new file need not already have a KG posting.
+        if let Some(scope) = scope {
+            for node in scope.nodes().values() {
+                let hits = fts_hits(node, query);
+                if hits > 0 {
+                    rows.insert(node.id.clone(), (node.clone(), hits));
+                }
+            }
+            // File promotion always needs the original global 2,000-match
+            // window. Other types need it only when a surviving candidate has
+            // a source path that can receive content scoring. Do not suppress
+            // such scores on multi-typed/path-bearing non-File nodes.
+            let needs_content = kind.is_none_or(|kind| kind == Class::File.iri())
+                || rows.values().any(|(node, _)| {
+                    kind.is_none_or(|kind| node.types.iter().any(|ty| ty == kind))
+                        && node.path().is_some_and(|path| scope.contains_file(path))
+                });
+            if needs_content {
+                // KG keyword search historically ignores invalid regex patterns,
+                // but actual selected-source failures must still propagate.
+                if let Ok(plan) = scope.content_plan(
+                    query,
+                    crate::content_search::ContentSearchOptions {
+                        max_results: Some(2000),
+                        ..Default::default()
+                    },
+                ) {
+                    for result in scope.search_content_plan(plan)?.matches {
+                        *content.entry(result.path).or_default() += 1;
+                    }
                 }
             }
         }
@@ -278,6 +385,11 @@ impl Repository {
         }
         let mut ranked = Vec::new();
         for (_, (mut node, hits)) in rows {
+            // All candidate sources, including content-only File stubs, obey
+            // the class predicate before competing for retained result slots.
+            if kind.is_some_and(|kind| !node.types.iter().any(|ty| ty == kind)) {
+                continue;
+            }
             let count = node
                 .path()
                 .and_then(|path| content.get(path))
@@ -300,7 +412,7 @@ impl Repository {
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
         ranked.truncate(pool.unwrap_or(limit).max(limit));
-        if pool.is_some_and(|pool| pool > limit) {
+        if kind.is_none() && pool.is_some_and(|pool| pool > limit) {
             let mut per_type = HashMap::<String, usize>::new();
             let mut selected = Vec::new();
             let mut remaining = Vec::new();
