@@ -1,5 +1,5 @@
 use super::{ReadTxn, WriteTxn};
-use crate::kg::project_id::ProjectIdentityRecord;
+use crate::kg::project_id::{MintReason, ProjectIdentityRecord};
 use crate::pristine::tables::*;
 use crate::pristine::{
     tables::{PROJECT_IDENTITY, SIGNER_KEYS},
@@ -173,6 +173,29 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    /// Unconditionally write the identity row and invalidate the derived KG.
+    /// For explicit remediation (`repo identity adopt`/`fork`) — the caller
+    /// has already decided the namespace change is intended. Preserves the
+    /// record's mint reason as given.
+    pub fn force_write_project_identity(
+        &mut self,
+        record: &ProjectIdentityRecord,
+    ) -> PristineResult<ProjectIdentityRecord> {
+        record.project_id().map_err(serialization)?;
+        let bytes = serde_json::to_vec(record).map_err(serialization)?;
+        self.txn
+            .open_table(PROJECT_IDENTITY)?
+            .insert(0, bytes.as_slice())?;
+        if self.kg_generation()? == crate::kg::KG_GENERATION {
+            // Invalidate the derived graph: project-qualified IRIs just
+            // changed. (A pre-rebuild repository stays at generation 0.)
+            self.txn
+                .open_table(KG_INDEX_META)?
+                .insert("kg_generation", 0u32)?;
+        }
+        Ok(record.clone())
+    }
+
     /// Compare-and-insert; concurrent minting keeps the first committed identity.
     pub fn put_project_identity_if_absent(
         &mut self,
@@ -187,6 +210,42 @@ impl WriteTxn<'_> {
             .open_table(PROJECT_IDENTITY)?
             .insert(0, bytes.as_slice())?;
         Ok(record.clone())
+    }
+
+    /// Adopt a remote identity: insert when absent, overwrite when the current
+    /// identity is an `Upgrade` mint (transport-replaceable by design), and
+    /// leave `Created`/`Adopted` identities untouched. The stored record is
+    /// always marked [`MintReason::Adopted`] — provenance of the *record in
+    /// this repository*, regardless of how the origin minted it.
+    ///
+    /// Adopting changes every project-qualified IRI, so the derived KG is
+    /// invalidated in the same transaction: the next KG read reports
+    /// [`PristineError::KgNeedsRebuild`] and the standard rebuild-on-open path
+    /// re-projects under the adopted id. Returns the identity now in force
+    /// (the adopted record, or the pre-existing non-replaceable one).
+    pub fn adopt_project_identity(
+        &mut self,
+        record: &ProjectIdentityRecord,
+    ) -> PristineResult<ProjectIdentityRecord> {
+        record.project_id().map_err(serialization)?;
+        let mut adopted = match self.project_identity()? {
+            None => record.clone(),
+            Some(existing) if existing.mint_reason == MintReason::Upgrade => record.clone(),
+            Some(existing) => return Ok(existing),
+        };
+        adopted.mint_reason = MintReason::Adopted;
+        let bytes = serde_json::to_vec(&adopted).map_err(serialization)?;
+        self.txn
+            .open_table(PROJECT_IDENTITY)?
+            .insert(0, bytes.as_slice())?;
+        if self.kg_generation()? == crate::kg::KG_GENERATION {
+            // Invalidate the derived graph: project-qualified IRIs just
+            // changed. (A pre-rebuild repository stays at generation 0.)
+            self.txn
+                .open_table(KG_INDEX_META)?
+                .insert("kg_generation", 0u32)?;
+        }
+        Ok(adopted)
     }
 
     /// Callers must check DID/key correspondence before caching key material.
