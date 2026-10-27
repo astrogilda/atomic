@@ -1390,7 +1390,7 @@ mod tests {
     use super::*;
     use atomic_core::types::Merkle;
     use atomic_repository::status::{FileStatus, FileStatusEntry};
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::path::PathBuf;
 
     // Status Command Construction Tests
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -1836,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_in_repository() {
         let _guard = DirGuard::new();
 
@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_short_format() {
         let _guard = DirGuard::new();
 
@@ -1897,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_no_untracked() {
         let _guard = DirGuard::new();
 
@@ -1931,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_with_path_filter() {
         let _guard = DirGuard::new();
 
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_in_subdirectory() {
         let _guard = DirGuard::new();
 
@@ -2002,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_with_multiple_file_types() {
         let _guard = DirGuard::new();
 
