@@ -956,6 +956,8 @@ pub fn intent_list(args: &super::intent::list::IntentList) -> CliResult<bool> {
         entry_type: None,
         status_filter: None,
         tool_result_previews: false,
+        sort: Some(args.sort.wire() as i32),
+        reverse: args.reverse,
     };
     let response = session.list_vault_entries(request)?;
     let mut rows = response
@@ -1184,6 +1186,8 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
         entry_type: None,
         status_filter: None,
         tool_result_previews: false,
+        sort: Some(args.sort.wire() as i32),
+        reverse: args.reverse,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -1579,6 +1583,8 @@ pub fn vault_list(args: &super::vault::list::List) -> CliResult<bool> {
         entry_type: type_filter.map(|kind| kind.to_string()),
         status_filter: None,
         tool_result_previews: false,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -2625,6 +2631,8 @@ pub fn vault_goal_list(args: &super::vault::goal::GoalList) -> CliResult<bool> {
         entry_type: None,
         status_filter: Some(args.status.clone()),
         tool_result_previews: false,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -6129,6 +6137,8 @@ pub fn vault_summaries(args: &super::vault::summaries::Summaries) -> CliResult<b
         entry_type: None,
         status_filter: None,
         tool_result_previews: true,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let mut summaries = serde_json::Map::new();
