@@ -17,8 +17,8 @@ use crate::atomic::{
     view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
     GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
     ListViewsRequest, LogRequest, PreviewRestoreRequest, QueryGraphRequest, RecordRequest,
-    ReplayVaultEvidenceRequest,
-    ResolveRepositoryRequest, StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
+    ReplayVaultEvidenceRequest, ResolveRepositoryRequest, StatusRequest, SwitchViewRequest,
+    VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
