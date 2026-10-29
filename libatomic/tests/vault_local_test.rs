@@ -413,6 +413,9 @@ async fn evidence_replay_returns_native_pins_and_refuses_stale_manifests() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(error.message().contains("stale intent/view pins"));
+}
+
+#[tokio::test]
 async fn memory_listing_sorts_before_the_budget_and_rejects_foreign_keys() {
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
