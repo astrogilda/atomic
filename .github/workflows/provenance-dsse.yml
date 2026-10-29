@@ -24,7 +24,7 @@ jobs:
       - name: Feature API tests and examples
         run: cargo test --locked -p atomic-canonical --features dsse-export
       - name: Real CLI export and independent consumption
-        run: cargo test --locked -p atomic-cli --features dsse-export --test provenance_integration_test
+        run: cargo test --locked -p atomic-cli --features dsse-export --test it provenance_integration_test
         env:
           ATOMIC_DSSE_PYTHON: python
       - name: Feature lint
